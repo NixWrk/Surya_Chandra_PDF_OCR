@@ -1,5 +1,6 @@
 """I/O layer for loading images, PDFs, and camera inputs."""
 
+from .camera_service import CameraService
 from .loaders import (
     IMG_EXTS,
     PDF_EXTS,
@@ -12,6 +13,7 @@ from .loaders import (
 )
 
 __all__ = [
+    "CameraService",
     "IMG_EXTS",
     "PDF_EXTS",
     "natural_key",
