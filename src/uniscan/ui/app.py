@@ -37,6 +37,7 @@ from uniscan.io import CameraService
 from uniscan.io.loaders import IMG_EXTS, PDF_EXTS, imread_unicode, list_supported_in_folder, load_input_items
 from uniscan.ocr import detect_ocr_dependencies
 from uniscan.session import CaptureSession
+from uniscan.ui.camera_health import camera_health_state
 
 PREVIEW_WAIT_MS = 80
 RESOLUTIONS = [
@@ -74,6 +75,7 @@ class UnifiedScanApp(ctk.CTk):
         self.page_preview_after_photo: ctk.CTkImage | None = None
 
         self.status_var = tk.StringVar(value="Ready")
+        self.camera_health_var = tk.StringVar(value="Camera: Closed")
         self.camera_index_var = tk.IntVar(value=0)
         self.camera_shots_var = tk.IntVar(value=1)
         self.camera_delay_var = tk.DoubleVar(value=1.0)
@@ -113,6 +115,7 @@ class UnifiedScanApp(ctk.CTk):
         self._build_ui()
         self.on_lens_mode_change(self.lens_mode_var.get())
         self.refresh_ocr_status()
+        self._update_camera_health()
         self.after(120, self._poll_job_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -170,6 +173,13 @@ class UnifiedScanApp(ctk.CTk):
         row_open.pack(fill=ctk.X, padx=10, pady=(8, 2))
         ctk.CTkButton(row_open, text="Open", width=90, command=self.open_camera).pack(side=ctk.LEFT)
         ctk.CTkButton(row_open, text="Close", width=90, command=self.close_camera).pack(side=ctk.LEFT, padx=6)
+        self.camera_health_label = ctk.CTkLabel(
+            controls,
+            textvariable=self.camera_health_var,
+            text_color="#6c757d",
+            anchor="w",
+        )
+        self.camera_health_label.pack(fill=ctk.X, padx=10, pady=(2, 6))
 
         ctk.CTkButton(controls, text="Configure Camera", command=self.configure_camera_event).pack(
             fill=ctk.X,
@@ -408,6 +418,16 @@ class UnifiedScanApp(ctk.CTk):
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
 
+    def _update_camera_health(self, error_text: str | None = None) -> None:
+        state = camera_health_state(
+            is_open=self.camera is not None,
+            is_previewing=self.preview_job is not None,
+            error_text=error_text,
+        )
+        self.camera_health_var.set(state.label)
+        if hasattr(self, "camera_health_label"):
+            self.camera_health_label.configure(text_color=state.color)
+
     def refresh_ocr_status(self) -> None:
         status = detect_ocr_dependencies()
         if status.ready:
@@ -563,8 +583,10 @@ class UnifiedScanApp(ctk.CTk):
     def open_camera(self) -> None:
         try:
             self._ensure_camera()
+            self._update_camera_health()
             self._set_status(f"Camera opened (index {self.camera_index_var.get()})")
         except Exception as exc:
+            self._update_camera_health(error_text=str(exc))
             messagebox.showerror("Camera Error", str(exc))
             self._set_status("Camera open failed")
 
@@ -573,27 +595,32 @@ class UnifiedScanApp(ctk.CTk):
         if self.camera is not None:
             self.camera.release()
             self.camera = None
+        self._update_camera_health()
         self._set_status("Camera closed")
 
     def start_preview(self) -> None:
         try:
             self._ensure_camera()
         except Exception as exc:
+            self._update_camera_health(error_text=str(exc))
             messagebox.showerror("Camera Error", str(exc))
             return
         if self.preview_job is None:
             self._preview_loop()
+        self._update_camera_health()
         self._set_status("Preview started")
 
     def stop_preview(self) -> None:
         if self.preview_job is not None:
             self.after_cancel(self.preview_job)
             self.preview_job = None
+        self._update_camera_health()
         self._set_status("Preview stopped")
 
     def _preview_loop(self) -> None:
         if self.camera is None:
             self.preview_job = None
+            self._update_camera_health()
             return
         frame = self.camera.read_frame()
         if frame is not None:
