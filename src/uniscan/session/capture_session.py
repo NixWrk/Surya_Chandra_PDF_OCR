@@ -1,0 +1,96 @@
+"""Capture/session data model used by unified UI and export pipeline."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from uuid import uuid4
+
+import numpy as np
+
+from uniscan.core.postprocess import POSTPROCESSING_OPTIONS
+
+
+@dataclass(slots=True)
+class CaptureEntry:
+    """Single page entry in a capture/import session."""
+
+    name: str
+    original_image: np.ndarray
+    current_image: np.ndarray
+    selected: bool = False
+    entry_id: str = field(default_factory=lambda: uuid4().hex)
+
+    @classmethod
+    def from_image(cls, *, name: str, image: np.ndarray) -> "CaptureEntry":
+        return cls(
+            name=name,
+            original_image=image.copy(),
+            current_image=image.copy(),
+        )
+
+
+class CaptureSession:
+    """Ordered in-memory list of page entries with editor operations."""
+
+    def __init__(self) -> None:
+        self._entries: list[CaptureEntry] = []
+
+    @property
+    def entries(self) -> list[CaptureEntry]:
+        return self._entries
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def add_entry(self, entry: CaptureEntry) -> None:
+        self._entries.append(entry)
+
+    def add_image(self, *, name: str, image: np.ndarray) -> CaptureEntry:
+        entry = CaptureEntry.from_image(name=name, image=image)
+        self._entries.append(entry)
+        return entry
+
+    def add_images(self, items: list[tuple[str, np.ndarray]]) -> list[CaptureEntry]:
+        added: list[CaptureEntry] = []
+        for name, image in items:
+            added.append(self.add_image(name=name, image=image))
+        return added
+
+    def move(self, entry_id: str, distance: int) -> bool:
+        """Move entry up/down by distance and return whether move succeeded."""
+        index = self._find_index(entry_id)
+        if index is None:
+            return False
+        new_index = index + distance
+        if new_index < 0 or new_index >= len(self._entries):
+            return False
+        self._entries[index], self._entries[new_index] = self._entries[new_index], self._entries[index]
+        return True
+
+    def select_all(self, selected: bool = True) -> None:
+        for entry in self._entries:
+            entry.selected = selected
+
+    def remove_selected(self) -> int:
+        before = len(self._entries)
+        self._entries = [entry for entry in self._entries if not entry.selected]
+        return before - len(self._entries)
+
+    def apply_postprocess(self, postprocess_name: str) -> None:
+        if postprocess_name not in POSTPROCESSING_OPTIONS:
+            raise ValueError(f"Unsupported postprocess mode: {postprocess_name}")
+        post_fn = POSTPROCESSING_OPTIONS[postprocess_name]
+        for entry in self._entries:
+            entry.current_image = post_fn(entry.original_image)
+
+    def selected_entries(self) -> list[CaptureEntry]:
+        return [entry for entry in self._entries if entry.selected]
+
+    def _find_index(self, entry_id: str) -> int | None:
+        for idx, entry in enumerate(self._entries):
+            if entry.entry_id == entry_id:
+                return idx
+        return None
