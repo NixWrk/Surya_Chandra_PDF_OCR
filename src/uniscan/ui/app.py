@@ -55,7 +55,8 @@ class UnifiedScanApp(ctk.CTk):
         self.camera: CameraService | None = None
         self.preview_job: str | None = None
         self.preview_photo: ctk.CTkImage | None = None
-        self.page_preview_photo: ctk.CTkImage | None = None
+        self.page_preview_before_photo: ctk.CTkImage | None = None
+        self.page_preview_after_photo: ctk.CTkImage | None = None
 
         self.status_var = tk.StringVar(value="Ready")
         self.camera_index_var = tk.IntVar(value=0)
@@ -244,9 +245,23 @@ class UnifiedScanApp(ctk.CTk):
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 12), pady=12)
         right.grid_rowconfigure(0, weight=1)
         right.grid_columnconfigure(0, weight=1)
+        right.grid_columnconfigure(1, weight=1)
 
-        self.page_preview_label = ctk.CTkLabel(right, text="No page selected")
-        self.page_preview_label.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        before_frame = ctk.CTkFrame(right)
+        before_frame.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
+        before_frame.grid_rowconfigure(1, weight=1)
+        before_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(before_frame, text="Before (Original)").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        self.page_preview_before_label = ctk.CTkLabel(before_frame, text="No page selected")
+        self.page_preview_before_label.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+        after_frame = ctk.CTkFrame(right)
+        after_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
+        after_frame.grid_rowconfigure(1, weight=1)
+        after_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(after_frame, text="After (Processed)").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        self.page_preview_after_label = ctk.CTkLabel(after_frame, text="No page selected")
+        self.page_preview_after_label.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
         self.refresh_page_list()
 
     def _on_close(self) -> None:
@@ -912,20 +927,31 @@ class UnifiedScanApp(ctk.CTk):
     def update_page_preview(self) -> None:
         selected = self.page_listbox.curselection()
         if len(selected) != 1:
-            self.page_preview_label.configure(image=None, text="Select one page to preview")
-            self.page_preview_photo = None
+            self.page_preview_before_label.configure(image=None, text="Select one page to preview")
+            self.page_preview_after_label.configure(image=None, text="Select one page to preview")
+            self.page_preview_before_photo = None
+            self.page_preview_after_photo = None
             return
 
         index = selected[0]
         if index < 0 or index >= len(self.session.entries):
-            self.page_preview_label.configure(image=None, text="Select one page to preview")
-            self.page_preview_photo = None
+            self.page_preview_before_label.configure(image=None, text="Select one page to preview")
+            self.page_preview_after_label.configure(image=None, text="Select one page to preview")
+            self.page_preview_before_photo = None
+            self.page_preview_after_photo = None
             return
 
-        image = self.session.entries[index].current_image
-        photo = self._to_ctk_photo_for_label(image, self.page_preview_label)
-        self.page_preview_photo = photo
-        self.page_preview_label.configure(image=photo, text="")
+        entry = self.session.entries[index]
+        before = entry.original_image
+        after = entry.current_image
+
+        before_photo = self._to_ctk_photo_for_label(before, self.page_preview_before_label)
+        after_photo = self._to_ctk_photo_for_label(after, self.page_preview_after_label)
+
+        self.page_preview_before_photo = before_photo
+        self.page_preview_after_photo = after_photo
+        self.page_preview_before_label.configure(image=before_photo, text="")
+        self.page_preview_after_label.configure(image=after_photo, text="")
 
     def _single_selected_index(self) -> int | None:
         selected = self.page_listbox.curselection()
