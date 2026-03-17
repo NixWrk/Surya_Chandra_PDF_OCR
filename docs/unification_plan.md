@@ -16,31 +16,45 @@ Deliver a PC-first Office Lens analogue:
 3. Background jobs with progress/cancel hook
 4. Core tests for session/pipeline/export
 
+## Progress Snapshot (2026-03-17)
+
+1. Memory-safe session pipeline is active: disk-backed pages, lazy reads, stream import/export.
+2. Review quality tools are active: before/after preview, manual corners, rotate, auto-deskew.
+3. Guided flow is active: step-based tabs and auto-jump to `Review` after capture/import.
+4. Office Lens style modes are active: `Document`, `Whiteboard`, `Photo`, `B/W`.
+5. In-place page replacement is active for selected page (`Replace Sel...` from image file).
+
 ## Implementation Stages
 
-### Stage A: Memory & Storage (In Progress)
+### Stage A: Memory & Storage
 
-1. `feat(storage): add cache workspace manager for page assets`
-2. `refactor(session): store page originals/processed images on disk with lazy loading`
-3. `refactor(import): convert import pipeline to streaming to avoid full-memory batches`
-4. `refactor(export): stream export from disk-backed pages where possible`
-5. `test(memory): add high-volume memory regression tests`
+Status: Mostly complete, memory regression benchmarking still open.
+
+1. [x] `feat(storage): add cache workspace manager for page assets`
+2. [x] `refactor(session): store page originals/processed images on disk with lazy loading`
+3. [x] `refactor(import): convert import pipeline to streaming to avoid full-memory batches`
+4. [x] `refactor(export): stream export from disk-backed pages where possible`
+5. [ ] `test(memory): add high-volume memory regression tests`
 
 ### Stage B: Office Lens Flow UX
 
-1. `feat(ui-flow): switch to guided flow Scan -> Review -> Export`
-2. `feat(ui-scan): simplify capture controls and add camera health state`
-3. `feat(ui-review): faster filmstrip with thumbnails from disk cache`
-4. `feat(ui-review): retake/replace page in-place`
-5. `docs(ui): in-app guidance and quick tips`
+Status: In progress.
+
+1. [x] `feat(ui-flow): switch to guided flow Scan -> Review -> Export`
+2. [ ] `feat(ui-scan): simplify capture controls and add camera health state`
+3. [x] `feat(ui-review): faster filmstrip with thumbnails from disk cache`
+4. [~] `feat(ui-review): retake/replace page in-place` (replace from file done, camera retake pending)
+5. [x] `docs(ui): in-app guidance and quick tips`
 
 ### Stage C: Preprocessing Clarity
 
-1. `feat(preprocess-ui): side-by-side before/after panel`
-2. `feat(preprocess-presets): Document, Whiteboard, Photo, B/W modes`
-3. `feat(preprocess-controls): expose threshold/contrast/denoise sliders`
-4. `feat(corners): manual 4-point corner correction`
-5. `test(preprocess): deterministic tests for filter and transform chain`
+Status: Complete for current scope.
+
+1. [x] `feat(preprocess-ui): side-by-side before/after panel`
+2. [x] `feat(preprocess-presets): Document, Whiteboard, Photo, B/W modes`
+3. [x] `feat(preprocess-controls): expose threshold/contrast/denoise sliders`
+4. [x] `feat(corners): manual 4-point corner correction`
+5. [x] `test(preprocess): deterministic tests for filter and transform chain`
 
 ### Stage D: Scan Quality
 
