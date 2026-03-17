@@ -13,6 +13,7 @@ import tkinter as tk
 from PIL import Image
 from tkinter import filedialog, messagebox
 
+from uniscan.export import export_pages_as_files, export_pages_as_pdf
 from uniscan.core.pipeline import PipelineOptions, process_loaded_items, split_spread
 from uniscan.core.postprocess import POSTPROCESSING_OPTIONS
 from uniscan.core.scanner_adapter import ScanAdapterError, scan_with_document_detector
@@ -65,6 +66,11 @@ class UnifiedScanApp(ctk.CTk):
         self.import_folder_var = tk.StringVar()
         self.import_files_var = tk.StringVar()
         self.import_pdf_dpi_var = tk.IntVar(value=300)
+        self.export_scope_var = tk.StringVar(value="All pages")
+        self.export_pdf_path_var = tk.StringVar()
+        self.export_dir_var = tk.StringVar()
+        self.export_format_var = tk.StringVar(value="png")
+        self.export_pdf_dpi_var = tk.IntVar(value=300)
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -92,7 +98,8 @@ class UnifiedScanApp(ctk.CTk):
         self._build_capture_tab(self.capture_tab)
         self._build_import_tab(self.import_tab)
         self._build_pages_tab(self.pages_tab)
-        for tab, name in ((self.export_tab, "Export"), (self.jobs_tab, "Jobs")):
+        self._build_export_tab(self.export_tab)
+        for tab, name in ((self.jobs_tab, "Jobs"),):
             body = ctk.CTkLabel(
                 tab,
                 text=f"{name} module: implementation in progress",
@@ -539,6 +546,77 @@ class UnifiedScanApp(ctk.CTk):
             pady=10,
         )
 
+    def _build_export_tab(self, tab: ctk.CTkFrame) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+
+        row_scope = ctk.CTkFrame(tab)
+        row_scope.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        ctk.CTkLabel(row_scope, text="Export scope").pack(side=ctk.LEFT, padx=(10, 8), pady=10)
+        ctk.CTkOptionMenu(
+            row_scope,
+            values=["All pages", "Selected pages"],
+            variable=self.export_scope_var,
+        ).pack(side=ctk.LEFT, padx=(0, 12), pady=10)
+
+        ctk.CTkLabel(row_scope, text="PDF DPI").pack(side=ctk.LEFT, padx=(0, 8), pady=10)
+        ctk.CTkEntry(row_scope, textvariable=self.export_pdf_dpi_var, width=90).pack(
+            side=ctk.LEFT,
+            padx=(0, 10),
+            pady=10,
+        )
+
+        row_pdf = ctk.CTkFrame(tab)
+        row_pdf.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+        row_pdf.grid_columnconfigure(0, weight=1)
+        ctk.CTkEntry(row_pdf, textvariable=self.export_pdf_path_var).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(10, 8),
+            pady=10,
+        )
+        ctk.CTkButton(row_pdf, text="Save PDF...", width=120, command=self.choose_export_pdf_path).grid(
+            row=0,
+            column=1,
+            padx=(0, 6),
+            pady=10,
+        )
+        ctk.CTkButton(row_pdf, text="Export PDF", width=120, command=self.export_to_pdf).grid(
+            row=0,
+            column=2,
+            padx=(0, 10),
+            pady=10,
+        )
+
+        row_files = ctk.CTkFrame(tab)
+        row_files.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+        row_files.grid_columnconfigure(0, weight=1)
+        ctk.CTkEntry(row_files, textvariable=self.export_dir_var).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(10, 8),
+            pady=10,
+        )
+        ctk.CTkButton(row_files, text="Dir...", width=80, command=self.choose_export_directory).grid(
+            row=0,
+            column=1,
+            padx=(0, 6),
+            pady=10,
+        )
+        ctk.CTkOptionMenu(
+            row_files,
+            values=["png", "jpg", "jpeg", "webp", "tif"],
+            variable=self.export_format_var,
+            width=100,
+        ).grid(row=0, column=2, padx=(0, 6), pady=10)
+        ctk.CTkButton(
+            row_files,
+            text="Export Files",
+            width=120,
+            command=self.export_to_files,
+        ).grid(row=0, column=3, padx=(0, 10), pady=10)
+
     def choose_import_folder(self) -> None:
         path = filedialog.askdirectory(title="Select input folder")
         if path:
@@ -713,6 +791,76 @@ class UnifiedScanApp(ctk.CTk):
             self._set_status("Postprocess reapplied to session")
         except Exception as exc:
             messagebox.showerror("Postprocess Error", str(exc))
+
+    def choose_export_pdf_path(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Save merged PDF as",
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+        )
+        if path:
+            self.export_pdf_path_var.set(path)
+
+    def choose_export_directory(self) -> None:
+        path = filedialog.askdirectory(title="Select output directory")
+        if path:
+            self.export_dir_var.set(path)
+
+    def _pages_for_export(self) -> list[np.ndarray]:
+        if self.export_scope_var.get() == "Selected pages":
+            self._sync_page_selection_to_session()
+            entries = self.session.selected_entries()
+        else:
+            entries = self.session.entries
+        return [entry.current_image for entry in entries]
+
+    def export_to_pdf(self) -> None:
+        try:
+            pages = self._pages_for_export()
+            if not pages:
+                raise RuntimeError("No pages available for export.")
+            path_raw = self.export_pdf_path_var.get().strip()
+            if not path_raw:
+                chosen = filedialog.asksaveasfilename(
+                    title="Save merged PDF as",
+                    defaultextension=".pdf",
+                    filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+                )
+                if not chosen:
+                    return
+                path_raw = chosen
+                self.export_pdf_path_var.set(chosen)
+            dpi = int(self.export_pdf_dpi_var.get())
+            if dpi < 72:
+                raise RuntimeError("PDF DPI must be >= 72.")
+            out_path = export_pages_as_pdf(pages, out_pdf=Path(path_raw), dpi=dpi)
+            self._set_status(f"Exported {len(pages)} page(s) to PDF: {out_path}")
+        except Exception as exc:
+            messagebox.showerror("Export PDF Error", str(exc))
+            self._set_status("PDF export failed")
+
+    def export_to_files(self) -> None:
+        try:
+            pages = self._pages_for_export()
+            if not pages:
+                raise RuntimeError("No pages available for export.")
+            path_raw = self.export_dir_var.get().strip()
+            if not path_raw:
+                chosen = filedialog.askdirectory(title="Select output directory")
+                if not chosen:
+                    return
+                path_raw = chosen
+                self.export_dir_var.set(chosen)
+            out_paths = export_pages_as_files(
+                pages,
+                output_dir=Path(path_raw),
+                ext=self.export_format_var.get(),
+                base_name="page",
+            )
+            self._set_status(f"Exported {len(out_paths)} file(s) to: {Path(path_raw)}")
+        except Exception as exc:
+            messagebox.showerror("Export Files Error", str(exc))
+            self._set_status("Files export failed")
 
 
 def run_app() -> int:
