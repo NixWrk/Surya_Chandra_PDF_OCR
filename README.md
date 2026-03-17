@@ -17,6 +17,31 @@ python camscan_hybrid_tool.py
 
 `camscan_hybrid_tool.py` is the current unified variant for your workflow.
 
+## New Unified App (In Progress)
+
+A new package-based unified application is being built under `src/uniscan`.
+
+Run (from repository root):
+
+```powershell
+set PYTHONPATH=src
+python -m uniscan.cli
+```
+
+Or after installation:
+
+```powershell
+uniscan
+```
+
+Current implemented modules in this new app:
+
+1. `Capture`: live preview, single capture, burst capture, camera configuration
+2. `Import`: folder/files/PDF import into one session
+3. `Pages`: page list management (preview, reorder, select/delete)
+4. `Export`: merged PDF and separate image export
+5. `Jobs`: background job progress and cancellation
+
 ## What The App Does
 
 `camscan_hybrid_tool.py` supports three source modes:
