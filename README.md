@@ -28,6 +28,12 @@ set PYTHONPATH=src
 python -m uniscan.cli
 ```
 
+One-script launcher (recommended on Windows):
+
+```powershell
+.\run_uniscan.cmd
+```
+
 Or after installation:
 
 ```powershell
