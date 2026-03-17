@@ -23,6 +23,7 @@ Deliver a PC-first Office Lens analogue:
 3. Guided flow is active: step-based tabs and auto-jump to `Review` after capture/import.
 4. Office Lens style modes are active: `Document`, `Whiteboard`, `Photo`, `B/W`.
 5. In-place page replacement is active for selected page (`Replace Sel...` from image file).
+6. OCR core is active: dependency detection and optional searchable PDF export path.
 
 ## Implementation Stages
 
@@ -66,10 +67,12 @@ Status: Complete for current scope.
 
 ### Stage E: OCR/Searchable PDF
 
-1. `feat(ocr-core): OCR engine abstraction and dependency checks`
-2. `feat(ocr-ui): OCR language/profile controls`
-3. `feat(ocr-export): searchable PDF text layer`
-4. `test(ocr): integration tests on fixtures`
+Status: In progress.
+
+1. [x] `feat(ocr-core): OCR engine abstraction and dependency checks`
+2. [x] `feat(ocr-ui): OCR language/profile controls`
+3. [~] `feat(ocr-export): searchable PDF text layer` (first implementation done, needs fixture validation)
+4. [ ] `test(ocr): integration tests on fixtures`
 
 ### Stage F: Production Readiness
 

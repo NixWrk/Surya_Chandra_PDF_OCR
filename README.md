@@ -45,7 +45,7 @@ Quick workflow (Office Lens style):
 1. Open tab `1. Scan` and pick a `Lens mode` (`Document`, `Whiteboard`, `Photo`, `B/W`).
 2. Capture from camera or go to `2. Import` and load files/folder.
 3. App switches to `3. Review`: reorder, rotate, deskew, manual corners, before/after check.
-4. Open `4. Export` and save merged PDF or image files.
+4. Open `4. Export` and save merged PDF or image files (`Searchable PDF (OCR)` is optional).
 
 Current implemented modules in this new app:
 
@@ -60,6 +60,7 @@ Implementation notes:
 1. Session pages are disk-backed (`uniscan` cache) with lazy reads to reduce RAM usage on large batches.
 2. `Pages` review now shows `Before/After` preview for preprocessing visibility.
 3. Capture preprocessing includes Office Lens style modes (`Document`, `Whiteboard`, `Photo`, `B/W`) plus manual preset/sliders.
+4. Export tab supports optional searchable PDF via OCR (`tesseract` + `pytesseract` + `pypdf`) with dependency status check.
 
 ## What The App Does
 
@@ -111,6 +112,14 @@ Install dependencies:
 ```powershell
 pip install opencv-python numpy pillow img2pdf pymupdf
 ```
+
+Optional for searchable PDF OCR in the new app:
+
+```powershell
+pip install pytesseract pypdf
+```
+
+Also install Tesseract OCR engine (system package / installer) and ensure `tesseract` is in `PATH`.
 
 If you plan to use legacy scripts with OCR, install additionally:
 
