@@ -52,6 +52,7 @@ class UnifiedScanApp(ctk.CTk):
         self.camera: CameraService | None = None
         self.preview_job: str | None = None
         self.preview_photo: ctk.CTkImage | None = None
+        self.page_preview_photo: ctk.CTkImage | None = None
 
         self.status_var = tk.StringVar(value="Ready")
         self.camera_index_var = tk.IntVar(value=0)
@@ -90,7 +91,8 @@ class UnifiedScanApp(ctk.CTk):
 
         self._build_capture_tab(self.capture_tab)
         self._build_import_tab(self.import_tab)
-        for tab, name in ((self.pages_tab, "Pages"), (self.export_tab, "Export"), (self.jobs_tab, "Jobs")):
+        self._build_pages_tab(self.pages_tab)
+        for tab, name in ((self.export_tab, "Export"), (self.jobs_tab, "Jobs")):
             body = ctk.CTkLabel(
                 tab,
                 text=f"{name} module: implementation in progress",
@@ -188,6 +190,55 @@ class UnifiedScanApp(ctk.CTk):
         )
         self.preview_label.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
+    def _build_pages_tab(self, tab: ctk.CTkFrame) -> None:
+        tab.grid_columnconfigure(0, weight=0)
+        tab.grid_columnconfigure(1, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        left = ctk.CTkFrame(tab)
+        left.grid(row=0, column=0, sticky="ns", padx=(12, 8), pady=12)
+
+        ctk.CTkLabel(left, text="Session Pages").pack(anchor="w", padx=10, pady=(10, 6))
+        self.page_listbox = tk.Listbox(left, selectmode=tk.EXTENDED, width=46, height=24)
+        self.page_listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
+        self.page_listbox.bind("<<ListboxSelect>>", self.on_page_select)
+
+        row_a = ctk.CTkFrame(left, fg_color="transparent")
+        row_a.pack(fill=ctk.X, padx=10, pady=(0, 4))
+        ctk.CTkButton(row_a, text="Move Up", width=110, command=self.move_selected_up).pack(side=ctk.LEFT)
+        ctk.CTkButton(row_a, text="Move Down", width=110, command=self.move_selected_down).pack(
+            side=ctk.LEFT,
+            padx=6,
+        )
+
+        row_b = ctk.CTkFrame(left, fg_color="transparent")
+        row_b.pack(fill=ctk.X, padx=10, pady=(0, 4))
+        ctk.CTkButton(row_b, text="Select All", width=110, command=self.select_all_pages).pack(side=ctk.LEFT)
+        ctk.CTkButton(row_b, text="Clear Sel", width=110, command=self.clear_page_selection).pack(
+            side=ctk.LEFT,
+            padx=6,
+        )
+
+        row_c = ctk.CTkFrame(left, fg_color="transparent")
+        row_c.pack(fill=ctk.X, padx=10, pady=(0, 4))
+        ctk.CTkButton(row_c, text="Delete Sel", width=110, command=self.delete_selected_pages).pack(side=ctk.LEFT)
+        ctk.CTkButton(row_c, text="Refresh", width=110, command=self.refresh_page_list).pack(side=ctk.LEFT, padx=6)
+
+        ctk.CTkButton(
+            left,
+            text="Apply Current Postprocess",
+            command=self.apply_postprocess_to_session,
+        ).pack(fill=ctk.X, padx=10, pady=(0, 10))
+
+        right = ctk.CTkFrame(tab)
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 12), pady=12)
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        self.page_preview_label = ctk.CTkLabel(right, text="No page selected")
+        self.page_preview_label.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.refresh_page_list()
+
     def _on_close(self) -> None:
         self.stop_preview()
         if self.camera is not None:
@@ -279,13 +330,18 @@ class UnifiedScanApp(ctk.CTk):
         return fn(image)
 
     def _show_in_preview(self, image: np.ndarray) -> None:
+        photo = self._to_ctk_photo_for_label(image, self.preview_label)
+        self.preview_photo = photo
+        self.preview_label.configure(image=photo, text="")
+
+    def _to_ctk_photo_for_label(self, image: np.ndarray, label: ctk.CTkLabel) -> ctk.CTkImage:
         if len(image.shape) == 2:
             rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         else:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        max_width = max(200, self.preview_label.winfo_width())
-        max_height = max(120, self.preview_label.winfo_height())
+        max_width = max(200, label.winfo_width())
+        max_height = max(120, label.winfo_height())
         h, w = rgb.shape[:2]
         scale = min(max_width / w, max_height / h)
         new_w = max(1, int(w * scale))
@@ -293,8 +349,7 @@ class UnifiedScanApp(ctk.CTk):
         resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
         pil_image = Image.fromarray(resized)
-        self.preview_photo = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=(new_w, new_h))
-        self.preview_label.configure(image=self.preview_photo, text="")
+        return ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=(new_w, new_h))
 
     def _process_capture_frame(self, frame: np.ndarray, base_name: str) -> list[tuple[str, np.ndarray]]:
         use_detector = self.detect_document_var.get() and not self.free_capture_var.get()
@@ -326,6 +381,7 @@ class UnifiedScanApp(ctk.CTk):
             timestamp = datetime.now().strftime(r"%Y%m%d_%H%M%S_%f")
             items = self._process_capture_frame(frame, base_name=timestamp)
             self.session.add_images(items)
+            self.refresh_page_list(keep_index=len(self.session) - 1)
             self._set_status(f"Captured {len(items)} page(s). Session pages: {len(self.session)}")
         except Exception as exc:
             messagebox.showerror("Capture Error", str(exc))
@@ -343,6 +399,7 @@ class UnifiedScanApp(ctk.CTk):
                 items = self._process_capture_frame(frame, base_name=f"{timestamp}_{idx:03d}")
                 self.session.add_images(items)
                 added_pages += len(items)
+            self.refresh_page_list(keep_index=len(self.session) - 1)
             self._set_status(f"Burst captured {added_pages} page(s). Session pages: {len(self.session)}")
         except Exception as exc:
             messagebox.showerror("Burst Error", str(exc))
@@ -553,9 +610,109 @@ class UnifiedScanApp(ctk.CTk):
         )
         items = [(f"{source_label}_{idx:05d}", page) for idx, page in enumerate(pages, start=1)]
         self.session.add_images(items)
+        self.refresh_page_list(keep_index=len(self.session) - 1)
         self._set_status(
             f"Imported {len(paths)} file(s), added {len(items)} page(s). Session pages: {len(self.session)}"
         )
+
+    def refresh_page_list(self, keep_index: int | None = None) -> None:
+        self.page_listbox.delete(0, tk.END)
+        for idx, entry in enumerate(self.session.entries, start=1):
+            self.page_listbox.insert(tk.END, f"{idx:04d}  {entry.name}")
+
+        if keep_index is not None and len(self.session.entries) > 0:
+            keep_index = max(0, min(keep_index, len(self.session.entries) - 1))
+            self.page_listbox.selection_set(keep_index)
+        self._sync_page_selection_to_session()
+        self.update_page_preview()
+
+    def _sync_page_selection_to_session(self) -> None:
+        selected = set(self.page_listbox.curselection())
+        for idx, entry in enumerate(self.session.entries):
+            entry.selected = idx in selected
+
+    def on_page_select(self, _event=None) -> None:
+        self._sync_page_selection_to_session()
+        self.update_page_preview()
+
+    def update_page_preview(self) -> None:
+        selected = self.page_listbox.curselection()
+        if len(selected) != 1:
+            self.page_preview_label.configure(image=None, text="Select one page to preview")
+            self.page_preview_photo = None
+            return
+
+        index = selected[0]
+        if index < 0 or index >= len(self.session.entries):
+            self.page_preview_label.configure(image=None, text="Select one page to preview")
+            self.page_preview_photo = None
+            return
+
+        image = self.session.entries[index].current_image
+        photo = self._to_ctk_photo_for_label(image, self.page_preview_label)
+        self.page_preview_photo = photo
+        self.page_preview_label.configure(image=photo, text="")
+
+    def _single_selected_index(self) -> int | None:
+        selected = self.page_listbox.curselection()
+        if len(selected) != 1:
+            return None
+        return selected[0]
+
+    def move_selected_up(self) -> None:
+        index = self._single_selected_index()
+        if index is None:
+            self._set_status("Select exactly one page to move.")
+            return
+        if index == 0:
+            return
+        entry_id = self.session.entries[index].entry_id
+        moved = self.session.move(entry_id, -1)
+        if moved:
+            self.refresh_page_list(keep_index=index - 1)
+            self._set_status("Moved page up")
+
+    def move_selected_down(self) -> None:
+        index = self._single_selected_index()
+        if index is None:
+            self._set_status("Select exactly one page to move.")
+            return
+        if index >= len(self.session.entries) - 1:
+            return
+        entry_id = self.session.entries[index].entry_id
+        moved = self.session.move(entry_id, 1)
+        if moved:
+            self.refresh_page_list(keep_index=index + 1)
+            self._set_status("Moved page down")
+
+    def select_all_pages(self) -> None:
+        self.page_listbox.selection_set(0, tk.END)
+        self._sync_page_selection_to_session()
+        self.update_page_preview()
+        self._set_status("Selected all pages")
+
+    def clear_page_selection(self) -> None:
+        self.page_listbox.selection_clear(0, tk.END)
+        self._sync_page_selection_to_session()
+        self.update_page_preview()
+        self._set_status("Selection cleared")
+
+    def delete_selected_pages(self) -> None:
+        self._sync_page_selection_to_session()
+        removed = self.session.remove_selected()
+        if removed <= 0:
+            self._set_status("No selected pages to delete")
+            return
+        self.refresh_page_list()
+        self._set_status(f"Deleted {removed} page(s). Session pages: {len(self.session)}")
+
+    def apply_postprocess_to_session(self) -> None:
+        try:
+            self.session.apply_postprocess(self.postprocess_var.get())
+            self.update_page_preview()
+            self._set_status("Postprocess reapplied to session")
+        except Exception as exc:
+            messagebox.showerror("Postprocess Error", str(exc))
 
 
 def run_app() -> int:
