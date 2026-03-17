@@ -254,6 +254,7 @@ class UnifiedScanApp(ctk.CTk):
         self.job_cancel_event.set()
         if self.camera is not None:
             self.camera.release()
+        self.session.close()
         self.destroy()
 
     def _set_status(self, text: str) -> None:

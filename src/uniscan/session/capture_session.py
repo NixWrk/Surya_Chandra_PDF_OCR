@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
 
 from uniscan.core.postprocess import POSTPROCESSING_OPTIONS
+from uniscan.storage import PageStore
 
 
 @dataclass(slots=True)
@@ -15,24 +17,49 @@ class CaptureEntry:
     """Single page entry in a capture/import session."""
 
     name: str
-    original_image: np.ndarray
-    current_image: np.ndarray
+    store: PageStore
+    original_path: Path
+    current_path: Path
+    thumb_path: Path
     selected: bool = False
     entry_id: str = field(default_factory=lambda: uuid4().hex)
 
     @classmethod
-    def from_image(cls, *, name: str, image: np.ndarray) -> "CaptureEntry":
+    def from_image(cls, *, name: str, image: np.ndarray, store: PageStore) -> "CaptureEntry":
+        entry_id = uuid4().hex
+        original_path, current_path, thumb_path = store.add_page(entry_id, image)
         return cls(
             name=name,
-            original_image=image.copy(),
-            current_image=image.copy(),
+            store=store,
+            original_path=original_path,
+            current_path=current_path,
+            thumb_path=thumb_path,
+            entry_id=entry_id,
         )
+
+    @property
+    def original_image(self) -> np.ndarray:
+        return self.store.read_image(self.original_path)
+
+    @property
+    def current_image(self) -> np.ndarray:
+        return self.store.read_image(self.current_path)
+
+    @current_image.setter
+    def current_image(self, image: np.ndarray) -> None:
+        self.store.write_image(self.current_path, image)
+        self.store.write_thumbnail(self.thumb_path, image)
+
+    @property
+    def thumbnail_image(self) -> np.ndarray:
+        return self.store.read_image(self.thumb_path)
 
 
 class CaptureSession:
-    """Ordered in-memory list of page entries with editor operations."""
+    """Ordered page session with disk-backed image storage."""
 
-    def __init__(self) -> None:
+    def __init__(self, store: PageStore | None = None) -> None:
+        self.store = store or PageStore()
         self._entries: list[CaptureEntry] = []
 
     @property
@@ -43,13 +70,15 @@ class CaptureSession:
         return len(self._entries)
 
     def clear(self) -> None:
+        for entry in self._entries:
+            self.store.remove_page(entry.entry_id)
         self._entries.clear()
 
     def add_entry(self, entry: CaptureEntry) -> None:
         self._entries.append(entry)
 
     def add_image(self, *, name: str, image: np.ndarray) -> CaptureEntry:
-        entry = CaptureEntry.from_image(name=name, image=image)
+        entry = CaptureEntry.from_image(name=name, image=image, store=self.store)
         self._entries.append(entry)
         return entry
 
@@ -76,7 +105,13 @@ class CaptureSession:
 
     def remove_selected(self) -> int:
         before = len(self._entries)
-        self._entries = [entry for entry in self._entries if not entry.selected]
+        kept: list[CaptureEntry] = []
+        for entry in self._entries:
+            if entry.selected:
+                self.store.remove_page(entry.entry_id)
+            else:
+                kept.append(entry)
+        self._entries = kept
         return before - len(self._entries)
 
     def apply_postprocess(self, postprocess_name: str) -> None:
@@ -88,6 +123,10 @@ class CaptureSession:
 
     def selected_entries(self) -> list[CaptureEntry]:
         return [entry for entry in self._entries if entry.selected]
+
+    def close(self) -> None:
+        self.clear()
+        self.store.close()
 
     def _find_index(self, entry_id: str) -> int | None:
         for idx, entry in enumerate(self._entries):
