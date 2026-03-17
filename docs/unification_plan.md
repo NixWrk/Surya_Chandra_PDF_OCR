@@ -22,7 +22,7 @@ Deliver a PC-first Office Lens analogue:
 2. Review quality tools are active: before/after preview, manual corners, rotate, auto-deskew.
 3. Guided flow is active: step-based tabs and auto-jump to `Review` after capture/import.
 4. Office Lens style modes are active: `Document`, `Whiteboard`, `Photo`, `B/W`.
-5. In-place page replacement is active for selected page (`Replace Sel...` from image file).
+5. In-place page replacement/retake is active for selected page (`Replace Sel...` and `Retake Cam`).
 6. OCR core is active: dependency detection and optional searchable PDF export path.
 7. Camera health indicator is active (`Closed/Open/Previewing/Error`) in scan controls.
 
@@ -45,7 +45,7 @@ Status: In progress.
 1. [x] `feat(ui-flow): switch to guided flow Scan -> Review -> Export`
 2. [x] `feat(ui-scan): simplify capture controls and add camera health state`
 3. [x] `feat(ui-review): faster filmstrip with thumbnails from disk cache`
-4. [~] `feat(ui-review): retake/replace page in-place` (replace from file done, camera retake pending)
+4. [x] `feat(ui-review): retake/replace page in-place`
 5. [x] `docs(ui): in-app guidance and quick tips`
 
 ### Stage C: Preprocessing Clarity
