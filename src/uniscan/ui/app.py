@@ -78,6 +78,8 @@ class UnifiedScanApp(ctk.CTk):
         self.preview_photo: ctk.CTkImage | None = None
         self.page_preview_before_photo: ctk.CTkImage | None = None
         self.page_preview_after_photo: ctk.CTkImage | None = None
+        self.import_preview_before_photo: ctk.CTkImage | None = None
+        self.import_preview_after_photo: ctk.CTkImage | None = None
 
         self.status_var = tk.StringVar(value="Ready")
         self.camera_health_var = tk.StringVar(value="Camera: Closed")
@@ -545,11 +547,13 @@ class UnifiedScanApp(ctk.CTk):
 
     def _on_import_postprocess_mode_change(self, _value: str) -> None:
         self._sync_import_lens_mode_from_controls()
+        self.preview_import_processing()
 
     def on_import_lens_mode_change(self, mode_name: str) -> None:
         profile = resolve_lens_mode_profile(mode_name)
         if profile is None:
             self._set_status("Import mode set to Custom (manual controls).")
+            self.preview_import_processing()
             return
 
         self.import_preprocess_preset_var.set(profile.preset_name)
@@ -573,6 +577,7 @@ class UnifiedScanApp(ctk.CTk):
         elif preset_name == "Photo" and self.import_postprocess_var.get() == "Black and White":
             self.import_postprocess_var.set("None")
         self._sync_import_lens_mode_from_controls()
+        self.preview_import_processing()
 
     def _set_job_display(self, *, stage: str | None = None, current: str | None = None, progress: int | None = None) -> None:
         if stage is not None:
@@ -1128,6 +1133,46 @@ class UnifiedScanApp(ctk.CTk):
         row_sliders.grid_columnconfigure(1, weight=1)
         row_sliders.grid_columnconfigure(3, weight=1)
 
+        row_preview_controls = ctk.CTkFrame(import_profile, fg_color="transparent")
+        row_preview_controls.pack(fill=ctk.X, padx=10, pady=(0, 8))
+        ctk.CTkButton(
+            row_preview_controls,
+            text="Preview Import Settings",
+            command=self.preview_import_processing,
+            width=200,
+        ).pack(side=ctk.LEFT)
+        ctk.CTkLabel(
+            row_preview_controls,
+            text="Shows first selected file/folder item.",
+            anchor="w",
+        ).pack(side=ctk.LEFT, padx=(10, 0))
+
+        preview_grid = ctk.CTkFrame(import_profile)
+        preview_grid.pack(fill=ctk.BOTH, expand=True, padx=10, pady=(0, 10))
+        preview_grid.grid_rowconfigure(1, weight=1)
+        preview_grid.grid_columnconfigure(0, weight=1)
+        preview_grid.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(preview_grid, text="Before (import sample)").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=8,
+            pady=(8, 4),
+        )
+        ctk.CTkLabel(preview_grid, text="After (import profile)").grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=8,
+            pady=(8, 4),
+        )
+
+        self.import_preview_before_label = ctk.CTkLabel(preview_grid, text="Select file/folder and click preview")
+        self.import_preview_before_label.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=(0, 8))
+        self.import_preview_after_label = ctk.CTkLabel(preview_grid, text="Select file/folder and click preview")
+        self.import_preview_after_label.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=(0, 8))
+
     def _build_export_tab(self, tab: ctk.CTkFrame) -> None:
         tab.grid_columnconfigure(0, weight=1)
 
@@ -1276,10 +1321,79 @@ class UnifiedScanApp(ctk.CTk):
         )
         self.job_cancel_button.grid(row=6, column=0, sticky="w", padx=10, pady=(0, 10))
 
+    def _resolve_import_preview_source_path(self) -> Path | None:
+        raw_files = [part.strip().strip('"') for part in self.import_files_var.get().split(";") if part.strip()]
+        for item in raw_files:
+            path = Path(item)
+            if path.exists() and path.is_file() and path.suffix.lower() in (IMG_EXTS | PDF_EXTS):
+                return path
+
+        folder_raw = self.import_folder_var.get().strip()
+        if folder_raw:
+            folder = Path(folder_raw)
+            try:
+                paths = list_supported_in_folder(folder)
+            except Exception:
+                return None
+            if paths:
+                return paths[0]
+        return None
+
+    def preview_import_processing(self) -> None:
+        path = self._resolve_import_preview_source_path()
+        if path is None:
+            self.import_preview_before_label.configure(image=None, text="Select file/folder and click preview")
+            self.import_preview_after_label.configure(image=None, text="Select file/folder and click preview")
+            self.import_preview_before_photo = None
+            self.import_preview_after_photo = None
+            return
+
+        try:
+            pdf_dpi = int(self.import_pdf_dpi_var.get())
+            if pdf_dpi < 72:
+                raise RuntimeError("PDF DPI must be >= 72.")
+
+            loaded = load_input_items([path], pdf_dpi=pdf_dpi)
+            pipeline_options = PipelineOptions(
+                detect_document=bool(self.import_detect_document_var.get()),
+                two_page_mode=bool(self.import_two_page_mode_var.get()),
+                postprocess_name="None",
+            )
+            pages = process_loaded_items(
+                loaded,
+                options=pipeline_options,
+                scanner_root=self.scanner_root,
+            )
+            if not pages:
+                raise RuntimeError("No pages produced for preview.")
+
+            before = pages[0]
+            postprocess_fn = POSTPROCESSING_OPTIONS.get(
+                self.import_postprocess_var.get(),
+                POSTPROCESSING_OPTIONS["None"],
+            )
+            after = apply_enhancements(postprocess_fn(before), self._current_import_preprocess_settings())
+
+            before_photo = self._to_ctk_photo_for_label(before, self.import_preview_before_label)
+            after_photo = self._to_ctk_photo_for_label(after, self.import_preview_after_label)
+
+            self.import_preview_before_photo = before_photo
+            self.import_preview_after_photo = after_photo
+            self.import_preview_before_label.configure(image=before_photo, text="")
+            self.import_preview_after_label.configure(image=after_photo, text="")
+            self._set_status(f"Import preview updated for: {path.name}")
+        except Exception as exc:
+            self.import_preview_before_label.configure(image=None, text="Preview failed")
+            self.import_preview_after_label.configure(image=None, text=str(exc))
+            self.import_preview_before_photo = None
+            self.import_preview_after_photo = None
+            self._set_status("Import preview failed")
+
     def choose_import_folder(self) -> None:
         path = filedialog.askdirectory(title="Select input folder")
         if path:
             self.import_folder_var.set(path)
+            self.preview_import_processing()
 
     def choose_import_files(self) -> None:
         files = filedialog.askopenfilenames(
@@ -1294,6 +1408,7 @@ class UnifiedScanApp(ctk.CTk):
         )
         if files:
             self.import_files_var.set(";".join(files))
+            self.preview_import_processing()
 
     def import_from_folder(self) -> None:
         try:
