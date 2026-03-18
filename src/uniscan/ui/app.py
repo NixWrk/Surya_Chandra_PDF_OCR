@@ -44,7 +44,7 @@ from uniscan.ocr import (
 from uniscan.session import CaptureSession
 from uniscan.ui.camera_health import camera_health_state
 
-PREVIEW_WAIT_MS = 80
+PREVIEW_WAIT_MS = 25
 RESOLUTIONS = [
     "3264x2448",
     "3264x1836",
@@ -87,6 +87,7 @@ class UnifiedScanApp(ctk.CTk):
         self.detect_document_var = tk.BooleanVar(value=True)
         self.two_page_mode_var = tk.BooleanVar(value=False)
         self.free_capture_var = tk.BooleanVar(value=False)
+        self.live_contour_preview_var = tk.BooleanVar(value=False)
         self.postprocess_var = tk.StringVar(value="None")
         self.lens_mode_var = tk.StringVar(value="Document")
         self.preprocess_preset_var = tk.StringVar(value="Document")
@@ -112,8 +113,8 @@ class UnifiedScanApp(ctk.CTk):
         self.job_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.job_cancel_event = threading.Event()
         self.job_thread: threading.Thread | None = None
-        self.tab_scan_name = "1. Scan"
-        self.tab_import_name = "2. Import"
+        self.tab_import_name = "1. Import"
+        self.tab_scan_name = "2. Scan"
         self.tab_review_name = "3. Review"
         self.tab_export_name = "4. Export"
         self.tab_jobs_name = "5. Jobs"
@@ -138,7 +139,7 @@ class UnifiedScanApp(ctk.CTk):
 
         flow_tip = ctk.CTkLabel(
             container,
-            text="Flow: 1) Scan from camera or import files  2) Review and correct pages  3) Export PDF or images",
+            text="Flow: 1) Import files (main) or scan camera  2) Review and correct pages  3) Export PDF or images",
             anchor="w",
         )
         flow_tip.pack(fill=ctk.X, padx=12, pady=(0, 6))
@@ -146,17 +147,18 @@ class UnifiedScanApp(ctk.CTk):
         self.tabs = ctk.CTkTabview(container)
         self.tabs.pack(fill=ctk.BOTH, expand=True, padx=12, pady=12)
 
-        self.capture_tab = self.tabs.add(self.tab_scan_name)
         self.import_tab = self.tabs.add(self.tab_import_name)
+        self.capture_tab = self.tabs.add(self.tab_scan_name)
         self.pages_tab = self.tabs.add(self.tab_review_name)
         self.export_tab = self.tabs.add(self.tab_export_name)
         self.jobs_tab = self.tabs.add(self.tab_jobs_name)
 
-        self._build_capture_tab(self.capture_tab)
         self._build_import_tab(self.import_tab)
+        self._build_capture_tab(self.capture_tab)
         self._build_pages_tab(self.pages_tab)
         self._build_export_tab(self.export_tab)
         self._build_jobs_tab(self.jobs_tab)
+        self.tabs.set(self.tab_import_name)
 
         status_frame = ctk.CTkFrame(container)
         status_frame.pack(fill=ctk.X, padx=12, pady=(0, 12))
@@ -208,6 +210,11 @@ class UnifiedScanApp(ctk.CTk):
             text="Free capture mode",
             variable=self.free_capture_var,
         ).pack(anchor="w", padx=10, pady=(2, 8))
+        ctk.CTkCheckBox(
+            controls,
+            text="Live contour in preview (slower)",
+            variable=self.live_contour_preview_var,
+        ).pack(anchor="w", padx=10, pady=(0, 8))
 
         ctk.CTkLabel(controls, text="Lens mode").pack(anchor="w", padx=10, pady=(4, 2))
         self.lens_mode_menu = ctk.CTkOptionMenu(
@@ -565,7 +572,9 @@ class UnifiedScanApp(ctk.CTk):
                 elif kind == "import_chunk":
                     items = payload
                     if items:
-                        self.session.add_images(items)
+                        added = self.session.add_images(items)
+                        for entry in added:
+                            self._reprocess_entry_from_original(entry)
                         self.refresh_page_list(keep_index=len(self.session) - 1)
                 elif kind == "done":
                     on_done, result, name = payload
@@ -597,15 +606,27 @@ class UnifiedScanApp(ctk.CTk):
         self._set_job_display(current="Cancellation requested...")
         self._set_status("Cancellation requested")
 
+    def _max_camera_resolution(self) -> tuple[int, int]:
+        best = RESOLUTIONS[0]
+        match = re.match(r"^(\d+)x(\d+)$", best.strip())
+        if match is None:
+            return (3264, 2448)
+        return (int(match.group(1)), int(match.group(2)))
+
     def _ensure_camera(self) -> CameraService:
         index = int(self.camera_index_var.get())
+        resolution = self._max_camera_resolution()
         if self.camera is None:
-            self.camera = CameraService(index=index)
+            self.camera = CameraService(index=index, resolution=resolution)
             self.camera.open()
         elif self.camera.index != index:
             self.camera.set_index(index)
+            self.camera.set_resolution(resolution)
         elif self.camera.read_frame() is None:
             self.camera.open()
+            self.camera.set_resolution(resolution)
+        else:
+            self.camera.set_resolution(resolution)
         return self.camera
 
     def open_camera(self) -> None:
@@ -657,10 +678,8 @@ class UnifiedScanApp(ctk.CTk):
         self.preview_job = self.after(PREVIEW_WAIT_MS, self._preview_loop)
 
     def _preview_image_with_contour(self, frame: np.ndarray) -> np.ndarray:
-        image = self._apply_postprocess(frame)
-        if len(image.shape) == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        if self.detect_document_var.get() and not self.free_capture_var.get():
+        image = frame
+        if self.live_contour_preview_var.get() and self.detect_document_var.get() and not self.free_capture_var.get():
             try:
                 scan_output = scan_with_document_detector(
                     frame,
@@ -728,14 +747,10 @@ class UnifiedScanApp(ctk.CTk):
         detect_document: bool | None = None,
         two_page_mode: bool | None = None,
         free_capture: bool | None = None,
-        postprocess_name: str | None = None,
-        preprocess_settings: PreprocessSettings | None = None,
     ) -> list[tuple[str, np.ndarray]]:
         detect_document = bool(self.detect_document_var.get()) if detect_document is None else detect_document
         two_page_mode = bool(self.two_page_mode_var.get()) if two_page_mode is None else two_page_mode
         free_capture = bool(self.free_capture_var.get()) if free_capture is None else free_capture
-        postprocess_name = self.postprocess_var.get() if postprocess_name is None else postprocess_name
-        preprocess_settings = self._current_preprocess_settings() if preprocess_settings is None else preprocess_settings
 
         use_detector = detect_document and not free_capture
         working = frame
@@ -751,10 +766,7 @@ class UnifiedScanApp(ctk.CTk):
                 )
             working = scan_output.warped
 
-        postprocess_fn = POSTPROCESSING_OPTIONS.get(postprocess_name, POSTPROCESSING_OPTIONS["None"])
-        processed = postprocess_fn(working)
-        processed = apply_enhancements(processed, preprocess_settings)
-        pages = split_spread(processed) if two_page_mode else [processed]
+        pages = split_spread(working) if two_page_mode else [working]
         if len(pages) == 1:
             return [(base_name, pages[0])]
         return [(f"{base_name}_{idx}", page) for idx, page in enumerate(pages, start=1)]
@@ -767,7 +779,9 @@ class UnifiedScanApp(ctk.CTk):
                 raise RuntimeError("Could not capture an image from the camera.")
             timestamp = datetime.now().strftime(r"%Y%m%d_%H%M%S_%f")
             items = self._process_capture_frame(frame, base_name=timestamp)
-            self.session.add_images(items)
+            added = self.session.add_images(items)
+            for entry in added:
+                self._reprocess_entry_from_original(entry)
             self.refresh_page_list(keep_index=len(self.session) - 1)
             self.go_to_review_tab()
             self._set_status(f"Captured {len(items)} page(s). Session pages: {len(self.session)}")
@@ -783,8 +797,6 @@ class UnifiedScanApp(ctk.CTk):
             detect_document = bool(self.detect_document_var.get())
             two_page_mode = bool(self.two_page_mode_var.get())
             free_capture = bool(self.free_capture_var.get())
-            postprocess_name = self.postprocess_var.get()
-            preprocess_settings = self._current_preprocess_settings()
             timestamp = datetime.now().strftime(r"%Y%m%d_%H%M%S")
 
             self.stop_preview()
@@ -818,8 +830,6 @@ class UnifiedScanApp(ctk.CTk):
                         detect_document=detect_document,
                         two_page_mode=two_page_mode,
                         free_capture=free_capture,
-                        postprocess_name=postprocess_name,
-                        preprocess_settings=preprocess_settings,
                     )
                     items.extend(current_items)
                     emit(
@@ -830,7 +840,9 @@ class UnifiedScanApp(ctk.CTk):
                 return items
 
             def on_done(items):
-                self.session.add_images(items)
+                added = self.session.add_images(items)
+                for entry in added:
+                    self._reprocess_entry_from_original(entry)
                 self.refresh_page_list(keep_index=len(self.session) - 1)
                 self.go_to_review_tab()
                 self._set_status(f"Burst captured {len(items)} page(s). Session pages: {len(self.session)}")
@@ -962,7 +974,7 @@ class UnifiedScanApp(ctk.CTk):
         )
         ctk.CTkLabel(
             row_options,
-            text="Uses current Scan settings (lens mode, detect/split, postprocess)",
+            text="Import keeps originals; apply postprocess/preprocess later in Review tab",
             anchor="w",
         ).pack(side=ctk.LEFT, padx=(0, 10), pady=10)
 
@@ -1178,9 +1190,8 @@ class UnifiedScanApp(ctk.CTk):
         pipeline_options = PipelineOptions(
             detect_document=bool(self.detect_document_var.get()),
             two_page_mode=bool(self.two_page_mode_var.get()),
-            postprocess_name=self.postprocess_var.get(),
+            postprocess_name="None",
         )
-        preprocess_settings = self._current_preprocess_settings()
         self._set_status(f"Starting import for {len(paths)} file(s)...")
 
         def worker(emit, is_cancelled):
@@ -1212,8 +1223,7 @@ class UnifiedScanApp(ctk.CTk):
 
                 items_chunk: list[tuple[str, np.ndarray]] = []
                 for page in pages_for_file:
-                    enhanced = apply_enhancements(page, preprocess_settings)
-                    items_chunk.append((f"{source_label}_{counter:05d}", enhanced))
+                    items_chunk.append((f"{source_label}_{counter:05d}", page))
                     counter += 1
                     added_pages += 1
 
@@ -1404,10 +1414,11 @@ class UnifiedScanApp(ctk.CTk):
                 raise RuntimeError("Retake requires one output page. Disable two-page split and retry.")
 
             _, image = items[0]
+            processed = self._apply_postprocess(image)
             ok = self.session.replace_entry_image(
                 entry.entry_id,
                 original_image=image,
-                current_image=image,
+                current_image=processed,
             )
             if not ok:
                 raise RuntimeError("Selected page was not found in session.")
