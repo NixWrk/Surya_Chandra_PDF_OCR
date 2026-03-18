@@ -7,6 +7,7 @@ import re
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 import customtkinter as ctk
 import cv2
@@ -100,6 +101,7 @@ class UnifiedScanApp(ctk.CTk):
         self.import_folder_var = tk.StringVar()
         self.import_files_var = tk.StringVar()
         self.import_pdf_dpi_var = tk.IntVar(value=300)
+        self.import_selected_files: list[str] = []
         self.import_detect_document_var = tk.BooleanVar(value=True)
         self.import_two_page_mode_var = tk.BooleanVar(value=False)
         self.import_postprocess_var = tk.StringVar(value="None")
@@ -118,9 +120,6 @@ class UnifiedScanApp(ctk.CTk):
         self.export_ocr_engine_var = tk.StringVar(value=OCR_ENGINE_PYTESSERACT)
         self.export_ocr_lang_var = tk.StringVar(value="eng")
         self.export_ocr_status_var = tk.StringVar(value="OCR: checking...")
-        self.job_stage_var = tk.StringVar(value="Idle")
-        self.job_current_var = tk.StringVar(value="-")
-        self.job_progress_var = tk.StringVar(value="0%")
         self.job_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.job_cancel_event = threading.Event()
         self.job_thread: threading.Thread | None = None
@@ -128,7 +127,6 @@ class UnifiedScanApp(ctk.CTk):
         self.tab_scan_name = "2. Scan"
         self.tab_review_name = "3. Review"
         self.tab_export_name = "4. Export"
-        self.tab_jobs_name = "5. Jobs"
 
         self._build_ui()
         self.on_lens_mode_change(self.lens_mode_var.get())
@@ -163,13 +161,11 @@ class UnifiedScanApp(ctk.CTk):
         self.capture_tab = self.tabs.add(self.tab_scan_name)
         self.pages_tab = self.tabs.add(self.tab_review_name)
         self.export_tab = self.tabs.add(self.tab_export_name)
-        self.jobs_tab = self.tabs.add(self.tab_jobs_name)
 
         self._build_import_tab(self.import_tab)
         self._build_capture_tab(self.capture_tab)
         self._build_pages_tab(self.pages_tab)
         self._build_export_tab(self.export_tab)
-        self._build_jobs_tab(self.jobs_tab)
         self.tabs.set(self.tab_import_name)
 
         status_frame = ctk.CTkFrame(container)
@@ -580,14 +576,16 @@ class UnifiedScanApp(ctk.CTk):
         self.preview_import_processing()
 
     def _set_job_display(self, *, stage: str | None = None, current: str | None = None, progress: int | None = None) -> None:
-        if stage is not None:
-            self.job_stage_var.set(stage)
-        if current is not None:
-            self.job_current_var.set(current)
+        parts: list[str] = []
+        if stage:
+            parts.append(stage)
+        if current:
+            parts.append(current)
         if progress is not None:
             p = max(0, min(100, int(progress)))
-            self.job_progress.set(p / 100.0)
-            self.job_progress_var.set(f"{p}%")
+            parts.append(f"{p}%")
+        if parts:
+            self._set_status(" | ".join(parts))
 
     def _start_background_job(self, name: str, worker, on_done) -> bool:
         if self.job_thread is not None and self.job_thread.is_alive():
@@ -595,7 +593,6 @@ class UnifiedScanApp(ctk.CTk):
             return False
 
         self.job_cancel_event.clear()
-        self.job_cancel_button.configure(state="normal")
         self._set_job_display(stage=name, current="Starting...", progress=0)
 
         def emit(stage: str | None = None, current: str | None = None, progress: int | None = None) -> None:
@@ -631,11 +628,9 @@ class UnifiedScanApp(ctk.CTk):
                     try:
                         on_done(result)
                     finally:
-                        self.job_cancel_button.configure(state="disabled")
                         self._set_job_display(stage=f"{name}: done", current="Completed", progress=100)
                 elif kind == "error":
                     name, text = payload
-                    self.job_cancel_button.configure(state="disabled")
                     if "Cancelled by user." in text:
                         self._set_job_display(stage=f"{name}: cancelled", current=text, progress=0)
                         self._set_status(f"{name} cancelled")
@@ -1015,7 +1010,7 @@ class UnifiedScanApp(ctk.CTk):
         row_files.grid_columnconfigure(0, weight=1)
         self.import_files_entry = ctk.CTkEntry(row_files, textvariable=self.import_files_var)
         self.import_files_entry.grid(row=0, column=0, sticky="ew", padx=(10, 8), pady=10)
-        ctk.CTkButton(row_files, text="Files...", width=100, command=self.choose_import_files).grid(
+        ctk.CTkButton(row_files, text="Files... (multi)", width=110, command=self.choose_import_files).grid(
             row=0,
             column=1,
             padx=(0, 6),
@@ -1277,52 +1272,8 @@ class UnifiedScanApp(ctk.CTk):
             command=self.export_to_files,
         ).grid(row=0, column=3, padx=(0, 10), pady=10)
 
-    def _build_jobs_tab(self, tab: ctk.CTkFrame) -> None:
-        tab.grid_columnconfigure(0, weight=1)
-
-        frame = ctk.CTkFrame(tab)
-        frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
-        frame.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(frame, text="Stage").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 2))
-        ctk.CTkLabel(frame, textvariable=self.job_stage_var, anchor="w").grid(
-            row=1,
-            column=0,
-            sticky="ew",
-            padx=10,
-            pady=(0, 8),
-        )
-
-        ctk.CTkLabel(frame, text="Current").grid(row=2, column=0, sticky="w", padx=10, pady=(0, 2))
-        ctk.CTkLabel(frame, textvariable=self.job_current_var, anchor="w").grid(
-            row=3,
-            column=0,
-            sticky="ew",
-            padx=10,
-            pady=(0, 8),
-        )
-
-        self.job_progress = ctk.CTkProgressBar(frame)
-        self.job_progress.grid(row=4, column=0, sticky="ew", padx=10, pady=(2, 4))
-        self.job_progress.set(0.0)
-        ctk.CTkLabel(frame, textvariable=self.job_progress_var, anchor="e").grid(
-            row=5,
-            column=0,
-            sticky="e",
-            padx=10,
-            pady=(0, 10),
-        )
-
-        self.job_cancel_button = ctk.CTkButton(
-            frame,
-            text="Cancel Current Job",
-            command=self.cancel_current_job,
-            state="disabled",
-        )
-        self.job_cancel_button.grid(row=6, column=0, sticky="w", padx=10, pady=(0, 10))
-
     def _resolve_import_preview_source_path(self) -> Path | None:
-        raw_files = [part.strip().strip('"') for part in self.import_files_var.get().split(";") if part.strip()]
+        raw_files = self._parse_import_files_text(self.import_files_var.get())
         for item in raw_files:
             path = Path(item)
             if path.exists() and path.is_file() and path.suffix.lower() in (IMG_EXTS | PDF_EXTS):
@@ -1338,6 +1289,21 @@ class UnifiedScanApp(ctk.CTk):
             if paths:
                 return paths[0]
         return None
+
+    def _parse_import_files_text(self, raw_text: str) -> list[str]:
+        parts = [part.strip().strip('"') for part in re.split(r"[;\n\r]+", raw_text) if part.strip()]
+        return parts
+
+    def _normalize_selected_files(self, files: Iterable[str]) -> list[str]:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for item in files:
+            key = str(Path(item))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(key)
+        return unique
 
     def preview_import_processing(self) -> None:
         path = self._resolve_import_preview_source_path()
@@ -1401,13 +1367,15 @@ class UnifiedScanApp(ctk.CTk):
             filetypes=[
                 (
                     "Image and PDF",
-                    "*.jpg;*.jpeg;*.png;*.tif;*.tiff;*.webp;*.bmp;*.pdf",
+                    "*.jpg *.jpeg *.png *.tif *.tiff *.webp *.bmp *.pdf",
                 ),
                 ("All files", "*.*"),
             ],
+            multiple=True,
         )
         if files:
-            self.import_files_var.set(";".join(files))
+            self.import_selected_files = self._normalize_selected_files(files)
+            self.import_files_var.set("\n".join(self.import_selected_files))
             self.preview_import_processing()
 
     def import_from_folder(self) -> None:
@@ -1423,7 +1391,8 @@ class UnifiedScanApp(ctk.CTk):
 
     def import_from_files(self) -> None:
         try:
-            raw = [part.strip().strip('"') for part in self.import_files_var.get().split(";") if part.strip()]
+            text_paths = self._parse_import_files_text(self.import_files_var.get())
+            raw = text_paths if text_paths else list(self.import_selected_files)
             if not raw:
                 raise RuntimeError("No files selected.")
             paths = [Path(item) for item in raw]

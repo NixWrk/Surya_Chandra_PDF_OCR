@@ -51,10 +51,9 @@ Quick workflow (Office Lens style):
 Current implemented modules in this new app:
 
 1. `Capture`: live preview, single capture, burst capture, camera configuration
-2. `Import`: folder/files/PDF import into one session
+2. `Import`: folder/files (multi-select)/PDF import into one session
 3. `Pages`: page list management (preview, reorder, select/delete)
 4. `Export`: merged PDF and separate image export
-5. `Jobs`: background job progress and cancellation
 
 Implementation notes:
 
@@ -64,8 +63,8 @@ Implementation notes:
 4. Export tab supports OCR engine selection with dependency status checks.
 5. `Import` and `Scan` tabs now have independent processing settings/profiles.
 6. `Import` tab includes `Before/After` sample preview for current import profile.
-5. Searchable PDF is currently wired for `pytesseract`, `OCRmyPDF`, and `PyMuPDF OCR`.
-6. `PaddleOCR`, `Surya`, and `MinerU` are available as selectable OCR backends with readiness checks (searchable-PDF wiring pending).
+7. Searchable PDF is currently wired for `pytesseract`, `OCRmyPDF`, and `PyMuPDF OCR`.
+8. `PaddleOCR`, `Surya`, and `MinerU` are available as selectable OCR backends with readiness checks (searchable-PDF wiring pending).
 
 ## What The App Does
 
