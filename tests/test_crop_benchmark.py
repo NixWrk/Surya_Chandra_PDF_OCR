@@ -121,6 +121,47 @@ def test_run_crop_benchmark_keeps_other_backends_when_one_is_unavailable(tmp_pat
     assert failed_result.error == "uvdoc missing"
 
 
+def test_run_crop_benchmark_ignores_its_own_output_pdfs_in_input_folder(tmp_path, monkeypatch) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_image(input_dir / "page1.png", 40)
+    (input_dir / "input_opencv_quad.pdf").write_bytes(b"old")
+    (input_dir / "input_uvdoc.pdf").write_bytes(b"old")
+
+    seen_means: list[int] = []
+
+    def fake_probe(*_args, **_kwargs) -> None:
+        return None
+
+    def fake_scan(image, *, backends, **_kwargs):
+        seen_means.append(int(image.mean()))
+        backend = backends[0]
+        return ScanOutput(
+            warped=image,
+            contour=None,
+            backend=backend,
+            detected=True,
+            raw_result=None,
+        )
+
+    def fake_export(image_paths, *, out_pdf, dpi):
+        out_pdf.write_bytes(f"{len(image_paths)}:{dpi}".encode("utf-8"))
+        return out_pdf
+
+    monkeypatch.setattr("uniscan.tools.crop_benchmark.probe_detector_backend", fake_probe)
+    monkeypatch.setattr("uniscan.tools.crop_benchmark.scan_with_document_detector", fake_scan)
+    monkeypatch.setattr("uniscan.tools.crop_benchmark.export_image_paths_as_pdf", fake_export)
+
+    results = run_crop_benchmark(
+        input_dir=input_dir,
+        output_dir=input_dir,
+        backends=(DETECTOR_BACKEND_OPENCV, DETECTOR_BACKEND_UVDOC),
+    )
+
+    assert seen_means == [40, 40]
+    assert all(result.output_pdf is not None for result in results)
+
+
 def test_cli_benchmark_crop_uses_runner_and_returns_success(monkeypatch, tmp_path, capsys) -> None:
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "out"

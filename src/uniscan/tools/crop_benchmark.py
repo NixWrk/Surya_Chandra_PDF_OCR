@@ -48,19 +48,34 @@ def default_camscan_root() -> Path | None:
     return None
 
 
-def _iter_loaded_folder_items(input_dir: Path, *, pdf_dpi: int):
-    input_paths = list_supported_in_folder(input_dir)
+def _iter_loaded_input_paths(input_paths: Sequence[Path], *, pdf_dpi: int):
     if not input_paths:
-        raise ValueError(f"No supported files found in: {input_dir}")
+        raise ValueError("No supported files found for benchmark input.")
 
     for source_path in input_paths:
         for loaded in load_input_items([source_path], pdf_dpi=pdf_dpi):
             yield loaded
 
 
+def _resolve_benchmark_input_paths(
+    *,
+    input_dir: Path,
+    output_dir: Path,
+    backends: Sequence[str],
+) -> tuple[Path, ...]:
+    input_paths = list_supported_in_folder(input_dir)
+    if input_dir.resolve() != output_dir.resolve():
+        return tuple(input_paths)
+
+    reserved_output_names = {f"{input_dir.name}_{backend}.pdf" for backend in backends}
+    filtered = [path for path in input_paths if path.name not in reserved_output_names]
+    return tuple(filtered)
+
+
 def _run_single_backend(
     *,
     input_dir: Path,
+    input_paths: Sequence[Path],
     output_dir: Path,
     backend: str,
     pdf_dpi: int,
@@ -83,7 +98,7 @@ def _run_single_backend(
         image_paths: list[Path] = []
 
         for total_pages, (_name, image) in enumerate(
-            _iter_loaded_folder_items(input_dir, pdf_dpi=pdf_dpi),
+            _iter_loaded_input_paths(input_paths, pdf_dpi=pdf_dpi),
             start=1,
         ):
             scan_output = scan_with_document_detector(
@@ -128,6 +143,11 @@ def run_crop_benchmark(
     resolved_input = Path(input_dir)
     resolved_output = Path(output_dir)
     resolved_backends = tuple(backends) if backends is not None else DEFAULT_BENCHMARK_BACKENDS
+    resolved_input_paths = _resolve_benchmark_input_paths(
+        input_dir=resolved_input,
+        output_dir=resolved_output,
+        backends=resolved_backends,
+    )
     resolved_scanner_root = scanner_root
     if resolved_scanner_root is None and DETECTOR_BACKEND_CAMSCAN in resolved_backends:
         resolved_scanner_root = default_camscan_root()
@@ -137,6 +157,7 @@ def run_crop_benchmark(
         try:
             result = _run_single_backend(
                 input_dir=resolved_input,
+                input_paths=resolved_input_paths,
                 output_dir=resolved_output,
                 backend=backend,
                 pdf_dpi=int(pdf_dpi),
