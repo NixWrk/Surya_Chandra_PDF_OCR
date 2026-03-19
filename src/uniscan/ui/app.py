@@ -68,6 +68,10 @@ class UnifiedScanApp(ctk.CTk):
         self.geometry("1280x800")
         self.minsize(1024, 680)
 
+        self.project_root = Path(__file__).resolve().parents[3]
+        candidate_scanner_root = self.project_root / "camscan_suhren"
+        self.scanner_root = candidate_scanner_root if candidate_scanner_root.exists() else None
+
         self.session = CaptureSession()
         self.camera: CameraService | None = None
         self.preview_job: str | None = None
@@ -1341,7 +1345,11 @@ class UnifiedScanApp(ctk.CTk):
 
     def _detect_corner_points(self, image: np.ndarray) -> np.ndarray | None:
         try:
-            scan_output = scan_with_document_detector(image, enabled=True)
+            scan_output = scan_with_document_detector(
+                image,
+                enabled=True,
+                scanner_root=self.scanner_root,
+            )
         except ScanAdapterError:
             return None
 
