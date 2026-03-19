@@ -44,6 +44,8 @@ def test_session_entries_are_disk_backed(tmp_path) -> None:
 
     assert entry.original_path.exists()
     assert entry.current_path.exists()
+    assert entry.preview_original_path.exists()
+    assert entry.preview_current_path.exists()
     assert entry.thumb_path.exists()
     session.close()
 
@@ -57,6 +59,8 @@ def test_entry_original_image_setter_writes_to_disk(tmp_path) -> None:
     reloaded = entry.original_image
     assert reloaded.shape == replacement.shape
     assert int(reloaded[0, 0, 0]) == 200
+    preview = entry.preview_original_image
+    assert preview.shape == replacement.shape
     session.close()
 
 

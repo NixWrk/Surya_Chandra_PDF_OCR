@@ -12,12 +12,18 @@ def _img() -> np.ndarray:
 def test_page_store_add_read_remove(tmp_path) -> None:
     store = PageStore(root_dir=tmp_path)
     entry_id = "entry_a"
-    original_path, current_path, thumb_path = store.add_page(entry_id, _img())
+    original_path, current_path, preview_original_path, preview_current_path, thumb_path = store.add_page(
+        entry_id,
+        _img(),
+    )
 
     assert original_path.exists()
     assert current_path.exists()
+    assert preview_original_path.exists()
+    assert preview_current_path.exists()
     assert thumb_path.exists()
     assert store.read_image(current_path).shape == (40, 60, 3)
+    assert store.read_image(preview_original_path).shape == (40, 60, 3)
 
     store.remove_page(entry_id)
     assert not original_path.exists()

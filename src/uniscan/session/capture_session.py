@@ -20,6 +20,8 @@ class CaptureEntry:
     store: PageStore
     original_path: Path
     current_path: Path
+    preview_original_path: Path
+    preview_current_path: Path
     thumb_path: Path
     selected: bool = False
     entry_id: str = field(default_factory=lambda: uuid4().hex)
@@ -27,12 +29,17 @@ class CaptureEntry:
     @classmethod
     def from_image(cls, *, name: str, image: np.ndarray, store: PageStore) -> "CaptureEntry":
         entry_id = uuid4().hex
-        original_path, current_path, thumb_path = store.add_page(entry_id, image)
+        original_path, current_path, preview_original_path, preview_current_path, thumb_path = store.add_page(
+            entry_id,
+            image,
+        )
         return cls(
             name=name,
             store=store,
             original_path=original_path,
             current_path=current_path,
+            preview_original_path=preview_original_path,
+            preview_current_path=preview_current_path,
             thumb_path=thumb_path,
             entry_id=entry_id,
         )
@@ -44,6 +51,7 @@ class CaptureEntry:
     @original_image.setter
     def original_image(self, image: np.ndarray) -> None:
         self.store.write_image(self.original_path, image)
+        self.store.write_preview(self.preview_original_path, image)
 
     @property
     def current_image(self) -> np.ndarray:
@@ -52,7 +60,16 @@ class CaptureEntry:
     @current_image.setter
     def current_image(self, image: np.ndarray) -> None:
         self.store.write_image(self.current_path, image)
+        self.store.write_preview(self.preview_current_path, image)
         self.store.write_thumbnail(self.thumb_path, image)
+
+    @property
+    def preview_original_image(self) -> np.ndarray:
+        return self.store.read_image(self.preview_original_path)
+
+    @property
+    def preview_current_image(self) -> np.ndarray:
+        return self.store.read_image(self.preview_current_path)
 
     @property
     def thumbnail_image(self) -> np.ndarray:

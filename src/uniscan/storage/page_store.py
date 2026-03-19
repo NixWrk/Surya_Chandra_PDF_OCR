@@ -14,7 +14,7 @@ from uniscan.io.loaders import imwrite_unicode
 
 
 class PageStore:
-    """Manage per-session page files (original/current/thumbnail)."""
+    """Manage per-session page files (original/current/previews/thumbnail)."""
 
     def __init__(self, root_dir: Path | None = None, *, keep_on_close: bool = False) -> None:
         base = Path(root_dir) if root_dir is not None else Path(tempfile.gettempdir()) / "uniscan_cache"
@@ -24,13 +24,15 @@ class PageStore:
         self.pages_dir.mkdir(parents=True, exist_ok=True)
         self.keep_on_close = keep_on_close
 
-    def paths_for_entry(self, entry_id: str) -> tuple[Path, Path, Path]:
+    def paths_for_entry(self, entry_id: str) -> tuple[Path, Path, Path, Path, Path]:
         page_dir = self.pages_dir / entry_id
         page_dir.mkdir(parents=True, exist_ok=True)
         original = page_dir / "original.png"
         current = page_dir / "current.png"
+        preview_original = page_dir / "preview_original.jpg"
+        preview_current = page_dir / "preview_current.jpg"
         thumb = page_dir / "thumb.jpg"
-        return original, current, thumb
+        return original, current, preview_original, preview_current, thumb
 
     def read_image(self, path: Path) -> np.ndarray:
         data = np.fromfile(str(path), dtype=np.uint8)
@@ -43,25 +45,43 @@ class PageStore:
         if not imwrite_unicode(path, image):
             raise RuntimeError(f"Cannot write page image: {path}")
 
-    def write_thumbnail(self, path: Path, image: np.ndarray, *, max_side: int = 320) -> None:
+    def _resize_for_display(
+        self,
+        image: np.ndarray,
+        *,
+        max_width: int,
+        max_height: int,
+    ) -> np.ndarray:
         if len(image.shape) == 2:
             preview = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
         else:
             preview = image
         h, w = preview.shape[:2]
-        scale = min(max_side / max(1, w), max_side / max(1, h), 1.0)
+        scale = min(max_width / max(1, w), max_height / max(1, h), 1.0)
+        if scale >= 1.0:
+            return preview
         new_w = max(1, int(w * scale))
         new_h = max(1, int(h * scale))
-        thumb = cv2.resize(preview, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        return cv2.resize(preview, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    def write_preview(self, path: Path, image: np.ndarray, *, max_width: int = 1920, max_height: int = 1080) -> None:
+        preview = self._resize_for_display(image, max_width=max_width, max_height=max_height)
+        if not imwrite_unicode(path, preview):
+            raise RuntimeError(f"Cannot write page preview: {path}")
+
+    def write_thumbnail(self, path: Path, image: np.ndarray, *, max_side: int = 320) -> None:
+        thumb = self._resize_for_display(image, max_width=max_side, max_height=max_side)
         if not imwrite_unicode(path, thumb):
             raise RuntimeError(f"Cannot write page thumbnail: {path}")
 
-    def add_page(self, entry_id: str, image: np.ndarray) -> tuple[Path, Path, Path]:
-        original_path, current_path, thumb_path = self.paths_for_entry(entry_id)
+    def add_page(self, entry_id: str, image: np.ndarray) -> tuple[Path, Path, Path, Path, Path]:
+        original_path, current_path, preview_original_path, preview_current_path, thumb_path = self.paths_for_entry(entry_id)
         self.write_image(original_path, image)
         self.write_image(current_path, image)
+        self.write_preview(preview_original_path, image)
+        self.write_preview(preview_current_path, image)
         self.write_thumbnail(thumb_path, image)
-        return original_path, current_path, thumb_path
+        return original_path, current_path, preview_original_path, preview_current_path, thumb_path
 
     def remove_page(self, entry_id: str) -> None:
         page_dir = self.pages_dir / entry_id

@@ -45,8 +45,6 @@ from uniscan.session import CaptureSession
 from uniscan.ui.camera_health import camera_health_state
 
 PREVIEW_WAIT_MS = 25
-LIGHTWEIGHT_PREVIEW_MAX_WIDTH = 1920
-LIGHTWEIGHT_PREVIEW_MAX_HEIGHT = 1080
 RESOLUTIONS = [
     "3264x2448",
     "3264x1836",
@@ -682,22 +680,13 @@ class UnifiedScanApp(ctk.CTk):
         out = fn(image)
         return apply_enhancements(out, self._current_preprocess_settings())
 
-    def _review_preview_image(self, image: np.ndarray) -> np.ndarray:
-        if not self.lightweight_preview_var.get():
-            return image
+    def _review_before_image(self, entry) -> np.ndarray:
+        return entry.preview_original_image if self.lightweight_preview_var.get() else entry.original_image
 
-        height, width = image.shape[:2]
-        scale = min(
-            LIGHTWEIGHT_PREVIEW_MAX_WIDTH / max(1, width),
-            LIGHTWEIGHT_PREVIEW_MAX_HEIGHT / max(1, height),
-            1.0,
-        )
-        if scale >= 1.0:
-            return image
-
-        new_w = max(1, int(width * scale))
-        new_h = max(1, int(height * scale))
-        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    def _review_after_image(self, entry, before_image: np.ndarray) -> np.ndarray:
+        if self.lightweight_preview_var.get():
+            return self._apply_postprocess(before_image)
+        return self._apply_postprocess(entry.original_image)
 
     def _show_in_preview(self, image: np.ndarray) -> None:
         photo = self._to_ctk_photo_for_label(image, self.preview_label)
@@ -1197,11 +1186,11 @@ class UnifiedScanApp(ctk.CTk):
             return
 
         entry = self.session.entries[index]
-        before = self._review_preview_image(entry.original_image)
+        before = self._review_before_image(entry)
         try:
-            after = self._apply_postprocess(before)
+            after = self._review_after_image(entry, before)
         except Exception:
-            after = self._review_preview_image(entry.current_image)
+            after = entry.preview_current_image if self.lightweight_preview_var.get() else entry.current_image
 
         before_photo = self._to_ctk_photo_for_label(before, self.page_preview_before_label)
         after_photo = self._to_ctk_photo_for_label(after, self.page_preview_after_label)
@@ -1410,7 +1399,9 @@ class UnifiedScanApp(ctk.CTk):
             "display_shape": None,
             "scale_x": 1.0,
             "scale_y": 1.0,
-            "points": self._default_corner_points(entries[0].original_image),
+            "points": self._default_corner_points(
+                entries[0].preview_original_image if self.lightweight_preview_var.get() else entries[0].original_image
+            ),
         }
 
         def _map_display_points_to_source(points: np.ndarray, source_shape: tuple[int, int], display_shape: tuple[int, int]) -> np.ndarray:
@@ -1425,15 +1416,15 @@ class UnifiedScanApp(ctk.CTk):
             entry_index = indices[state["index"]]
             return entry_index, self.session.entries[entry_index]
 
-        def _display_image_for(entry_image: np.ndarray) -> np.ndarray:
-            return self._review_preview_image(entry_image)
+        def _display_image_for(entry) -> np.ndarray:
+            return entry.preview_original_image if self.lightweight_preview_var.get() else entry.original_image
 
         def _init_points_for(entry) -> np.ndarray:
             cached = points_by_entry.get(entry.entry_id)
             if cached is not None:
                 return cached
 
-            display_image = _display_image_for(entry.original_image)
+            display_image = _display_image_for(entry)
             detected: np.ndarray | None = None
             if auto_detect:
                 detected = self._detect_corner_points(display_image)
@@ -1471,7 +1462,7 @@ class UnifiedScanApp(ctk.CTk):
             if source_image is None or source_image.size == 0:
                 raise RuntimeError(f"Selected page is empty: {entry.name}")
 
-            display_image = _display_image_for(source_image)
+            display_image = _display_image_for(entry)
             display_h, display_w = display_image.shape[:2]
             source_h, source_w = source_image.shape[:2]
             view_h = max(1, int(display_h))
@@ -1539,7 +1530,7 @@ class UnifiedScanApp(ctk.CTk):
 
         def _auto_detect_current():
             entry_index, entry = _current_entry()
-            display_image = _display_image_for(entry.original_image)
+            display_image = _display_image_for(entry)
             detected = self._detect_corner_points(display_image)
             if detected is None:
                 messagebox.showwarning("Auto Crop", f"Document boundaries were not detected for {entry.name}.")

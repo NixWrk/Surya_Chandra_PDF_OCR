@@ -47,7 +47,8 @@ Quick workflow (Office Lens style):
 3. App switches to `3. Review`: reorder, rotate, deskew, auto crop, manual corners, and side-by-side `Before/After` preview.
 4. All processing controls are in `Review`: quick dropdowns (`Lens`, `Post`, `Preset`), `Advanced...` popup sliders, and an `Apply all changes to all files` scope checkbox.
 5. Review uses lightweight previews by default (`Full HD`); uncheck it to work directly with full-resolution previews.
-6. Open `4. Export`, choose OCR engine if needed, then save merged PDF or image files.
+6. `Auto Crop...` opens a page browser with auto-detect and manual corner editing for one page or all pages.
+7. Open `4. Export`, choose OCR engine if needed, then save merged PDF or image files.
 
 Current implemented modules in this new app:
 
