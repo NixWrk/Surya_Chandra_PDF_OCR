@@ -14,7 +14,14 @@ from .preprocess import (
     resolve_lens_mode_profile,
 )
 from .postprocess import POSTPROCESSING_OPTIONS
-from .scanner_adapter import ScanAdapterError, scan_with_document_detector
+from .scanner_adapter import (
+    DETECTOR_BACKEND_CAMSCAN,
+    DETECTOR_BACKEND_OPENCV,
+    DETECTOR_BACKEND_UVDOC,
+    ScanAdapterError,
+    probe_detector_backend,
+    scan_with_document_detector,
+)
 
 __all__ = [
     "LENS_MODE_CUSTOM",
@@ -24,6 +31,9 @@ __all__ = [
     "PREPROCESS_PRESETS",
     "POSTPROCESSING_OPTIONS",
     "PreprocessSettings",
+    "DETECTOR_BACKEND_CAMSCAN",
+    "DETECTOR_BACKEND_OPENCV",
+    "DETECTOR_BACKEND_UVDOC",
     "ScanAdapterError",
     "apply_enhancements",
     "build_pdf_from_images",
@@ -31,6 +41,7 @@ __all__ = [
     "infer_lens_mode",
     "order_quad_points",
     "process_loaded_items",
+    "probe_detector_backend",
     "resolve_lens_mode_profile",
     "scan_with_document_detector",
     "split_spread",

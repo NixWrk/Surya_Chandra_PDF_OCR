@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -16,6 +18,7 @@ from .geometry import order_quad_points, warp_perspective_from_points
 
 DETECTOR_BACKEND_CAMSCAN = "camscan"
 DETECTOR_BACKEND_OPENCV = "opencv_quad"
+DETECTOR_BACKEND_UVDOC = "uvdoc"
 
 
 class ScanAdapterError(RuntimeError):
@@ -29,6 +32,7 @@ class ScanOutput:
     warped: np.ndarray | None
     contour: np.ndarray | None
     backend: str | None
+    detected: bool
     raw_result: Any
 
 
@@ -50,6 +54,36 @@ def _import_scanner_with_optional_root(optional_root: Path | None = None) -> Mod
         raise ScanAdapterError(
             f"Cannot import camscan.scanner from optional root: {optional_root}"
         ) from exc
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _default_paddlex_cache_home() -> Path:
+    return _repo_root() / ".paddlex_cache"
+
+
+def _configure_uvdoc_environment(cache_home: Path | None = None) -> Path:
+    resolved = cache_home or _default_paddlex_cache_home()
+    resolved.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(resolved))
+    # This check adds startup delay on every run and is not needed for local benchmarking.
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    return Path(os.environ["PADDLE_PDX_CACHE_HOME"])
+
+
+@lru_cache(maxsize=1)
+def _load_uvdoc_model(cache_home_str: str | None = None) -> Any:
+    cache_home = Path(cache_home_str) if cache_home_str else None
+    _configure_uvdoc_environment(cache_home)
+    try:
+        from paddleocr import TextImageUnwarping
+    except Exception as exc:  # pragma: no cover - import depends on optional runtime deps
+        raise ScanAdapterError(
+            "Cannot import PaddleOCR UVDoc. Install paddleocr and paddlepaddle first."
+        ) from exc
+    return TextImageUnwarping()
 
 
 def _resize_for_detection(image: np.ndarray, *, max_side: int = 1600) -> tuple[np.ndarray, float]:
@@ -144,18 +178,36 @@ def _find_quad_contour(image: np.ndarray) -> np.ndarray | None:
 def _opencv_document_detector(image: np.ndarray) -> ScanOutput:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     if float(np.std(gray)) < 5.0:
-        return ScanOutput(warped=image, contour=None, backend=None, raw_result={"opencv": "low_variance"})
+        return ScanOutput(
+            warped=image,
+            contour=None,
+            backend=None,
+            detected=False,
+            raw_result={"opencv": "low_variance"},
+        )
 
     resized, scale = _resize_for_detection(image)
     contour = _find_quad_contour(resized)
     if contour is None:
-        return ScanOutput(warped=image, contour=None, backend=None, raw_result={"opencv": "no_contour"})
+        return ScanOutput(
+            warped=image,
+            contour=None,
+            backend=None,
+            detected=False,
+            raw_result={"opencv": "no_contour"},
+        )
 
     if scale != 1.0:
         contour = contour / scale
     contour = order_quad_points(contour.astype(np.float32))
     warped = warp_perspective_from_points(image, contour)
-    return ScanOutput(warped=warped, contour=contour, backend=DETECTOR_BACKEND_OPENCV, raw_result=None)
+    return ScanOutput(
+        warped=warped,
+        contour=contour,
+        backend=DETECTOR_BACKEND_OPENCV,
+        detected=True,
+        raw_result=None,
+    )
 
 
 def _camscan_document_detector(image: np.ndarray, *, scanner_root: Path | None = None) -> ScanOutput:
@@ -172,9 +224,65 @@ def _camscan_document_detector(image: np.ndarray, *, scanner_root: Path | None =
             contour = order_quad_points(cv2.boxPoints(rect).astype(np.float32))
         else:
             contour = None
+    if warped is None and contour is not None:
+        warped = warp_perspective_from_points(image, contour)
+    if warped is None and contour is None:
+        return ScanOutput(warped=image, contour=None, backend=None, detected=False, raw_result=result)
+    return ScanOutput(
+        warped=warped,
+        contour=contour,
+        backend=DETECTOR_BACKEND_CAMSCAN,
+        detected=True,
+        raw_result=result,
+    )
+
+
+def _uvdoc_document_detector(image: np.ndarray, *, cache_home: Path | None = None) -> ScanOutput:
+    model = _load_uvdoc_model(str(cache_home) if cache_home is not None else None)
+    result_list = model.predict(image)
+    if not result_list:
+        return ScanOutput(warped=image, contour=None, backend=None, detected=False, raw_result=None)
+
+    raw_result = result_list[0]
+    warped = raw_result.get("doctr_img")
     if warped is None:
-        return ScanOutput(warped=image, contour=contour, backend=DETECTOR_BACKEND_CAMSCAN, raw_result=result)
-    return ScanOutput(warped=warped, contour=contour, backend=DETECTOR_BACKEND_CAMSCAN, raw_result=result)
+        return ScanOutput(warped=image, contour=None, backend=None, detected=False, raw_result=raw_result)
+
+    warped_arr = np.asarray(warped)
+    if warped_arr.size == 0:
+        return ScanOutput(warped=image, contour=None, backend=None, detected=False, raw_result=raw_result)
+    if warped_arr.dtype != np.uint8:
+        warped_arr = np.clip(warped_arr, 0, 255).astype(np.uint8)
+    if warped_arr.ndim == 2:
+        warped_arr = cv2.cvtColor(warped_arr, cv2.COLOR_GRAY2BGR)
+    elif warped_arr.ndim == 3 and warped_arr.shape[2] == 4:
+        warped_arr = cv2.cvtColor(warped_arr, cv2.COLOR_RGBA2BGR)
+
+    return ScanOutput(
+        warped=warped_arr,
+        contour=None,
+        backend=DETECTOR_BACKEND_UVDOC,
+        detected=True,
+        raw_result=raw_result,
+    )
+
+
+def probe_detector_backend(
+    backend: str,
+    *,
+    scanner_root: Path | None = None,
+    uvdoc_cache_home: Path | None = None,
+) -> None:
+    """Raise ScanAdapterError if the requested backend is unavailable."""
+    if backend == DETECTOR_BACKEND_CAMSCAN:
+        _import_scanner_with_optional_root(optional_root=scanner_root)
+        return
+    if backend == DETECTOR_BACKEND_OPENCV:
+        return
+    if backend == DETECTOR_BACKEND_UVDOC:
+        _load_uvdoc_model(str(uvdoc_cache_home) if uvdoc_cache_home is not None else None)
+        return
+    raise ScanAdapterError(f"Unsupported detector backend: {backend}")
 
 
 def scan_with_document_detector(
@@ -183,6 +291,7 @@ def scan_with_document_detector(
     enabled: bool = True,
     scanner_root: Path | None = None,
     backends: tuple[str, ...] | None = None,
+    uvdoc_cache_home: Path | None = None,
 ) -> ScanOutput:
     """
     Run document detector and return normalized output.
@@ -190,7 +299,7 @@ def scan_with_document_detector(
     If detection is disabled, returns the input image as warped.
     """
     if not enabled:
-        return ScanOutput(warped=image, contour=None, backend=None, raw_result=None)
+        return ScanOutput(warped=image, contour=None, backend=None, detected=False, raw_result=None)
 
     selected_backends = backends or (DETECTOR_BACKEND_CAMSCAN, DETECTOR_BACKEND_OPENCV)
     errors: list[str] = []
@@ -201,18 +310,21 @@ def scan_with_document_detector(
                 result = _camscan_document_detector(image, scanner_root=scanner_root)
             elif backend == DETECTOR_BACKEND_OPENCV:
                 result = _opencv_document_detector(image)
+            elif backend == DETECTOR_BACKEND_UVDOC:
+                result = _uvdoc_document_detector(image, cache_home=uvdoc_cache_home)
             else:
                 raise ScanAdapterError(f"Unsupported detector backend: {backend}")
         except Exception as exc:
             errors.append(f"{backend}: {exc}")
             continue
 
-        if result.contour is not None:
+        if result.detected:
             return result
 
     return ScanOutput(
         warped=image,
         contour=None,
         backend=None,
+        detected=False,
         raw_result={"errors": errors},
     )
