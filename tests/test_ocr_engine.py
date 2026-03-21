@@ -1,15 +1,39 @@
 from pathlib import Path
 
+import pytest
+
 from uniscan.ocr.engine import (
+    OCR_ENGINE_LABELS,
+    OCR_ENGINE_MINERU,
     OCR_ENGINE_OCRMYPDF,
     OCR_ENGINE_PADDLEOCR,
     OCR_ENGINE_PYMUPDF,
+    OCR_ENGINE_PYTESSERACT,
+    OCR_ENGINE_SURYA,
+    OCR_ENGINE_VALUES,
+    SEARCHABLE_PDF_ENGINES,
     OcrDependencyStatus,
     OcrEngineStatus,
     detect_ocr_dependencies,
     detect_ocr_engine_status,
     image_paths_to_searchable_pdf,
 )
+
+
+def _importer_factory(available_modules: set[str]):
+    def _importer(name: str):
+        if name in available_modules:
+            return object()
+        raise ImportError(name)
+
+    return _importer
+
+
+def _which_factory(available_commands: set[str]):
+    def _which(name: str):
+        return name if name in available_commands else None
+
+    return _which
 
 
 def test_detect_ocr_dependencies_missing() -> None:
@@ -30,10 +54,76 @@ def test_detect_ocr_dependencies_ready() -> None:
     assert status.missing == []
 
 
+def test_ocr_engine_registry_is_stable() -> None:
+    assert OCR_ENGINE_VALUES == (
+        OCR_ENGINE_PYTESSERACT,
+        OCR_ENGINE_OCRMYPDF,
+        OCR_ENGINE_PADDLEOCR,
+        OCR_ENGINE_PYMUPDF,
+        OCR_ENGINE_SURYA,
+        OCR_ENGINE_MINERU,
+    )
+    assert SEARCHABLE_PDF_ENGINES == (
+        OCR_ENGINE_PYTESSERACT,
+        OCR_ENGINE_OCRMYPDF,
+        OCR_ENGINE_PYMUPDF,
+    )
+    assert all(engine in OCR_ENGINE_LABELS for engine in OCR_ENGINE_VALUES)
+
+
+@pytest.mark.parametrize(
+    ("engine_name", "expected_searchable_pdf"),
+    [
+        (OCR_ENGINE_PYTESSERACT, True),
+        (OCR_ENGINE_OCRMYPDF, True),
+        (OCR_ENGINE_PADDLEOCR, False),
+        (OCR_ENGINE_PYMUPDF, True),
+        (OCR_ENGINE_SURYA, False),
+        (OCR_ENGINE_MINERU, False),
+    ],
+)
+def test_detect_ocr_engine_status_ready_matrix(engine_name: str, expected_searchable_pdf: bool) -> None:
+    status = detect_ocr_engine_status(
+        engine_name,
+        import_module=_importer_factory({"pytesseract", "pypdf", "img2pdf", "fitz", "paddleocr", "surya", "marker", "mineru", "magic_pdf"}),
+        which_fn=_which_factory({"tesseract", "ocrmypdf"}),
+    )
+    assert status.ready
+    assert status.searchable_pdf is expected_searchable_pdf
+    assert status.label == OCR_ENGINE_LABELS[engine_name]
+
+
+@pytest.mark.parametrize(
+    ("engine_name", "imported_modules", "available_commands", "expected_missing"),
+    [
+        (OCR_ENGINE_PYTESSERACT, set(), set(), ["pytesseract", "pypdf", "tesseract"]),
+        (OCR_ENGINE_OCRMYPDF, {"img2pdf"}, set(), ["ocrmypdf"]),
+        (OCR_ENGINE_PADDLEOCR, set(), set(), ["paddleocr"]),
+        (OCR_ENGINE_PYMUPDF, set(), set(), ["pymupdf(fitz)", "pypdf", "tesseract"]),
+        (OCR_ENGINE_SURYA, set(), set(), ["surya/marker"]),
+        (OCR_ENGINE_MINERU, set(), set(), ["mineru(magic_pdf)"]),
+    ],
+)
+def test_detect_ocr_engine_status_missing_matrix(
+    engine_name: str,
+    imported_modules: set[str],
+    available_commands: set[str],
+    expected_missing: list[str],
+) -> None:
+    status = detect_ocr_engine_status(
+        engine_name,
+        import_module=_importer_factory(imported_modules),
+        which_fn=_which_factory(available_commands),
+    )
+    assert not status.ready
+    assert status.missing == expected_missing
+    assert status.searchable_pdf is (engine_name in SEARCHABLE_PDF_ENGINES)
+
+
 def test_detect_ocr_engine_status_ocrmypdf_missing_cmd() -> None:
     status = detect_ocr_engine_status(
         OCR_ENGINE_OCRMYPDF,
-        import_module=lambda _name: object(),
+        import_module=_importer_factory({"img2pdf"}),
         which_fn=lambda _cmd: None,
     )
     assert not status.ready
@@ -44,11 +134,33 @@ def test_detect_ocr_engine_status_ocrmypdf_missing_cmd() -> None:
 def test_detect_ocr_engine_status_paddleocr_ready_but_no_searchable_pdf() -> None:
     status = detect_ocr_engine_status(
         OCR_ENGINE_PADDLEOCR,
-        import_module=lambda _name: object(),
-        which_fn=lambda _cmd: None,
+        import_module=_importer_factory({"paddleocr"}),
+        which_fn=_which_factory(set()),
     )
     assert status.ready
     assert not status.searchable_pdf
+
+
+def test_image_paths_to_searchable_pdf_rejects_unwired_ocr_engines(tmp_path: Path) -> None:
+    for engine_name in (OCR_ENGINE_PADDLEOCR, OCR_ENGINE_SURYA, OCR_ENGINE_MINERU):
+        try:
+            image_paths_to_searchable_pdf(
+                [tmp_path / "page.png"],
+                out_pdf=tmp_path / f"{engine_name}.pdf",
+                engine_name=engine_name,
+                engine_status=OcrEngineStatus(
+                    engine_name=engine_name,
+                    ready=True,
+                    missing=[],
+                    searchable_pdf=False,
+                ),
+                import_module=_importer_factory({"paddleocr", "surya", "marker", "mineru", "magic_pdf"}),
+                which_fn=_which_factory({"tesseract", "ocrmypdf"}),
+            )
+        except NotImplementedError as exc:
+            assert OCR_ENGINE_LABELS[engine_name] in str(exc)
+        else:
+            raise AssertionError(f"Expected NotImplementedError for {engine_name}")
 
 
 def test_image_paths_to_searchable_pdf_pytesseract_merges_pages(tmp_path: Path) -> None:
