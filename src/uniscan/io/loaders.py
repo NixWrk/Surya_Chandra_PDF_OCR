@@ -71,6 +71,33 @@ def render_pdf_pages(pdf_path: Path, dpi: int) -> list[LoadedItem]:
     return pages
 
 
+def render_pdf_page_indices(pdf_path: Path, page_indices: Iterable[int], dpi: int) -> list[LoadedItem]:
+    """Render selected PDF pages to BGR images without materializing the full document."""
+    try:
+        import fitz  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("PDF import requires PyMuPDF. Install with: pip install pymupdf") from exc
+
+    pages: list[LoadedItem] = []
+    doc = fitz.open(str(pdf_path))
+    try:
+        for page_index in page_indices:
+            if page_index < 0 or page_index >= doc.page_count:
+                raise IndexError(f"PDF page index out of range: {page_index}")
+            page = doc[page_index]
+            pix = page.get_pixmap(dpi=dpi, alpha=False)
+            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            if pix.n == 4:
+                arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            else:
+                arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            pages.append((f"{pdf_path.name} [p{page_index + 1:04d}]", arr))
+    finally:
+        doc.close()
+
+    return pages
+
+
 def load_input_items(
     paths: Iterable[Path],
     *,

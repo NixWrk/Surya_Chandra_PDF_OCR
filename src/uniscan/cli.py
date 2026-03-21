@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from uniscan.ocr import run_ocr_benchmark, summarize_ocr_benchmark
 from uniscan.tools import run_crop_benchmark, summarize_benchmark_results
 from uniscan.ui import run_app
 
@@ -52,6 +53,38 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional cache directory for PaddleOCR UVDoc weights.",
     )
 
+    ocr_benchmark_parser = subparsers.add_parser(
+        "benchmark-ocr",
+        help="Run sampled OCR benchmarks on a PDF fixture and write engine outputs.",
+    )
+    ocr_benchmark_parser.add_argument("--pdf", required=True, type=Path, help="Input PDF fixture path.")
+    ocr_benchmark_parser.add_argument("--output", required=True, type=Path, help="Output folder path.")
+    ocr_benchmark_parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=5,
+        help="Window size for the first/middle/last page samples.",
+    )
+    ocr_benchmark_parser.add_argument(
+        "--dpi",
+        type=int,
+        default=160,
+        help="Render DPI for sampled pages.",
+    )
+    ocr_benchmark_parser.add_argument(
+        "--lang",
+        default="eng",
+        help="OCR language code.",
+    )
+    ocr_benchmark_parser.add_argument(
+        "--engines",
+        nargs="+",
+        default=None,
+        help=(
+            "Engine names to run. Defaults to the registered OCR engine matrix."
+        ),
+    )
+
     args = parser.parse_args(argv)
     if args.version:
         from uniscan import __version__
@@ -69,6 +102,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(summarize_benchmark_results(results))
         return 0 if any(result.output_pdf is not None for result in results) else 1
+    if args.command == "benchmark-ocr":
+        results = run_ocr_benchmark(
+            pdf_path=args.pdf,
+            output_dir=args.output,
+            engines=tuple(args.engines) if args.engines else None,
+            sample_size=args.sample_size,
+            dpi=args.dpi,
+            lang=args.lang,
+        )
+        print(summarize_ocr_benchmark(results))
+        return 0
     return run_app()
 
 

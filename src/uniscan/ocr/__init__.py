@@ -1,5 +1,11 @@
 """OCR utilities."""
 
+from .benchmark import (
+    OcrBenchmarkResult,
+    run_ocr_benchmark,
+    sample_pdf_page_indices,
+    summarize_ocr_benchmark,
+)
 from .engine import (
     OCR_ENGINE_LABELS,
     OCR_ENGINE_MINERU,
@@ -27,7 +33,11 @@ __all__ = [
     "OCR_ENGINE_VALUES",
     "OcrDependencyStatus",
     "OcrEngineStatus",
+    "OcrBenchmarkResult",
     "detect_ocr_dependencies",
     "detect_ocr_engine_status",
     "image_paths_to_searchable_pdf",
+    "run_ocr_benchmark",
+    "sample_pdf_page_indices",
+    "summarize_ocr_benchmark",
 ]

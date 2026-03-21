@@ -9,6 +9,7 @@ from .loaders import (
     list_supported_in_folder,
     load_input_items,
     natural_key,
+    render_pdf_page_indices,
     render_pdf_pages,
 )
 
@@ -19,6 +20,7 @@ __all__ = [
     "natural_key",
     "imread_unicode",
     "imwrite_unicode",
+    "render_pdf_page_indices",
     "render_pdf_pages",
     "list_supported_in_folder",
     "load_input_items",
