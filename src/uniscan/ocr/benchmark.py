@@ -182,6 +182,10 @@ def _module_presence_probe(name: str):
 def _run_paddleocr_direct(image_paths: Sequence[Path], *, lang: str) -> tuple[str, int]:
     os.environ["PADDLE_PDX_CACHE_HOME"] = str(_DEFAULT_PADDLE_CACHE_HOME)
     os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+    os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "huggingface")
+    os.environ.setdefault("FLAGS_enable_pir_api", "0")
+    os.environ.setdefault("FLAGS_use_mkldnn", "0")
+    os.environ.setdefault("PADDLE_PDX_USE_PIR_TRT", "false")
 
     from paddleocr import PaddleOCR
 
@@ -266,6 +270,11 @@ def _run_mineru_module_cli(
     input_dir = image_paths[0].parent
     output_root = work_dir / "mineru_out"
     output_root.mkdir(parents=True, exist_ok=True)
+    ultralytics_dir = work_dir / "ultralytics_cfg"
+    ultralytics_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["YOLO_CONFIG_DIR"] = str(ultralytics_dir)
+    os.environ.setdefault("MODELSCOPE_CACHE", str(work_dir / "modelscope_cache"))
+    os.environ.setdefault("HF_HOME", str(work_dir / "hf_home"))
 
     mineru_lang = "en" if lang.strip().lower() in {"eng", "en", "english"} else "ch"
     from mineru.cli.client import main as mineru_main
