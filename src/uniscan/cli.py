@@ -84,6 +84,11 @@ def main(argv: list[str] | None = None) -> int:
             "Engine names to run. Defaults to the registered OCR engine matrix."
         ),
     )
+    ocr_benchmark_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero exit code when any engine is not ok.",
+    )
 
     args = parser.parse_args(argv)
     if args.version:
@@ -112,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
             lang=args.lang,
         )
         print(summarize_ocr_benchmark(results))
+        if args.strict and any(result.status != "ok" for result in results):
+            return 1
         return 0
     return run_app()
 

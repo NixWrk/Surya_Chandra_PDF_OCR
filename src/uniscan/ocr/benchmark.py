@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-import os
+import importlib
+import importlib.util
 import json
+import os
+import shutil
+import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -14,7 +18,9 @@ from uniscan.io import imwrite_unicode, render_pdf_page_indices
 
 from .engine import (
     OCR_ENGINE_LABELS,
+    OCR_ENGINE_MINERU,
     OCR_ENGINE_PADDLEOCR,
+    OCR_ENGINE_SURYA,
     OCR_ENGINE_VALUES,
     SEARCHABLE_PDF_ENGINES,
     detect_ocr_engine_status,
@@ -32,6 +38,7 @@ class OcrBenchmarkResult:
     elapsed_seconds: float
     artifact_path: str | None
     text_chars: int
+    memory_delta_mb: float | None = None
     error: str | None = None
     note: str | None = None
 
@@ -143,9 +150,38 @@ def _extract_pdf_text_chars(pdf_path: Path) -> int:
         doc.close()
 
 
+def _memory_rss_mb() -> float | None:
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return None
+    try:
+        return float(psutil.Process(os.getpid()).memory_info().rss) / (1024.0 * 1024.0)
+    except Exception:
+        return None
+
+
+def _memory_delta_mb(before: float | None, after: float | None) -> float | None:
+    if before is None or after is None:
+        return None
+    return round(after - before, 3)
+
+
+def _artifact_path_for_engine(output_dir: Path, pdf_stem: str, engine: str) -> Path:
+    suffix = ".pdf" if engine in SEARCHABLE_PDF_ENGINES else ".txt"
+    return output_dir / f"{pdf_stem}_{engine}{suffix}"
+
+
+def _module_presence_probe(name: str):
+    """Import-probe compatible callable without importing heavyweight modules."""
+    if importlib.util.find_spec(name) is None:
+        raise ImportError(name)
+    return object()
+
+
 def _run_paddleocr_direct(image_paths: Sequence[Path], *, lang: str) -> tuple[str, int]:
-    os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(_DEFAULT_PADDLE_CACHE_HOME))
-    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    os.environ["PADDLE_PDX_CACHE_HOME"] = str(_DEFAULT_PADDLE_CACHE_HOME)
+    os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
     from paddleocr import PaddleOCR
 
@@ -165,6 +201,253 @@ def _run_paddleocr_direct(image_paths: Sequence[Path], *, lang: str) -> tuple[st
     return text, len(text)
 
 
+def _run_surya_module_cli(
+    image_paths: Sequence[Path],
+    *,
+    lang: str,
+    work_dir: Path,
+    run_cmd,
+) -> tuple[str, int]:
+    if len(image_paths) == 0:
+        raise ValueError("No images for Surya OCR.")
+
+    input_dir = image_paths[0].parent
+    output_root = work_dir / "surya_out"
+    output_root.mkdir(parents=True, exist_ok=True)
+    os.environ["MODEL_CACHE_DIR"] = str(work_dir / "surya_models")
+    os.environ.setdefault("HF_HOME", str(work_dir / "hf_home"))
+    os.environ.setdefault("MODELSCOPE_CACHE", str(work_dir / "modelscope_cache"))
+    from surya.scripts.ocr_text import ocr_text_cli
+
+    args = [
+        str(input_dir),
+        "--output_dir",
+        str(output_root),
+    ]
+    try:
+        ocr_text_cli.main(args=args, standalone_mode=False)
+    except SystemExit as exc:
+        if int(getattr(exc, "code", 1) or 0) != 0:
+            raise RuntimeError(f"surya.scripts.ocr_text exited with code {exc.code}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"surya.scripts.ocr_text failed: {exc}") from exc
+
+    results_json = output_root / input_dir.name / "results.json"
+    if not results_json.exists():
+        raise RuntimeError(f"Surya did not produce results file: {results_json}")
+
+    payload = json.loads(results_json.read_text(encoding="utf-8"))
+    collected: list[str] = []
+    for pages in payload.values():
+        if not isinstance(pages, list):
+            continue
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            for line in page.get("text_lines", []):
+                if isinstance(line, dict):
+                    text = (line.get("text") or "").strip()
+                    if text:
+                        collected.append(text)
+    text = "\n".join(collected)
+    return text, len(text)
+
+
+def _run_mineru_module_cli(
+    image_paths: Sequence[Path],
+    *,
+    lang: str,
+    work_dir: Path,
+    run_cmd,
+) -> tuple[str, int]:
+    if len(image_paths) == 0:
+        raise ValueError("No images for MinerU OCR.")
+
+    input_dir = image_paths[0].parent
+    output_root = work_dir / "mineru_out"
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    mineru_lang = "en" if lang.strip().lower() in {"eng", "en", "english"} else "ch"
+    from mineru.cli.client import main as mineru_main
+
+    args = [
+        "-p",
+        str(input_dir),
+        "-o",
+        str(output_root),
+        "-m",
+        "ocr",
+        "-b",
+        "pipeline",
+        "-l",
+        mineru_lang,
+    ]
+    try:
+        mineru_main.main(args=args, standalone_mode=False)
+    except SystemExit as exc:
+        if int(getattr(exc, "code", 1) or 0) != 0:
+            raise RuntimeError(f"mineru.cli.client exited with code {exc.code}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"mineru.cli.client failed: {exc}") from exc
+
+    text_parts: list[str] = []
+    for suffix in ("*.md", "*.txt", "*.json"):
+        for path in sorted(output_root.rglob(suffix)):
+            try:
+                payload = path.read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                continue
+            if payload:
+                text_parts.append(payload)
+
+    if not text_parts:
+        raise RuntimeError("MinerU finished without text artifacts.")
+
+    text = "\n".join(text_parts)
+    return text, len(text)
+
+
+def _run_text_engine_from_cli(
+    image_paths: Sequence[Path],
+    *,
+    engine: str,
+    lang: str,
+    candidates: Sequence[tuple[str, ...]],
+    which_fn,
+    run_cmd,
+) -> tuple[str, int]:
+    collected: list[str] = []
+    errors: list[str] = []
+
+    for image_path in image_paths:
+        page_text: str | None = None
+        for template in candidates:
+            binary = template[0]
+            binary_path = which_fn(binary) or which_fn(f"{binary}.exe")
+            if binary_path is None:
+                continue
+            args = [str(binary_path)] + [part.format(image=str(image_path), lang=lang) for part in template[1:]]
+            proc = run_cmd(args, capture_output=True, text=True)
+            if int(getattr(proc, "returncode", 1)) == 0:
+                page_text = ((getattr(proc, "stdout", "") or "") + "\n" + (getattr(proc, "stderr", "") or "")).strip()
+                if page_text:
+                    collected.append(page_text)
+                break
+            stderr = (getattr(proc, "stderr", "") or "").strip()
+            stdout = (getattr(proc, "stdout", "") or "").strip()
+            details = stderr or stdout or "unknown cli error"
+            errors.append(f"{binary}: {details}")
+
+        if page_text is None:
+            if not errors:
+                raise RuntimeError(f"Engine '{engine}' has no runnable CLI candidates in PATH.")
+            raise RuntimeError(f"Engine '{engine}' failed on {image_path.name}: {' | '.join(errors)}")
+
+    text = "\n".join(part for part in collected if part and not part.isspace())
+    return text, len(text)
+
+
+def _run_surya_direct(
+    image_paths: Sequence[Path],
+    *,
+    lang: str,
+    work_dir: Path,
+    which_fn=shutil.which,
+    run_cmd=subprocess.run,
+) -> tuple[str, int]:
+    module_error: Exception | None = None
+    try:
+        return _run_surya_module_cli(image_paths, lang=lang, work_dir=work_dir, run_cmd=run_cmd)
+    except Exception as exc:
+        module_error = exc
+
+    candidates = (
+        ("surya_ocr", "{image}", "--lang", "{lang}"),
+        ("surya_ocr", "--input", "{image}", "--lang", "{lang}"),
+        ("surya_ocr", "--image", "{image}", "--lang", "{lang}"),
+        ("marker_single", "{image}"),
+        ("marker", "{image}"),
+    )
+    try:
+        return _run_text_engine_from_cli(
+            image_paths,
+            engine=OCR_ENGINE_SURYA,
+            lang=lang,
+            candidates=candidates,
+            which_fn=which_fn,
+            run_cmd=run_cmd,
+        )
+    except Exception as cli_exc:
+        if module_error is not None:
+            raise RuntimeError(f"{module_error} | fallback: {cli_exc}") from cli_exc
+        raise
+
+
+def _run_mineru_direct(
+    image_paths: Sequence[Path],
+    *,
+    lang: str,
+    work_dir: Path,
+    which_fn=shutil.which,
+    run_cmd=subprocess.run,
+) -> tuple[str, int]:
+    module_error: Exception | None = None
+    try:
+        return _run_mineru_module_cli(image_paths, lang=lang, work_dir=work_dir, run_cmd=run_cmd)
+    except Exception as exc:
+        module_error = exc
+
+    candidates = (
+        ("mineru", "{image}", "--lang", "{lang}"),
+        ("mineru", "--input", "{image}", "--lang", "{lang}"),
+        ("magic-pdf", "{image}", "--lang", "{lang}"),
+        ("magic-pdf", "--input", "{image}", "--lang", "{lang}"),
+    )
+    try:
+        return _run_text_engine_from_cli(
+            image_paths,
+            engine=OCR_ENGINE_MINERU,
+            lang=lang,
+            candidates=candidates,
+            which_fn=which_fn,
+            run_cmd=run_cmd,
+        )
+    except Exception as cli_exc:
+        if module_error is not None:
+            raise RuntimeError(f"{module_error} | fallback: {cli_exc}") from cli_exc
+        raise
+
+
+def _run_extraction_engine(
+    engine: str,
+    image_paths: Sequence[Path],
+    *,
+    lang: str,
+    work_dir: Path,
+    which_fn,
+    run_cmd,
+) -> tuple[str, int]:
+    if engine == OCR_ENGINE_PADDLEOCR:
+        return _run_paddleocr_direct(image_paths, lang=lang)
+    if engine == OCR_ENGINE_SURYA:
+        return _run_surya_direct(
+            image_paths,
+            lang=lang,
+            work_dir=work_dir,
+            which_fn=which_fn,
+            run_cmd=run_cmd,
+        )
+    if engine == OCR_ENGINE_MINERU:
+        return _run_mineru_direct(
+            image_paths,
+            lang=lang,
+            work_dir=work_dir,
+            which_fn=which_fn,
+            run_cmd=run_cmd,
+        )
+    raise ValueError(f"Unsupported extraction engine: {engine}")
+
+
 def _make_result(
     *,
     engine: str,
@@ -173,6 +456,7 @@ def _make_result(
     elapsed_seconds: float,
     artifact_path: Path | None,
     text_chars: int,
+    memory_delta_mb: float | None,
     error: str | None = None,
     note: str | None = None,
 ) -> OcrBenchmarkResult:
@@ -183,6 +467,7 @@ def _make_result(
         elapsed_seconds=elapsed_seconds,
         artifact_path=None if artifact_path is None else str(artifact_path),
         text_chars=text_chars,
+        memory_delta_mb=memory_delta_mb,
         error=error,
         note=note,
     )
@@ -196,6 +481,9 @@ def run_ocr_benchmark(
     sample_size: int = 5,
     dpi: int = 160,
     lang: str = "eng",
+    import_module=None,
+    which_fn=shutil.which,
+    run_cmd=subprocess.run,
 ) -> list[OcrBenchmarkResult]:
     """Run a sampled OCR benchmark against a PDF fixture."""
     resolved_pdf = Path(pdf_path)
@@ -208,6 +496,7 @@ def run_ocr_benchmark(
         raise ValueError("No PDF pages available for OCR benchmark.")
 
     selected_engines = tuple(engines) if engines is not None else OCR_ENGINE_VALUES
+    import_probe = import_module or _module_presence_probe
     results: list[OcrBenchmarkResult] = []
 
     with tempfile.TemporaryDirectory(prefix="uniscan_ocr_benchmark_") as tmp:
@@ -219,33 +508,60 @@ def run_ocr_benchmark(
             tmp_dir=tmp_dir,
         )
 
-        for engine in selected_engines:
+        for engine_name in selected_engines:
+            engine = engine_name.strip().lower()
             start = perf_counter()
-            engine_status = detect_ocr_engine_status(engine)
-            if not engine_status.ready:
+            rss_before = _memory_rss_mb()
+            artifact_path = _artifact_path_for_engine(resolved_output, resolved_pdf.stem, engine)
+            try:
+                engine_status = detect_ocr_engine_status(
+                    engine,
+                    import_module=import_probe,
+                    which_fn=which_fn,
+                )
+            except Exception as exc:
                 elapsed = perf_counter() - start
                 results.append(
                     _make_result(
                         engine=engine,
-                        status="skipped",
+                        status="error",
                         sample_pages=sample_pages,
                         elapsed_seconds=elapsed,
-                        artifact_path=None,
+                        artifact_path=artifact_path,
                         text_chars=0,
-                        note=f"missing: {', '.join(engine_status.missing) if engine_status.missing else 'unknown'}",
+                        memory_delta_mb=_memory_delta_mb(rss_before, _memory_rss_mb()),
+                        error=str(exc),
+                        note="status detection failed",
                     )
                 )
                 continue
 
-            if engine in SEARCHABLE_PDF_ENGINES:
-                artifact_path = resolved_output / f"{resolved_pdf.stem}_{engine}.pdf"
-                try:
+            if not engine_status.ready:
+                elapsed = perf_counter() - start
+                missing = ", ".join(engine_status.missing) if engine_status.missing else "unknown"
+                results.append(
+                    _make_result(
+                        engine=engine,
+                        status="error",
+                        sample_pages=sample_pages,
+                        elapsed_seconds=elapsed,
+                        artifact_path=artifact_path,
+                        text_chars=0,
+                        memory_delta_mb=_memory_delta_mb(rss_before, _memory_rss_mb()),
+                        note=f"missing: {missing}",
+                    )
+                )
+                continue
+
+            try:
+                if engine in SEARCHABLE_PDF_ENGINES:
                     output_pdf = image_paths_to_searchable_pdf(
                         sampled_image_paths,
                         out_pdf=artifact_path,
                         lang=lang,
                         engine_name=engine,
                     )
+                    text_chars = _extract_pdf_text_chars(output_pdf)
                     elapsed = perf_counter() - start
                     results.append(
                         _make_result(
@@ -254,67 +570,47 @@ def run_ocr_benchmark(
                             sample_pages=sample_pages,
                             elapsed_seconds=elapsed,
                             artifact_path=output_pdf,
-                            text_chars=_extract_pdf_text_chars(output_pdf),
-                        )
-                    )
-                except Exception as exc:
-                    elapsed = perf_counter() - start
-                    results.append(
-                        _make_result(
-                            engine=engine,
-                            status="error",
-                            sample_pages=sample_pages,
-                            elapsed_seconds=elapsed,
-                            artifact_path=artifact_path,
-                            text_chars=0,
-                            error=str(exc),
-                        )
-                    )
-                continue
-
-            if engine == OCR_ENGINE_PADDLEOCR:
-                artifact_path = resolved_output / f"{resolved_pdf.stem}_{engine}.txt"
-                try:
-                    text, text_chars = _run_paddleocr_direct(sampled_image_paths, lang=lang)
-                    artifact_path.write_text(text, encoding="utf-8")
-                    elapsed = perf_counter() - start
-                    results.append(
-                        _make_result(
-                            engine=engine,
-                            status="ok",
-                            sample_pages=sample_pages,
-                            elapsed_seconds=elapsed,
-                            artifact_path=artifact_path,
                             text_chars=text_chars,
+                            memory_delta_mb=_memory_delta_mb(rss_before, _memory_rss_mb()),
                         )
                     )
-                except Exception as exc:
-                    elapsed = perf_counter() - start
-                    results.append(
-                        _make_result(
-                            engine=engine,
-                            status="error",
-                            sample_pages=sample_pages,
-                            elapsed_seconds=elapsed,
-                            artifact_path=artifact_path,
-                            text_chars=0,
-                            error=str(exc),
-                        )
-                    )
-                continue
+                    continue
 
-            elapsed = perf_counter() - start
-            results.append(
-                _make_result(
-                    engine=engine,
-                    status="skipped",
-                    sample_pages=sample_pages,
-                    elapsed_seconds=elapsed,
-                    artifact_path=None,
-                    text_chars=0,
-                    note="not wired for benchmark yet",
+                text, text_chars = _run_extraction_engine(
+                    engine,
+                    sampled_image_paths,
+                    lang=lang,
+                    work_dir=tmp_dir / f"{engine}_work",
+                    which_fn=which_fn,
+                    run_cmd=run_cmd,
                 )
-            )
+                artifact_path.write_text(text, encoding="utf-8")
+                elapsed = perf_counter() - start
+                results.append(
+                    _make_result(
+                        engine=engine,
+                        status="ok",
+                        sample_pages=sample_pages,
+                        elapsed_seconds=elapsed,
+                        artifact_path=artifact_path,
+                        text_chars=text_chars,
+                        memory_delta_mb=_memory_delta_mb(rss_before, _memory_rss_mb()),
+                    )
+                )
+            except Exception as exc:
+                elapsed = perf_counter() - start
+                results.append(
+                    _make_result(
+                        engine=engine,
+                        status="error",
+                        sample_pages=sample_pages,
+                        elapsed_seconds=elapsed,
+                        artifact_path=artifact_path,
+                        text_chars=0,
+                        memory_delta_mb=_memory_delta_mb(rss_before, _memory_rss_mb()),
+                        error=str(exc),
+                    )
+                )
 
     report_path = resolved_output / f"{resolved_pdf.stem}_ocr_benchmark.json"
     report_path.write_text(
@@ -337,20 +633,15 @@ def summarize_ocr_benchmark(results: Sequence[OcrBenchmarkResult]) -> str:
     """Format a concise human-readable benchmark summary."""
     lines: list[str] = []
     for result in results:
+        memory_part = "" if result.memory_delta_mb is None else f" mem={result.memory_delta_mb:+.2f}MB"
         if result.status == "ok":
             lines.append(
                 f"{result.engine}: ok {result.elapsed_seconds:.2f}s "
-                f"text={result.text_chars} artifact={result.artifact_path}"
-            )
-            continue
-        if result.status == "skipped":
-            lines.append(
-                f"{result.engine}: skipped {result.elapsed_seconds:.2f}s "
-                f"{result.note or 'no note'}"
+                f"text={result.text_chars}{memory_part} artifact={result.artifact_path}"
             )
             continue
         lines.append(
             f"{result.engine}: error {result.elapsed_seconds:.2f}s "
-            f"{result.error or 'unknown error'}"
+            f"{result.error or result.note or 'unknown error'}{memory_part}"
         )
     return "\n".join(lines)

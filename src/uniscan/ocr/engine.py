@@ -163,7 +163,8 @@ def detect_ocr_engine_status(
     if engine == OCR_ENGINE_SURYA:
         has_surya = _has_module("surya", import_module)
         has_marker = _has_module("marker", import_module)
-        missing = [] if (has_surya or has_marker) else ["surya/marker"]
+        has_surya_cli = _has_command("surya_ocr", which_fn) or _has_command("marker_single", which_fn) or _has_command("marker", which_fn)
+        missing = [] if (has_surya or has_marker or has_surya_cli) else ["surya/marker"]
         return OcrEngineStatus(
             engine_name=engine,
             ready=not missing,
@@ -172,7 +173,8 @@ def detect_ocr_engine_status(
         )
 
     has_mineru = _has_module("mineru", import_module) or _has_module("magic_pdf", import_module)
-    missing = [] if has_mineru else ["mineru(magic_pdf)"]
+    has_mineru_cli = _has_command("mineru", which_fn) or _has_command("magic-pdf", which_fn)
+    missing = [] if (has_mineru or has_mineru_cli) else ["mineru(magic_pdf)"]
     return OcrEngineStatus(
         engine_name=engine,
         ready=not missing,
@@ -197,19 +199,40 @@ def _image_paths_to_searchable_pdf_pytesseract(
 ) -> Path:
     pytesseract = import_module("pytesseract")
     pypdf = import_module("pypdf")
+    page_pdf_bytes: list[bytes] = []
+    for src_path in image_paths:
+        page_pdf_bytes.append(
+            pytesseract.image_to_pdf_or_hocr(str(src_path), extension="pdf", lang=lang)
+        )
 
-    merger = pypdf.PdfMerger()
-    streams: list[BytesIO] = []
+    if hasattr(pypdf, "PdfMerger"):
+        merger = pypdf.PdfMerger()
+        streams: list[BytesIO] = []
+        try:
+            for payload in page_pdf_bytes:
+                stream = BytesIO(payload)
+                streams.append(stream)
+                merger.append(stream)
+            with out_pdf.open("wb") as fh:
+                merger.write(fh)
+        finally:
+            merger.close()
+            for stream in streams:
+                stream.close()
+        return out_pdf
+
+    writer = pypdf.PdfWriter()
+    streams = []
     try:
-        for src_path in image_paths:
-            pdf_bytes = pytesseract.image_to_pdf_or_hocr(str(src_path), extension="pdf", lang=lang)
-            stream = BytesIO(pdf_bytes)
+        for payload in page_pdf_bytes:
+            stream = BytesIO(payload)
             streams.append(stream)
-            merger.append(stream)
+            reader = pypdf.PdfReader(stream)
+            for page in reader.pages:
+                writer.add_page(page)
         with out_pdf.open("wb") as fh:
-            merger.write(fh)
+            writer.write(fh)
     finally:
-        merger.close()
         for stream in streams:
             stream.close()
     return out_pdf
@@ -235,7 +258,6 @@ def _image_paths_to_searchable_pdf_ocrmypdf(
             [
                 str(ocrmypdf_cmd),
                 "--force-ocr",
-                "--skip-text",
                 "--optimize",
                 "0",
                 "--language",
@@ -263,25 +285,45 @@ def _image_paths_to_searchable_pdf_pymupdf(
 ) -> Path:
     fitz = import_module("fitz")
     pypdf = import_module("pypdf")
+    page_pdf_bytes: list[bytes] = []
+    for src_path in image_paths:
+        pix = fitz.Pixmap(str(src_path))
+        if not hasattr(pix, "pdfocr_tobytes"):
+            raise RuntimeError("Current PyMuPDF build has no OCR support (missing Pixmap.pdfocr_tobytes).")
+        try:
+            page_pdf = pix.pdfocr_tobytes(language=lang)
+        except TypeError:
+            page_pdf = pix.pdfocr_tobytes()
+        page_pdf_bytes.append(page_pdf)
 
-    merger = pypdf.PdfMerger()
-    streams: list[BytesIO] = []
+    if hasattr(pypdf, "PdfMerger"):
+        merger = pypdf.PdfMerger()
+        streams: list[BytesIO] = []
+        try:
+            for payload in page_pdf_bytes:
+                stream = BytesIO(payload)
+                streams.append(stream)
+                merger.append(stream)
+            with out_pdf.open("wb") as fh:
+                merger.write(fh)
+        finally:
+            merger.close()
+            for stream in streams:
+                stream.close()
+        return out_pdf
+
+    writer = pypdf.PdfWriter()
+    streams = []
     try:
-        for src_path in image_paths:
-            pix = fitz.Pixmap(str(src_path))
-            if not hasattr(pix, "pdfocr_tobytes"):
-                raise RuntimeError("Current PyMuPDF build has no OCR support (missing Pixmap.pdfocr_tobytes).")
-            try:
-                page_pdf = pix.pdfocr_tobytes(language=lang)
-            except TypeError:
-                page_pdf = pix.pdfocr_tobytes()
-            stream = BytesIO(page_pdf)
+        for payload in page_pdf_bytes:
+            stream = BytesIO(payload)
             streams.append(stream)
-            merger.append(stream)
+            reader = pypdf.PdfReader(stream)
+            for page in reader.pages:
+                writer.add_page(page)
         with out_pdf.open("wb") as fh:
-            merger.write(fh)
+            writer.write(fh)
     finally:
-        merger.close()
         for stream in streams:
             stream.close()
     return out_pdf
