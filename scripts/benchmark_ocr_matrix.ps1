@@ -204,7 +204,16 @@ foreach ($engine in $engineMatrix) {
 
     try {
         if ($Recreate -and (Test-Path $venvPath)) {
-            Remove-Item -Recurse -Force $venvPath
+            try {
+                Remove-Item -Recurse -Force $venvPath -ErrorAction Stop
+            }
+            catch {
+                $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+                $venvPath = Join-Path $RepoRoot (".venv_latest_{0}_{1}" -f $engineName, $timestamp)
+                $venvPython = Join-Path $venvPath "Scripts\python.exe"
+                $entry.venv_path = $venvPath
+                ("[warn] Unable to remove existing venv. Using fallback venv path: {0}" -f $venvPath) | Tee-Object -FilePath $logPath -Append | Out-Host
+            }
         }
 
         if (!(Test-Path $venvPython)) {
