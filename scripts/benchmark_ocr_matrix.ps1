@@ -61,9 +61,9 @@ $engineMatrix = @(
     @{
         name = "paddleocr"
         deps = @(
-            "paddleocr",
-            "paddlex",
-            "paddlepaddle",
+            "paddleocr==3.4.0",
+            "paddlex==3.4.2",
+            "paddlepaddle==3.1.1",
             "requests"
         )
     },
