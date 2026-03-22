@@ -95,7 +95,19 @@ $engineMatrix = @(
 )
 
 if ($Engines.Count -gt 0) {
-    $normalized = $Engines | ForEach-Object { $_.Trim().ToLowerInvariant() }
+    $normalized = @()
+    foreach ($engineArg in $Engines) {
+        if ([string]::IsNullOrWhiteSpace($engineArg)) {
+            continue
+        }
+        foreach ($part in ($engineArg -split ",")) {
+            $name = $part.Trim().ToLowerInvariant()
+            if (-not [string]::IsNullOrWhiteSpace($name)) {
+                $normalized += $name
+            }
+        }
+    }
+    $normalized = @($normalized | Select-Object -Unique)
     $engineMatrix = @($engineMatrix | Where-Object { $normalized -contains $_.name })
     if ($engineMatrix.Count -eq 0) {
         throw "No matching engines found for filter: $($Engines -join ', ')"
