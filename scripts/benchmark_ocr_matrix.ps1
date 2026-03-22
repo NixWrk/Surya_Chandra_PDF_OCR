@@ -178,7 +178,13 @@ foreach ($engine in $engineMatrix) {
     New-Item -ItemType Directory -Force $engineOutput | Out-Null
     $logPath = Join-Path $engineOutput "run.log"
     if (Test-Path $logPath) {
-        Remove-Item -Force $logPath
+        try {
+            Remove-Item -Force $logPath -ErrorAction Stop
+        }
+        catch {
+            $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+            $logPath = Join-Path $engineOutput ("run_{0}.log" -f $timestamp)
+        }
     }
 
     $entry = [ordered]@{
