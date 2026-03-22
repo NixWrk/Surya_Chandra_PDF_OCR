@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
         "--sample-size",
         type=int,
         default=5,
-        help="Window size for the first/middle/last page samples.",
+        help="Total number of sampled pages (evenly distributed from first to last).",
     )
     ocr_benchmark_parser.add_argument(
         "--dpi",

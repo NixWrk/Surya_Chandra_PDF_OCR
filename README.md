@@ -125,6 +125,22 @@ Optional OCR dependencies in the new app:
 pip install pytesseract pypdf ocrmypdf paddleocr pymupdf
 ```
 
+Optional packages for full all-engine OCR benchmark (`surya`/`mineru` paths):
+
+```powershell
+pip install surya-ocr mineru ftfy dill omegaconf doclayout-yolo ultralytics
+```
+
+Known working stack for one-environment all-engine benchmark on Windows:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --upgrade --force-reinstall `
+  "paddleocr==3.4.0" "paddlex==3.4.2" "paddlepaddle==3.1.1" `
+  "transformers==4.57.1" "tokenizers==0.22.1" "huggingface-hub==0.34.4" `
+  "ftfy==6.3.1" "dill==0.4.1" "omegaconf==2.3.0" `
+  "langchain==0.2.17" "langchain-community==0.2.19" "langchain-core==0.2.43"
+```
+
 Also install CLI/system tools where needed:
 
 1. Tesseract OCR engine in `PATH` for `pytesseract` and `PyMuPDF OCR` mode.
@@ -134,6 +150,10 @@ Experimental engine packages:
 
 1. `Surya` (or `marker` package path that bundles Surya OCR).
 2. `MinerU` (`mineru` or `magic_pdf` package).
+
+Benchmark note:
+
+1. `benchmark-ocr --sample-size N` now means total sampled pages (evenly distributed from first to last), not `N` pages per window.
 
 If you plan to use legacy scripts with OCR, install additionally:
 

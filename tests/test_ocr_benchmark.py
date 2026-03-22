@@ -60,8 +60,10 @@ def _ready_status(engine_name: str, *, searchable_pdf: bool) -> SimpleNamespace:
     )
 
 
-def test_sample_pdf_page_indices_spans_first_middle_last_windows() -> None:
-    assert sample_pdf_page_indices(12, sample_size=3) == [0, 1, 2, 5, 6, 7, 9, 10, 11]
+def test_sample_pdf_page_indices_returns_evenly_distributed_pages() -> None:
+    assert sample_pdf_page_indices(12, sample_size=3) == [0, 6, 11]
+    assert sample_pdf_page_indices(12, sample_size=2) == [0, 11]
+    assert sample_pdf_page_indices(12, sample_size=1) == [0]
     assert sample_pdf_page_indices(2, sample_size=5) == [0, 1]
     assert sample_pdf_page_indices(0, sample_size=5) == []
 
@@ -111,7 +113,7 @@ def test_run_ocr_benchmark_writes_report_and_artifacts(tmp_path, monkeypatch) ->
     assert all(result.status == "ok" for result in results)
     assert all(result.artifact_path and Path(result.artifact_path).exists() for result in results)
     for result in results:
-        assert result.sample_pages == [1, 2, 3]
+        assert result.sample_pages == [1, 3]
     assert {result.text_chars for result in results if result.engine in SEARCHABLE_ENGINES} == {321}
     assert {result.text_chars for result in results if result.engine in EXTRACTION_ENGINES} == {12, 13, 14}
 
@@ -119,7 +121,7 @@ def test_run_ocr_benchmark_writes_report_and_artifacts(tmp_path, monkeypatch) ->
     assert report_path.exists()
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert payload["pdf_path"] == str(pdf_path)
-    assert payload["sample_pages"] == [1, 2, 3]
+    assert payload["sample_pages"] == [1, 3]
     assert len(payload["results"]) == len(ALL_ENGINES)
 
 

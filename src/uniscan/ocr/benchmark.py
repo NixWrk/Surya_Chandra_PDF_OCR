@@ -27,7 +27,12 @@ from .engine import (
     image_paths_to_searchable_pdf,
 )
 
-_DEFAULT_PADDLE_CACHE_HOME = Path(__file__).resolve().parents[3] / ".paddlex_cache"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_DEFAULT_PADDLE_CACHE_HOME = _REPO_ROOT / ".paddlex_cache"
+_DEFAULT_HF_CACHE_HOME = _REPO_ROOT / ".hf_cache"
+_DEFAULT_MODELSCOPE_CACHE_HOME = _REPO_ROOT / ".modelscope_cache"
+_DEFAULT_SURYA_MODEL_CACHE_HOME = _REPO_ROOT / ".surya_cache"
+_DEFAULT_YOLO_CONFIG_HOME = _REPO_ROOT / ".ultralytics"
 
 
 @dataclass(slots=True)
@@ -48,26 +53,33 @@ class OcrBenchmarkResult:
 
 
 def sample_pdf_page_indices(page_count: int, *, sample_size: int = 5) -> list[int]:
-    """Pick first/middle/last page windows without loading the whole PDF."""
+    """Pick an evenly distributed page sample without loading the whole PDF."""
     if page_count <= 0:
         return []
 
-    window = max(1, int(sample_size))
-    if page_count <= window:
+    target = max(1, int(sample_size))
+    if page_count <= target:
         return list(range(page_count))
 
-    indices: set[int] = set(range(0, min(window, page_count)))
+    if target == 1:
+        return [0]
 
-    midpoint = page_count // 2
-    mid_start = max(0, midpoint - window // 2)
-    mid_end = min(page_count, mid_start + window)
-    mid_start = max(0, mid_end - window)
-    indices.update(range(mid_start, mid_end))
+    indices: list[int] = []
+    for index in range(target):
+        # Even spread across [0, page_count - 1], including both ends.
+        page_index = round(index * (page_count - 1) / (target - 1))
+        if page_index not in indices:
+            indices.append(page_index)
 
-    last_start = max(0, page_count - window)
-    indices.update(range(last_start, page_count))
+    if len(indices) < target:
+        for page_index in range(page_count):
+            if page_index in indices:
+                continue
+            indices.append(page_index)
+            if len(indices) == target:
+                break
 
-    return sorted(indices)
+    return indices
 
 
 def _pdf_page_count(pdf_path: Path) -> int:
@@ -180,8 +192,8 @@ def _module_presence_probe(name: str):
 
 
 def _run_paddleocr_direct(image_paths: Sequence[Path], *, lang: str) -> tuple[str, int]:
-    os.environ["PADDLE_PDX_CACHE_HOME"] = str(_DEFAULT_PADDLE_CACHE_HOME)
-    os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+    os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(_DEFAULT_PADDLE_CACHE_HOME))
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
     os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "huggingface")
     os.environ.setdefault("FLAGS_enable_pir_api", "0")
     os.environ.setdefault("FLAGS_use_mkldnn", "0")
@@ -218,9 +230,9 @@ def _run_surya_module_cli(
     input_dir = image_paths[0].parent
     output_root = work_dir / "surya_out"
     output_root.mkdir(parents=True, exist_ok=True)
-    os.environ["MODEL_CACHE_DIR"] = str(work_dir / "surya_models")
-    os.environ.setdefault("HF_HOME", str(work_dir / "hf_home"))
-    os.environ.setdefault("MODELSCOPE_CACHE", str(work_dir / "modelscope_cache"))
+    os.environ.setdefault("MODEL_CACHE_DIR", str(_DEFAULT_SURYA_MODEL_CACHE_HOME))
+    os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
+    os.environ.setdefault("MODELSCOPE_CACHE", str(_DEFAULT_MODELSCOPE_CACHE_HOME))
     from surya.scripts.ocr_text import ocr_text_cli
 
     args = [
@@ -270,11 +282,10 @@ def _run_mineru_module_cli(
     input_dir = image_paths[0].parent
     output_root = work_dir / "mineru_out"
     output_root.mkdir(parents=True, exist_ok=True)
-    ultralytics_dir = work_dir / "ultralytics_cfg"
-    ultralytics_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["YOLO_CONFIG_DIR"] = str(ultralytics_dir)
-    os.environ.setdefault("MODELSCOPE_CACHE", str(work_dir / "modelscope_cache"))
-    os.environ.setdefault("HF_HOME", str(work_dir / "hf_home"))
+    os.environ.setdefault("YOLO_CONFIG_DIR", str(_DEFAULT_YOLO_CONFIG_HOME))
+    os.environ.setdefault("MODELSCOPE_CACHE", str(_DEFAULT_MODELSCOPE_CACHE_HOME))
+    os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
+    os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
     mineru_lang = "en" if lang.strip().lower() in {"eng", "en", "english"} else "ch"
     from mineru.cli.client import main as mineru_main

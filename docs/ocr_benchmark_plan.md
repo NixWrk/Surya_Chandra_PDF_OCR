@@ -35,11 +35,10 @@ Each run must generate:
 
 ## Execution Policy
 
-Default sampled window:
+Default sampled selection:
 
-1. First `N` pages.
-2. Middle `N` pages.
-3. Last `N` pages.
+1. Sample exactly `N` pages total.
+2. Distribute indices evenly from first to last page.
 
 Required behavior:
 

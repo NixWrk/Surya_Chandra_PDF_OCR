@@ -85,7 +85,7 @@ def test_ocr_engine_registry_is_stable() -> None:
 def test_detect_ocr_engine_status_ready_matrix(engine_name: str, expected_searchable_pdf: bool) -> None:
     status = detect_ocr_engine_status(
         engine_name,
-        import_module=_importer_factory({"pytesseract", "pypdf", "img2pdf", "fitz", "paddleocr", "surya", "marker", "mineru", "magic_pdf"}),
+        import_module=_importer_factory({"pytesseract", "pypdf", "img2pdf", "fitz", "paddleocr", "surya", "marker", "mineru", "magic_pdf", "ftfy", "dill", "omegaconf"}),
         which_fn=_which_factory({"tesseract", "ocrmypdf"}),
     )
     assert status.ready
@@ -139,6 +139,16 @@ def test_detect_ocr_engine_status_paddleocr_ready_but_no_searchable_pdf() -> Non
     )
     assert status.ready
     assert not status.searchable_pdf
+
+
+def test_detect_ocr_engine_status_mineru_requires_runtime_modules() -> None:
+    status = detect_ocr_engine_status(
+        OCR_ENGINE_MINERU,
+        import_module=_importer_factory({"mineru"}),
+        which_fn=_which_factory(set()),
+    )
+    assert not status.ready
+    assert set(status.missing) == {"ftfy", "dill", "omegaconf"}
 
 
 def test_image_paths_to_searchable_pdf_rejects_unwired_ocr_engines(tmp_path: Path) -> None:

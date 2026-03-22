@@ -174,7 +174,13 @@ def detect_ocr_engine_status(
 
     has_mineru = _has_module("mineru", import_module) or _has_module("magic_pdf", import_module)
     has_mineru_cli = _has_command("mineru", which_fn) or _has_command("magic-pdf", which_fn)
-    missing = [] if (has_mineru or has_mineru_cli) else ["mineru(magic_pdf)"]
+    missing: list[str] = []
+    if not (has_mineru or has_mineru_cli):
+        missing.append("mineru(magic_pdf)")
+    if has_mineru:
+        for module_name in ("ftfy", "dill", "omegaconf"):
+            if not _has_module(module_name, import_module):
+                missing.append(module_name)
     return OcrEngineStatus(
         engine_name=engine,
         ready=not missing,
