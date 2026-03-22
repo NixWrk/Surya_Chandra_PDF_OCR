@@ -155,6 +155,20 @@ Benchmark note:
 
 1. `benchmark-ocr --sample-size N` now means total sampled pages (evenly distributed from first to last), not `N` pages per window.
 
+Environment strategy and conflict notes:
+
+1. See `docs/ocr_env_strategy.md` for known dependency conflicts and the one-venv pin set.
+2. For latest-release comparisons, run isolated per-engine environments with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\benchmark_ocr_matrix.ps1 `
+  -PdfPath "J:\Imaging Edge Mobile\Imaging Edge Mobile_paddleocr_uvdoc.pdf" `
+  -OutputRoot ".\artifacts\ocr_latest_matrix" `
+  -SampleSize 1 `
+  -Dpi 160 `
+  -Recreate
+```
+
 If you plan to use legacy scripts with OCR, install additionally:
 
 ```powershell
@@ -202,6 +216,7 @@ python "prepare pdf to tesseract.py"
 | `only_tesseract.py` | OCR pipeline using direct `tesseract.exe` calls |
 | `imgs_and_pdfs_ocr_fast_STABLE.py` | Stable previous OCR GUI version |
 | `prepare pdf to tesseract.py` | PDF conditioning helper before OCR |
+| `scripts/benchmark_ocr_matrix.ps1` | Creates isolated venv per OCR engine, runs benchmark, writes matrix summary |
 | `camscan_suhren/` | Third-party camera scanner project used as source of preprocessing logic |
 
 ## Known Limitations
