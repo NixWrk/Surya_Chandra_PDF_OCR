@@ -132,6 +132,13 @@ function Invoke-Logged {
     "$Exe $($ArgList -join ' ')" | Tee-Object -FilePath $LogPath -Append | Out-Null
 
     $stderrPath = Join-Path $env:TEMP ("uniscan_ocr_matrix_stderr_{0}.log" -f ([guid]::NewGuid().ToString("N")))
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $hasNativeEap = $null -ne (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue)
+    if ($hasNativeEap) {
+        $previousNativeEap = $global:PSNativeCommandUseErrorActionPreference
+        $global:PSNativeCommandUseErrorActionPreference = $false
+    }
     try {
         # Keep native argument semantics (paths with spaces remain intact),
         # while redirecting stderr away from PowerShell error records.
@@ -142,6 +149,10 @@ function Invoke-Logged {
         $exitCode = [int]$LASTEXITCODE
     }
     finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        if ($hasNativeEap) {
+            $global:PSNativeCommandUseErrorActionPreference = $previousNativeEap
+        }
         if (Test-Path $stderrPath) {
             Remove-Item -Force $stderrPath
         }
@@ -212,23 +223,47 @@ foreach ($engine in $engineMatrix) {
         $null = Invoke-Logged -Exe $venvPython -ArgList (@("-m", "pip", "install", "--upgrade") + $engineDeps) -LogPath $logPath -StepName "Install engine deps"
         $entry.install_exit_code = 0
 
-        $versionPkgs = @(
-            "uniscan",
-            "pytesseract",
-            "ocrmypdf",
-            "pymupdf",
-            "paddleocr",
-            "paddlex",
-            "paddlepaddle",
-            "surya-ocr",
-            "mineru",
-            "transformers",
-            "tokenizers",
-            "huggingface-hub",
-            "ftfy",
-            "dill",
-            "omegaconf"
-        )
+        $versionPkgs = @("uniscan", "pymupdf")
+        switch ($engineName) {
+            "pytesseract" {
+                $versionPkgs += @("pytesseract", "pypdf")
+                break
+            }
+            "ocrmypdf" {
+                $versionPkgs += @("ocrmypdf", "pypdf", "img2pdf")
+                break
+            }
+            "pymupdf" {
+                $versionPkgs += @("pypdf", "pytesseract")
+                break
+            }
+            "paddleocr" {
+                $versionPkgs += @("paddleocr", "paddlex", "paddlepaddle", "requests")
+                break
+            }
+            "surya" {
+                $versionPkgs += @("surya-ocr", "requests", "transformers", "tokenizers", "huggingface-hub")
+                break
+            }
+            "mineru" {
+                $versionPkgs += @(
+                    "mineru",
+                    "doclayout-yolo",
+                    "ultralytics",
+                    "ftfy",
+                    "dill",
+                    "omegaconf",
+                    "shapely",
+                    "pyclipper",
+                    "requests",
+                    "transformers",
+                    "tokenizers",
+                    "huggingface-hub"
+                )
+                break
+            }
+        }
+        $versionPkgs = @($versionPkgs | Select-Object -Unique)
         $versionsPath = Join-Path $engineOutput "versions.txt"
         $freezePath = Join-Path $engineOutput "requirements_freeze.txt"
         $null = Invoke-Logged -Exe $venvPython -ArgList (@("-m", "pip", "show") + $versionPkgs) -LogPath $versionsPath -StepName "Version snapshot" -AllowFailure
