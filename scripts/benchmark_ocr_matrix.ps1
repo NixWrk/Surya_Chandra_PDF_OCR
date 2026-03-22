@@ -60,15 +60,37 @@ $engineMatrix = @(
     },
     @{
         name = "paddleocr"
-        deps = @("paddleocr", "paddlex", "paddlepaddle")
+        deps = @(
+            "paddleocr",
+            "paddlex",
+            "paddlepaddle",
+            "requests"
+        )
     },
     @{
         name = "surya"
-        deps = @("surya-ocr")
+        deps = @(
+            "surya-ocr",
+            "requests",
+            "transformers==4.57.1",
+            "tokenizers==0.22.1",
+            "huggingface-hub==0.34.4"
+        )
     },
     @{
         name = "mineru"
-        deps = @("mineru", "doclayout-yolo", "ultralytics", "ftfy", "dill", "omegaconf")
+        deps = @(
+            "mineru",
+            "doclayout-yolo",
+            "ultralytics",
+            "ftfy",
+            "dill",
+            "omegaconf",
+            "requests",
+            "transformers==4.57.1",
+            "tokenizers==0.22.1",
+            "huggingface-hub==0.34.4"
+        )
     }
 )
 
@@ -98,7 +120,7 @@ function Invoke-Logged {
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $Exe @ArgList 2>&1 | Tee-Object -FilePath $LogPath -Append
+        & $Exe @ArgList 2>&1 | Tee-Object -FilePath $LogPath -Append | Out-Host
         $exitCode = $LASTEXITCODE
     }
     finally {
@@ -199,6 +221,14 @@ foreach ($engine in $engineMatrix) {
         $env:MODELSCOPE_CACHE = $repoModelscopeCache
         $env:YOLO_CONFIG_DIR = $repoYoloCfg
         $env:TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD = "1"
+        if ($engineName -eq "paddleocr") {
+            # Reduce Paddle CPU backend incompatibilities in latest stacks.
+            $env:FLAGS_enable_pir_api = "0"
+            $env:FLAGS_use_mkldnn = "0"
+            $env:PADDLE_PDX_USE_PIR_TRT = "false"
+            $env:FLAGS_enable_new_ir_in_executor = "0"
+            $env:FLAGS_enable_pir_in_executor = "0"
+        }
 
         $benchArgs = @(
             "-m", "uniscan",
