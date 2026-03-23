@@ -86,3 +86,9 @@ This means:
 
 1. You can already run searchable PDF via `paddleocr` if `ocrmypdf_paddleocr` is installed.
 2. For `surya`, `mineru`, `chandra`, UniScan has plugin hooks and module detection, but actual plugin package must be installed/provided.
+
+## Plugin source safety rule
+
+1. Original repos inside `OCRmypdf_plugins` are treated as read-only sources.
+2. Any modifications must be done only in copied folders with `_NIX` suffix.
+3. The installer script `scripts/install_local_ocrmypdf_plugins.ps1` creates/uses `_NIX` copies and installs plugins from those copies.

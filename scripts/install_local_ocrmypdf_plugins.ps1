@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$RepoRoot = "",
-    [string]$PythonExe = ".\.venv\Scripts\python.exe"
+    [string]$PythonExe = ".\.venv\Scripts\python.exe",
+    [switch]$RefreshNixCopies
 )
 
 Set-StrictMode -Version Latest
@@ -40,16 +41,30 @@ $candidates = @(
 
 $installed = @()
 foreach ($name in $candidates) {
-    $path = Join-Path $pluginRoot $name
-    if (!(Test-Path $path)) {
+    $sourcePath = Join-Path $pluginRoot $name
+    if (!(Test-Path $sourcePath)) {
         continue
     }
-    Write-Host "Installing plugin from $path"
-    & $pythonPath -m pip install -e $path
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to install plugin: $path"
+
+    $nixPath = Join-Path $pluginRoot ("{0}_NIX" -f $name)
+    if ($RefreshNixCopies -and (Test-Path $nixPath)) {
+        Write-Host "Refreshing NIX copy: $nixPath"
+        Remove-Item -Recurse -Force $nixPath
     }
-    $installed += $name
+    if (!(Test-Path $nixPath)) {
+        Write-Host "Creating NIX copy: $sourcePath -> $nixPath"
+        Copy-Item -Path $sourcePath -Destination $nixPath -Recurse -Force
+    }
+    else {
+        Write-Host "Using existing NIX copy: $nixPath"
+    }
+
+    Write-Host "Installing plugin from NIX copy $nixPath"
+    & $pythonPath -m pip install -e $nixPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to install plugin from NIX copy: $nixPath"
+    }
+    $installed += ("{0}_NIX" -f $name)
 }
 
 if ($installed.Count -eq 0) {
@@ -60,4 +75,3 @@ if ($installed.Count -eq 0) {
 Write-Host ""
 Write-Host "Installed plugin repos:"
 $installed | ForEach-Object { Write-Host " - $_" }
-

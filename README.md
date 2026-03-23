@@ -144,6 +144,12 @@ One-command installer for local plugin repos:
 powershell -ExecutionPolicy Bypass -File .\scripts\install_local_ocrmypdf_plugins.ps1
 ```
 
+Important workflow rule:
+
+1. Do not modify original plugin folders under `OCRmypdf_plugins`.
+2. Work only in copied folders with suffix `_NIX` (for example `OCRmyPDF-PaddleOCR-main_NIX`).
+3. `install_local_ocrmypdf_plugins.ps1` follows this rule automatically: it creates/uses `_NIX` copies and installs from those.
+
 Known working stack for one-environment all-engine benchmark on Windows:
 
 ```powershell
