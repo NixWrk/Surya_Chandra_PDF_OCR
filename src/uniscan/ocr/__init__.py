@@ -28,6 +28,12 @@ from .engine import (
     detect_ocr_engine_status,
     image_paths_to_searchable_pdf,
 )
+from .preprocessing import (
+    PREPROCESSING_MODES,
+    PreprocessingMode,
+    apply_preprocessing,
+    preprocess_image_file,
+)
 
 __all__ = [
     "OCR_ENGINE_LABELS",
@@ -43,9 +49,13 @@ __all__ = [
     "OcrDependencyStatus",
     "OcrEngineStatus",
     "OcrBenchmarkResult",
+    "PREPROCESSING_MODES",
+    "PreprocessingMode",
+    "apply_preprocessing",
     "detect_ocr_dependencies",
     "detect_ocr_engine_status",
     "image_paths_to_searchable_pdf",
+    "preprocess_image_file",
     "run_ocr_canonical_package",
     "run_ocr_benchmark",
     "resolve_pdf_page_indices",

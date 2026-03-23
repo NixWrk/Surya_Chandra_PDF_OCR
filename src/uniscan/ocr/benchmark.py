@@ -27,6 +27,7 @@ from .engine import (
     detect_ocr_engine_status,
     image_paths_to_searchable_pdf,
 )
+from .preprocessing import _strip_markdown
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_PADDLE_CACHE_HOME = _REPO_ROOT / ".paddlex_cache"
@@ -345,15 +346,17 @@ def _run_mineru_module_cli(
     except Exception as exc:
         raise RuntimeError(f"mineru.cli.client failed: {exc}") from exc
 
+    # Collect only .md files; .json files contain raw structured data that is
+    # not human-readable text and inflates char counts dramatically.
     text_parts: list[str] = []
-    for suffix in ("*.md", "*.txt", "*.json"):
-        for path in sorted(output_root.rglob(suffix)):
-            try:
-                payload = path.read_text(encoding="utf-8", errors="ignore").strip()
-            except Exception:
-                continue
-            if payload:
-                text_parts.append(payload)
+    for path in sorted(output_root.rglob("*.md")):
+        try:
+            raw = path.read_text(encoding="utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        cleaned = _strip_markdown(raw)
+        if cleaned:
+            text_parts.append(cleaned)
 
     if not text_parts:
         raise RuntimeError("MinerU finished without text artifacts.")
