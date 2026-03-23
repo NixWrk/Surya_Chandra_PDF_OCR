@@ -5,7 +5,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from uniscan.ocr import run_ocr_benchmark, summarize_ocr_benchmark
+from uniscan.ocr import (
+    run_ocr_benchmark,
+    run_ocr_canonical_package,
+    summarize_ocr_benchmark,
+    summarize_ocr_canonical_package,
+)
 from uniscan.tools import run_crop_benchmark, summarize_benchmark_results
 from uniscan.ui import run_app
 
@@ -90,6 +95,41 @@ def main(argv: list[str] | None = None) -> int:
         help="Return non-zero exit code when any engine is not ok.",
     )
 
+    ocr_canonical_parser = subparsers.add_parser(
+        "benchmark-ocr-canonical",
+        help="Build equal-condition OCR package (canonical per-page text + normalized searchable PDFs).",
+    )
+    ocr_canonical_parser.add_argument("--pdf", required=True, type=Path, help="Input PDF fixture path.")
+    ocr_canonical_parser.add_argument("--output", required=True, type=Path, help="Output folder path.")
+    ocr_canonical_parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=5,
+        help="Total number of sampled pages (evenly distributed from first to last).",
+    )
+    ocr_canonical_parser.add_argument(
+        "--dpi",
+        type=int,
+        default=160,
+        help="Render DPI for sampled pages.",
+    )
+    ocr_canonical_parser.add_argument(
+        "--lang",
+        default="eng",
+        help="OCR language code.",
+    )
+    ocr_canonical_parser.add_argument(
+        "--engines",
+        nargs="+",
+        default=None,
+        help="Engine names to run. Defaults to the registered OCR engine matrix.",
+    )
+    ocr_canonical_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero exit code when any engine is not ok.",
+    )
+
     args = parser.parse_args(argv)
     if args.version:
         from uniscan import __version__
@@ -117,6 +157,19 @@ def main(argv: list[str] | None = None) -> int:
             lang=args.lang,
         )
         print(summarize_ocr_benchmark(results))
+        if args.strict and any(result.status != "ok" for result in results):
+            return 1
+        return 0
+    if args.command == "benchmark-ocr-canonical":
+        results = run_ocr_canonical_package(
+            pdf_path=args.pdf,
+            output_dir=args.output,
+            engines=tuple(args.engines) if args.engines else None,
+            sample_size=args.sample_size,
+            dpi=args.dpi,
+            lang=args.lang,
+        )
+        print(summarize_ocr_canonical_package(results))
         if args.strict and any(result.status != "ok" for result in results):
             return 1
         return 0

@@ -169,6 +169,17 @@ powershell -ExecutionPolicy Bypass -File .\scripts\benchmark_ocr_matrix.ps1 `
   -Recreate
 ```
 
+Equal-condition comparison package for all OCR engines (canonical per-page text + normalized searchable PDFs):
+
+```powershell
+.\.venv\Scripts\python.exe -m uniscan benchmark-ocr-canonical `
+  --pdf "J:\Imaging Edge Mobile\Imaging Edge Mobile_paddleocr_uvdoc.pdf" `
+  --output ".\outputs\ocr_canonical_full_run" `
+  --sample-size 10 `
+  --dpi 200 `
+  --strict
+```
+
 Build a readable comparison bundle (report + copied results + per-engine extracted text) in `.\outputs`:
 
 ```powershell
@@ -225,6 +236,7 @@ python "prepare pdf to tesseract.py"
 | `imgs_and_pdfs_ocr_fast_STABLE.py` | Stable previous OCR GUI version |
 | `prepare pdf to tesseract.py` | PDF conditioning helper before OCR |
 | `scripts/benchmark_ocr_matrix.ps1` | Creates isolated venv per OCR engine, runs benchmark, writes matrix summary |
+| `uniscan benchmark-ocr-canonical` | Runs all engines on equal sampled pages, writes canonical per-page text and normalized searchable PDFs |
 | `scripts/compare_ocr_results.py` | Copies one benchmark run to `outputs`, extracts readable text per engine, writes markdown comparison report |
 | `camscan_suhren/` | Third-party camera scanner project used as source of preprocessing logic |
 
