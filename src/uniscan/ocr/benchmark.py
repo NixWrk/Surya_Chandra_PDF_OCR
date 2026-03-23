@@ -269,6 +269,13 @@ def _run_surya_module_cli(
     os.environ.setdefault("MODEL_CACHE_DIR", str(_DEFAULT_SURYA_MODEL_CACHE_HOME))
     os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
     os.environ.setdefault("MODELSCOPE_CACHE", str(_DEFAULT_MODELSCOPE_CACHE_HOME))
+    # Surya opens images via PIL internally — lift the decompression-bomb
+    # guard so it can process high-resolution pages.
+    try:
+        from PIL import Image as _PIL_Image  # type: ignore
+        _PIL_Image.MAX_IMAGE_PIXELS = None
+    except Exception:
+        pass
     from surya.scripts.ocr_text import ocr_text_cli
 
     args = [
@@ -324,6 +331,13 @@ def _run_mineru_module_cli(
     os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
     mineru_lang = "en" if lang.strip().lower() in {"eng", "en", "english"} else "ch"
+    # MinerU converts input images to PDF internally via PIL — lift the
+    # decompression-bomb guard before importing the module.
+    try:
+        from PIL import Image as _PIL_Image  # type: ignore
+        _PIL_Image.MAX_IMAGE_PIXELS = None
+    except Exception:
+        pass
     from mineru.cli.client import main as mineru_main
 
     args = [

@@ -402,7 +402,7 @@ def _image_paths_to_searchable_pdf_pymupdf(
         for payload in page_pdf_bytes:
             stream = BytesIO(payload)
             streams.append(stream)
-            reader = pypdf.PdfReader(stream)
+            reader = pypdf.PdfReader(stream, strict=False)
             for page in reader.pages:
                 writer.add_page(page)
         with out_pdf.open("wb") as fh:
