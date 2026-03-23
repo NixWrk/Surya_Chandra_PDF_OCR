@@ -138,6 +138,12 @@ Optional OCRmyPDF plugin packages from your local `OCRmypdf_plugins` folder:
 .\.venv\Scripts\python.exe -m pip install -e .\OCRmypdf_plugins\ocrmypdf-doctr-master
 ```
 
+One-command installer for local plugin repos:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install_local_ocrmypdf_plugins.ps1
+```
+
 Known working stack for one-environment all-engine benchmark on Windows:
 
 ```powershell
