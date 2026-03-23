@@ -23,6 +23,7 @@ from .engine import (
     detect_ocr_engine_status,
     image_paths_to_searchable_pdf,
 )
+from .preprocessing import PREPROCESSING_MODES, PreprocessingMode, preprocess_image_file
 
 
 @dataclass(slots=True)
@@ -151,9 +152,33 @@ def run_ocr_canonical_package(
     sample_size: int = 5,
     page_numbers: Sequence[int] | None = None,
     dpi: int = 160,
+    render_dpi: int = 0,
+    ocr_dpi: int = 0,
+    preprocessing: PreprocessingMode = "none",
     lang: str = "eng",
 ) -> list[CanonicalOcrResult]:
-    """Run OCR engines and package outputs into a canonical comparable format."""
+    """Run OCR engines and package outputs into a canonical comparable format.
+
+    Parameters
+    ----------
+    render_dpi:
+        DPI for rendering PDF pages to images.  When ``> 0`` overrides *dpi*.
+        Default ``0`` falls back to *dpi*.
+    ocr_dpi:
+        DPI at which images are fed to the OCR engine.  When ``render_dpi !=
+        ocr_dpi`` (and both are positive) images are rescaled before OCR.
+        Default ``0`` means "same as render_dpi".
+    preprocessing:
+        Pre-processing mode applied to each page image before OCR:
+        ``"none"`` (default), ``"basic"`` (greyscale + DPI normalise),
+        ``"full"`` (basic + Otsu binarise + deskew).
+    """
+    if preprocessing not in PREPROCESSING_MODES:
+        raise ValueError(
+            f"Invalid preprocessing mode: {preprocessing!r}. "
+            f"Valid values: {PREPROCESSING_MODES}"
+        )
+
     resolved_pdf = Path(pdf_path)
     resolved_output = Path(output_dir)
     resolved_output.mkdir(parents=True, exist_ok=True)
@@ -165,6 +190,9 @@ def run_ocr_canonical_package(
     canonical_root.mkdir(parents=True, exist_ok=True)
     searchable_root.mkdir(parents=True, exist_ok=True)
 
+    effective_render_dpi = render_dpi if render_dpi > 0 else dpi
+    effective_ocr_dpi = ocr_dpi if ocr_dpi > 0 else effective_render_dpi
+
     page_count = _pdf_page_count(resolved_pdf)
     sample_pages = resolve_pdf_page_indices(
         page_count,
@@ -174,13 +202,34 @@ def run_ocr_canonical_package(
     if not sample_pages:
         raise ValueError("No PDF pages available for canonical OCR packaging.")
 
-    rendered = render_pdf_page_indices(resolved_pdf, sample_pages, dpi=dpi)
+    rendered = render_pdf_page_indices(resolved_pdf, sample_pages, dpi=effective_render_dpi)
     sampled_images: list[Path] = []
     for idx, (_name, image) in enumerate(rendered, start=1):
         out_path = source_pages_dir / f"page_{idx:04d}.png"
         if not imwrite_unicode(out_path, image):
             raise RuntimeError(f"Failed to write source page image: {out_path}")
         sampled_images.append(out_path)
+
+    # Apply preprocessing to produce separate OCR-ready images when needed
+    ocr_images: list[Path] = sampled_images
+    if preprocessing != "none":
+        preproc_dir = resolved_output / "preprocessed"
+        preproc_dir.mkdir(parents=True, exist_ok=True)
+        ocr_images = []
+        for src_path in sampled_images:
+            dst_path = preproc_dir / src_path.name
+            try:
+                preprocess_image_file(
+                    src_path,
+                    dst_path,
+                    mode=preprocessing,
+                    render_dpi=effective_render_dpi,
+                    ocr_dpi=effective_ocr_dpi,
+                )
+                ocr_images.append(dst_path)
+            except Exception:
+                # Preprocessing failure is non-fatal: fall back to source image
+                ocr_images.append(src_path)
 
     selected_engines = tuple(engines) if engines is not None else OCR_ENGINE_VALUES
     results: list[CanonicalOcrResult] = []
@@ -202,7 +251,7 @@ def run_ocr_canonical_package(
 
                 page_texts: list[str] = []
                 total_chars = 0
-                for page_idx, image_path in enumerate(sampled_images, start=1):
+                for page_idx, image_path in enumerate(ocr_images, start=1):
                     page_work = tmp_root / engine / f"page_{page_idx:04d}"
                     text = _extract_page_text(
                         engine,

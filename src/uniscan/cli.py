@@ -12,6 +12,7 @@ from uniscan.ocr import (
     summarize_ocr_benchmark,
     summarize_ocr_canonical_package,
 )
+from uniscan.ocr.preprocessing import PREPROCESSING_MODES
 from uniscan.tools import run_crop_benchmark, summarize_benchmark_results
 from uniscan.ui import run_app
 
@@ -163,6 +164,37 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Return non-zero exit code when any engine is not ok.",
     )
+    ocr_canonical_parser.add_argument(
+        "--render-dpi",
+        type=int,
+        default=0,
+        help=(
+            "DPI for rendering PDF pages to images. "
+            "When > 0 overrides --dpi for the render step. "
+            "Default 0 falls back to --dpi."
+        ),
+    )
+    ocr_canonical_parser.add_argument(
+        "--ocr-dpi",
+        type=int,
+        default=0,
+        help=(
+            "DPI at which images are fed to the OCR engine. "
+            "When render-dpi != ocr-dpi images are rescaled before OCR. "
+            "Default 0 means same as render-dpi."
+        ),
+    )
+    ocr_canonical_parser.add_argument(
+        "--preprocessing",
+        choices=list(PREPROCESSING_MODES),
+        default="none",
+        help=(
+            "Pre-processing applied to each page image before OCR: "
+            "'none' (default) — pass through unchanged; "
+            "'basic' — greyscale + DPI normalise; "
+            "'full' — basic + Otsu binarise + deskew."
+        ),
+    )
 
     args = parser.parse_args(argv)
     if args.version:
@@ -211,6 +243,9 @@ def main(argv: list[str] | None = None) -> int:
             sample_size=args.sample_size,
             page_numbers=page_numbers,
             dpi=args.dpi,
+            render_dpi=args.render_dpi,
+            ocr_dpi=args.ocr_dpi,
+            preprocessing=args.preprocessing,
             lang=args.lang,
         )
         print(summarize_ocr_canonical_package(results))
