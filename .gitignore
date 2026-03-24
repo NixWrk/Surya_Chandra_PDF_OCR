@@ -8,6 +8,9 @@ __pycache__/
 .modelscope_cache/
 .surya_cache/
 .ultralytics/
+.tmp/
+.uv_cache/
+.uv_python/
 .venv/
 .venv_latest_*/
 venv/
@@ -16,5 +19,6 @@ dist/
 *.egg-info/
 artifacts/
 outputs/
-OCRmypdf_plugins/
+OCRmypdf_plugins.rar
+OCRmypdf_plugins/*_NIX/
 camscan_suhren/

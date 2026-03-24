@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -208,7 +209,7 @@ def _render_sample_paths(
     return image_paths
 
 
-def _extract_pdf_text_chars(pdf_path: Path) -> int:
+def _extract_pdf_text(pdf_path: Path) -> str:
     try:
         import fitz  # type: ignore
     except Exception as exc:
@@ -216,12 +217,18 @@ def _extract_pdf_text_chars(pdf_path: Path) -> int:
 
     doc = fitz.open(str(pdf_path))
     try:
-        total = 0
+        parts: list[str] = []
         for page in doc:
-            total += len(page.get_text("text"))
-        return total
+            page_text = page.get_text("text")
+            if page_text:
+                parts.append(page_text)
+        return "\n".join(parts)
     finally:
         doc.close()
+
+
+def _extract_pdf_text_chars(pdf_path: Path) -> int:
+    return len(_extract_pdf_text(pdf_path))
 
 
 def _memory_rss_mb() -> float | None:
@@ -400,8 +407,7 @@ def _run_mineru_module_cli(
     except Exception as exc:
         raise RuntimeError(f"mineru.cli.client failed: {exc}") from exc
 
-    # Collect only .md files; .json files contain raw structured data that is
-    # not human-readable text and inflates char counts dramatically.
+    # Primary path: Markdown exported by MinerU.
     text_parts: list[str] = []
     for path in sorted(output_root.rglob("*.md")):
         try:
@@ -411,6 +417,23 @@ def _run_mineru_module_cli(
         cleaned = _strip_markdown(raw)
         if cleaned:
             text_parts.append(cleaned)
+
+    # Some MinerU builds emit empty markdown but keep OCR text in
+    # *_content_list.json. Use it only as a fallback when markdown is empty.
+    if not text_parts:
+        for path in sorted(output_root.rglob("*_content_list.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+            except Exception:
+                continue
+            if not isinstance(payload, list):
+                continue
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text") or "").strip()
+                if text:
+                    text_parts.append(text)
 
     if not text_parts:
         raise RuntimeError("MinerU finished without text artifacts.")
@@ -441,7 +464,14 @@ def _run_text_engine_from_cli(
             args = [str(binary_path)] + [part.format(image=str(image_path), lang=lang) for part in template[1:]]
             proc = run_cmd(args, capture_output=True, text=True)
             if int(getattr(proc, "returncode", 1)) == 0:
-                page_text = ((getattr(proc, "stdout", "") or "") + "\n" + (getattr(proc, "stderr", "") or "")).strip()
+                stdout = getattr(proc, "stdout", "") or ""
+                stderr = getattr(proc, "stderr", "") or ""
+                combined = (stdout + "\n" + stderr).strip()
+                if engine == OCR_ENGINE_SURYA and binary in {"marker_single", "marker"}:
+                    marker_text = _extract_marker_cli_text(combined)
+                    page_text = marker_text if marker_text else combined
+                else:
+                    page_text = combined
                 if page_text:
                     collected.append(page_text)
                 break
@@ -457,6 +487,34 @@ def _run_text_engine_from_cli(
 
     text = "\n".join(part for part in collected if part and not part.isspace())
     return text, len(text)
+
+
+def _extract_marker_cli_text(log_blob: str) -> str:
+    """Extract OCR text from marker CLI logs by reading saved markdown files."""
+    matches = re.findall(r"Saved markdown to\s+([^\r\n]+)", log_blob)
+    if not matches:
+        return ""
+
+    collected: list[str] = []
+    for raw_path in matches:
+        marker_path = Path(raw_path.strip().strip("'\""))
+        if marker_path.is_file() and marker_path.suffix.lower() == ".md":
+            md_files = [marker_path]
+        elif marker_path.is_dir():
+            md_files = sorted(marker_path.glob("*.md"))
+        else:
+            md_files = []
+
+        for md_file in md_files:
+            try:
+                raw_md = md_file.read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                continue
+            cleaned = _strip_markdown(raw_md)
+            if cleaned:
+                collected.append(cleaned)
+
+    return "\n".join(part for part in collected if part and not part.isspace())
 
 
 def _run_surya_direct(
@@ -818,7 +876,11 @@ def run_ocr_benchmark(
                         lang=lang,
                         engine_name=engine,
                     )
-                    text_chars = _extract_pdf_text_chars(output_pdf)
+                    extracted_text = _extract_pdf_text(output_pdf)
+                    text_chars = len(extracted_text)
+                    # Keep native searchable PDF artifact and also write plain text
+                    # sidecar to simplify downstream comparisons.
+                    output_pdf.with_suffix(".txt").write_text(extracted_text, encoding="utf-8")
                     elapsed = perf_counter() - start
                     results.append(
                         _make_result(

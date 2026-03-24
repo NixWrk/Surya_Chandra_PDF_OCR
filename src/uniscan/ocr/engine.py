@@ -102,6 +102,18 @@ def _has_command(name: str, which_fn) -> bool:
     return bool(which_fn(name) or which_fn(f"{name}.exe"))
 
 
+def _is_valid_ocrmypdf_plugin_module(name: str, import_module) -> bool:
+    """Validate that module looks like an OCRmyPDF plugin module."""
+    try:
+        module = import_module(name)
+    except Exception:
+        return False
+
+    # OCRmyPDF plugins expose hook functions from the module namespace.
+    hook_candidates = ("get_ocr_engine", "add_options", "check_options")
+    return any(hasattr(module, hook_name) for hook_name in hook_candidates)
+
+
 def _ocrmypdf_plugin_candidates_for_engine(engine: str) -> tuple[str, ...]:
     env_key = f"UNISCAN_OCRMYPDF_PLUGIN_{engine.upper()}"
     env_raw = (os.environ.get(env_key) or "").strip()
@@ -125,7 +137,7 @@ def _detect_ocrmypdf_plugin_module(
         return None
 
     for module_name in _ocrmypdf_plugin_candidates_for_engine(engine):
-        if _has_module(module_name, import_module):
+        if _is_valid_ocrmypdf_plugin_module(module_name, import_module):
             return module_name
     return None
 

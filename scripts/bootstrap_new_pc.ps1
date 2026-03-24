@@ -86,8 +86,8 @@ if ($null -ne $tessExe) {
     Write-Host "  OK: $tessVer at $($tessExe.Source)" -ForegroundColor Green
     # Check language packs
     $langs = & tesseract --list-langs 2>&1
-    $hasRus = ($langs | Where-Object { $_ -eq "rus" }).Count -gt 0
-    $hasEng = ($langs | Where-Object { $_ -eq "eng" }).Count -gt 0
+    $hasRus = @($langs | Where-Object { $_ -eq "rus" }).Count -gt 0
+    $hasEng = @($langs | Where-Object { $_ -eq "eng" }).Count -gt 0
     if ($hasRus -and $hasEng) {
         Write-Host "  Languages: eng + rus available" -ForegroundColor Green
     } else {
