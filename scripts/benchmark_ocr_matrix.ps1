@@ -99,7 +99,7 @@ $engineMatrix = @(
     @{
         name = "chandra"
         deps = @(
-            "chandra-ocr",
+            "chandra-ocr[hf]",
             "requests"
         )
     }
@@ -297,7 +297,10 @@ foreach ($engine in $engineMatrix) {
         $null = Invoke-Logged -Exe $venvPython -ArgList (@("-m", "pip", "show") + $versionPkgs) -LogPath $versionsPath -StepName "Version snapshot" -AllowFailure
         $null = Invoke-Logged -Exe $venvPython -ArgList @("-m", "pip", "freeze") -LogPath $freezePath -StepName "Freeze snapshot" -AllowFailure
 
-        $env:Path = $toolPath
+        # Prepend the venv Scripts dir so CLI tools (chandra, surya_ocr, …)
+        # installed into the venv are discoverable via shutil.which().
+        $venvScripts = Join-Path $venvPath "Scripts"
+        $env:Path = "$venvScripts;$toolPath"
         $env:PADDLE_PDX_CACHE_HOME = $repoPaddleCache
         $env:PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK = "True"
         $env:HF_HOME = $repoHfCache
