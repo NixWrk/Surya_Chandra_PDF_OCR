@@ -9,8 +9,12 @@ __pycache__/
 .surya_cache/
 .ultralytics/
 .venv/
+.venv_latest_*/
 venv/
 build/
 dist/
 *.egg-info/
 artifacts/
+outputs/
+OCRmypdf_plugins/
+camscan_suhren/

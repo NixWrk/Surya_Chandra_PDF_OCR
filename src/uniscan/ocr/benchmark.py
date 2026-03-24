@@ -530,7 +530,51 @@ def _run_mineru_direct(
         raise
 
 
-def _run_chandra_direct(
+def _run_chandra_module(
+    image_paths: Sequence[Path],
+    *,
+    lang: str,
+    work_dir: Path,
+) -> tuple[str, int]:
+    """Run Chandra OCR via direct Python module import (preferred path)."""
+    if len(image_paths) == 0:
+        raise ValueError("No images for Chandra OCR.")
+
+    os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
+    # Chandra uses PIL internally — lift the decompression-bomb guard.
+    try:
+        from PIL import Image as _PIL_Image  # type: ignore
+        _PIL_Image.MAX_IMAGE_PIXELS = None
+    except Exception:
+        pass
+
+    from chandra.model import InferenceManager
+    from chandra.model.schema import BatchInputItem
+    from chandra.input import load_image
+
+    model = InferenceManager(method="hf")
+
+    collected: list[str] = []
+    for image_path in image_paths:
+        pil_image = load_image(str(image_path))
+        batch = [BatchInputItem(image=pil_image, prompt_type="ocr_layout")]
+        results = model.generate(batch, include_images=False, include_headers_footers=False)
+
+        page_texts: list[str] = []
+        for result in results:
+            md = getattr(result, "markdown", "") or ""
+            md = md.strip()
+            if md:
+                page_texts.append(md)
+        if not page_texts:
+            raise RuntimeError(f"Chandra OCR produced no text for {image_path.name}.")
+        collected.append("\n".join(page_texts))
+
+    text = "\n".join(part for part in collected if part and not part.isspace())
+    return text, len(text)
+
+
+def _run_chandra_cli(
     image_paths: Sequence[Path],
     *,
     lang: str,
@@ -538,6 +582,7 @@ def _run_chandra_direct(
     which_fn=shutil.which,
     run_cmd=subprocess.run,
 ) -> tuple[str, int]:
+    """Run Chandra OCR via CLI binary (fallback path)."""
     if len(image_paths) == 0:
         raise ValueError("No images for Chandra OCR.")
 
@@ -585,6 +630,36 @@ def _run_chandra_direct(
 
     text = "\n".join(part for part in collected if part and not part.isspace())
     return text, len(text)
+
+
+def _run_chandra_direct(
+    image_paths: Sequence[Path],
+    *,
+    lang: str,
+    work_dir: Path,
+    which_fn=shutil.which,
+    run_cmd=subprocess.run,
+) -> tuple[str, int]:
+    # Primary: direct Python module import (no CLI binary needed).
+    module_error: Exception | None = None
+    try:
+        return _run_chandra_module(image_paths, lang=lang, work_dir=work_dir)
+    except Exception as exc:
+        module_error = exc
+
+    # Fallback: CLI binary via shutil.which.
+    try:
+        return _run_chandra_cli(
+            image_paths,
+            lang=lang,
+            work_dir=work_dir,
+            which_fn=which_fn,
+            run_cmd=run_cmd,
+        )
+    except Exception as cli_exc:
+        if module_error is not None:
+            raise RuntimeError(f"{module_error} | fallback: {cli_exc}") from cli_exc
+        raise
 
 
 def _run_extraction_engine(

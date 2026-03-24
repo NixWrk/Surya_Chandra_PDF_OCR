@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$RepoRoot = "",
-    [string]$PdfPath = "J:\Imaging Edge Mobile\Imaging Edge Mobile_paddleocr_uvdoc.pdf",
+    [string]$PdfPath = "",
     [string]$OutputRoot = "",
     [int]$SampleSize = 1,
     [string]$Pages = "",
@@ -10,6 +10,7 @@ param(
     [string[]]$Engines = @(),
     [string]$BootstrapPython = "py",
     [string]$BootstrapVersion = "3.11",
+    [string]$TesseractPath = "",
     [switch]$Recreate,
     [switch]$SkipEditableInstall
 )
@@ -33,12 +34,79 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 
 New-Item -ItemType Directory -Force $OutputRoot | Out-Null
 
+# Locate a test PDF if none provided
+if ([string]::IsNullOrWhiteSpace($PdfPath)) {
+    # Try common fixture locations
+    $candidates = @(
+        (Join-Path $RepoRoot "tests\fixtures\sample.pdf"),
+        (Join-Path $RepoRoot "fixtures\sample.pdf")
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { $PdfPath = $c; break }
+    }
+    if ([string]::IsNullOrWhiteSpace($PdfPath)) {
+        throw "No -PdfPath provided and no fixture PDF found. Pass -PdfPath <path-to-pdf>."
+    }
+}
+
 if (!(Test-Path $PdfPath)) {
     throw "PDF fixture not found: $PdfPath"
 }
 
+# Build tool PATH: auto-detect Tesseract, keep system PATH
 $basePath = $env:Path
-$toolPath = "J:\PC\AI\Tesseract;J:\PC\python\Scripts;$basePath"
+$extraPaths = @()
+
+# Auto-detect Tesseract
+if (-not [string]::IsNullOrWhiteSpace($TesseractPath)) {
+    $extraPaths += $TesseractPath
+}
+else {
+    $tesseractExe = Get-Command tesseract -ErrorAction SilentlyContinue
+    if ($null -ne $tesseractExe) {
+        $extraPaths += (Split-Path $tesseractExe.Source)
+    }
+    else {
+        # Common Tesseract locations on Windows
+        $defaultPaths = @(
+            "C:\Program Files\Tesseract-OCR",
+            "C:\Program Files (x86)\Tesseract-OCR",
+            "J:\PC\AI\Tesseract"
+        )
+        foreach ($dp in $defaultPaths) {
+            if (Test-Path (Join-Path $dp "tesseract.exe")) {
+                $extraPaths += $dp
+                break
+            }
+        }
+    }
+}
+$toolPath = (($extraPaths + @($basePath)) -join ";")
+
+# ---------------------------------------------------------------------------
+# GPU detection: query nvidia-smi for compute capability
+# ---------------------------------------------------------------------------
+$gpuComputeCap = 0.0
+$gpuName = "none"
+try {
+    $nvOut = & nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>$null
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($nvOut)) {
+        $parts = $nvOut.Split(",")
+        $gpuName = $parts[0].Trim()
+        $gpuComputeCap = [double]($parts[1].Trim())
+    }
+}
+catch { }
+
+$hasCuda = $gpuComputeCap -gt 0
+$paddleGpuOk = $gpuComputeCap -ge 7.5   # PaddlePaddle requires > 7.5
+$torchGpuOk  = $gpuComputeCap -ge 3.5   # PyTorch cu121 supports 3.5+
+
+Write-Host ""
+Write-Host "GPU: $gpuName (compute $gpuComputeCap)"
+Write-Host "  torch GPU  : $(if ($torchGpuOk) {'YES'} else {'NO (need >= 3.5)'})"
+Write-Host "  paddle GPU : $(if ($paddleGpuOk) {'YES'} else {'NO (need >= 7.5)'})"
+Write-Host ""
 
 $repoPaddleCache = Join-Path $RepoRoot ".paddlex_cache"
 $repoHfCache = Join-Path $RepoRoot ".hf_cache"
@@ -65,9 +133,11 @@ $engineMatrix = @(
         deps = @(
             "paddleocr==3.4.0",
             "paddlex==3.4.2",
-            "paddlepaddle==3.1.1",
             "requests"
         )
+        # PaddlePaddle GPU requires compute capability > 7.5 (GTX 1070 = 6.1, won't work).
+        # Install GPU via paddlepaddle.org.cn index; falls back to CPU if GPU fails.
+        gpu_paddle = $true
     },
     @{
         name = "surya"
@@ -78,6 +148,8 @@ $engineMatrix = @(
             "tokenizers==0.22.1",
             "huggingface-hub==0.34.4"
         )
+        # torch GPU installed separately via --index-url
+        gpu_torch = $true
     },
     @{
         name = "mineru"
@@ -95,6 +167,8 @@ $engineMatrix = @(
             "tokenizers==0.22.1",
             "huggingface-hub==0.34.4"
         )
+        # torch GPU installed separately via --index-url
+        gpu_torch = $true
     },
     @{
         name = "chandra"
@@ -102,6 +176,8 @@ $engineMatrix = @(
             "chandra-ocr[hf]",
             "requests"
         )
+        # torch GPU installed separately via --index-url
+        gpu_torch = $true
     }
 )
 
@@ -242,6 +318,51 @@ foreach ($engine in $engineMatrix) {
 
         if (-not $SkipEditableInstall) {
             $null = Invoke-Logged -Exe $venvPython -ArgList @("-m", "pip", "install", "--upgrade", "-e", $RepoRoot) -LogPath $logPath -StepName "Install project editable"
+        }
+
+        # Install PyTorch with CUDA support for GPU-enabled engines (surya, mineru, chandra)
+        if ($engine.gpu_torch -eq $true) {
+            if ($torchGpuOk) {
+                $null = Invoke-Logged -Exe $venvPython -ArgList @(
+                    "-m", "pip", "install", "--upgrade",
+                    "torch", "torchvision", "torchaudio",
+                    "--index-url", "https://download.pytorch.org/whl/cu121"
+                ) -LogPath $logPath -StepName "Install PyTorch+CUDA (cu121)"
+            }
+            else {
+                "GPU compute $gpuComputeCap < 3.5; installing PyTorch CPU." | Tee-Object -FilePath $logPath -Append | Out-Host
+                $null = Invoke-Logged -Exe $venvPython -ArgList @(
+                    "-m", "pip", "install", "--upgrade",
+                    "torch", "torchvision", "torchaudio"
+                ) -LogPath $logPath -StepName "Install PyTorch CPU (fallback)"
+            }
+        }
+
+        # Install PaddlePaddle: GPU from official CN index if supported, else CPU
+        if ($engine.gpu_paddle -eq $true) {
+            $paddleInstalled = $false
+            if ($paddleGpuOk) {
+                try {
+                    $null = Invoke-Logged -Exe $venvPython -ArgList @(
+                        "-m", "pip", "install",
+                        "paddlepaddle-gpu==3.2.2",
+                        "-i", "https://www.paddlepaddle.org.cn/packages/stable/cu118/"
+                    ) -LogPath $logPath -StepName "Install PaddlePaddle-GPU (cu118)"
+                    $paddleInstalled = $true
+                }
+                catch {
+                    "PaddlePaddle-GPU install failed, falling back to CPU." | Tee-Object -FilePath $logPath -Append | Out-Host
+                }
+            }
+            else {
+                "GPU compute $gpuComputeCap < 7.5; skipping PaddlePaddle-GPU." | Tee-Object -FilePath $logPath -Append | Out-Host
+            }
+            if (-not $paddleInstalled) {
+                $null = Invoke-Logged -Exe $venvPython -ArgList @(
+                    "-m", "pip", "install", "--upgrade",
+                    "paddlepaddle==3.1.1"
+                ) -LogPath $logPath -StepName "Install PaddlePaddle-CPU (fallback)"
+            }
         }
 
         $null = Invoke-Logged -Exe $venvPython -ArgList (@("-m", "pip", "install", "--upgrade") + $engineDeps) -LogPath $logPath -StepName "Install engine deps"
