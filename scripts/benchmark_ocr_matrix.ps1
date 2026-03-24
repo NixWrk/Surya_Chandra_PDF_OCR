@@ -6,6 +6,7 @@ param(
     [int]$SampleSize = 1,
     [string]$Pages = "",
     [int]$Dpi = 160,
+    [string]$Lang = "",
     [string[]]$Engines = @(),
     [string]$BootstrapPython = "py",
     [string]$BootstrapVersion = "3.11",
@@ -324,6 +325,9 @@ foreach ($engine in $engineMatrix) {
         )
         if (-not [string]::IsNullOrWhiteSpace($Pages)) {
             $benchArgs += @("--pages", $Pages)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Lang)) {
+            $benchArgs += @("--lang", $Lang)
         }
         $benchExit = Invoke-Logged -Exe $venvPython -ArgList $benchArgs -LogPath $logPath -StepName "Run benchmark" -AllowFailure
         $entry.benchmark_exit_code = $benchExit

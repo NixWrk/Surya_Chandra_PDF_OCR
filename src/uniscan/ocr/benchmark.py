@@ -157,12 +157,38 @@ def _collect_text_strings(value: Any) -> list[str]:
     return texts
 
 
+_PADDLEOCR_LANG_MAP: dict[str, str] = {
+    "eng": "en",
+    "en": "en",
+    "english": "en",
+    "rus": "ru",
+    "ru": "ru",
+    "russian": "ru",
+    "deu": "german",
+    "fra": "fr",
+    "spa": "es",
+    "ita": "it",
+    "por": "pt",
+    "chi_sim": "ch",
+    "chi_tra": "chinese_cht",
+    "jpn": "japan",
+    "kor": "korean",
+    "ara": "ar",
+}
+
+
 def _paddleocr_lang(lang: str) -> str:
-    """Map OCR language codes to PaddleOCR language identifiers."""
-    normalized = lang.strip().lower()
-    if normalized in {"eng", "en", "english"}:
-        return "en"
-    return normalized
+    """Map Tesseract-style language codes to PaddleOCR identifiers.
+
+    Handles multi-language specs like ``rus+eng`` by returning the first
+    mapped language (PaddleOCR does not support multi-lang in a single call).
+    """
+    for part in lang.split("+"):
+        normalized = part.strip().lower()
+        if normalized in _PADDLEOCR_LANG_MAP:
+            return _PADDLEOCR_LANG_MAP[normalized]
+    # Fallback: return the first component as-is.
+    return lang.split("+")[0].strip().lower()
 
 
 def _render_sample_paths(
@@ -330,7 +356,21 @@ def _run_mineru_module_cli(
     os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
     os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
-    mineru_lang = "en" if lang.strip().lower() in {"eng", "en", "english"} else "ch"
+    # MinerU only supports "en" and "ch"; map common Tesseract codes.
+    _first_lang = lang.split("+")[0].strip().lower()
+    if _first_lang in {"eng", "en", "english"}:
+        mineru_lang = "en"
+    elif _first_lang in {"chi_sim", "chi_tra", "ch", "chinese"}:
+        mineru_lang = "ch"
+    else:
+        # Unsupported language — fall back to "en" which at least handles
+        # Latin subset; MinerU has no Cyrillic/Russian model.
+        import warnings
+        warnings.warn(
+            f"MinerU does not support language '{lang}'; falling back to 'en'.",
+            stacklevel=2,
+        )
+        mineru_lang = "en"
     # MinerU converts input images to PDF internally via PIL — lift the
     # decompression-bomb guard before importing the module.
     try:
