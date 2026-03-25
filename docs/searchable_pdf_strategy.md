@@ -56,7 +56,9 @@ In code: `src/uniscan/ocr/engine.py` (`_image_paths_to_searchable_pdf_ocrmypdf_p
    - Plugin module candidates in UniScan:
      - `ocrmypdf_mineru`, `ocrmypdf_magic_pdf`
 4. `chandra`
-   - Ready plugin package: not confirmed.
+   - Ready plugin package: yes.
+   - Stable plugin package in this repo:
+     - `OCRmypdf_plugins/ocrmypdf-chandra-main` (module: `ocrmypdf_chandra`)
    - Plugin module candidate in UniScan:
      - `ocrmypdf_chandra`
 
@@ -83,13 +85,15 @@ Based on local plugin repositories currently present in this workspace:
 1. Confirmed: PaddleOCR via OCRmyPDF plugin.
 2. Confirmed: Surya via OCRmyPDF plugin (`ocrmypdf-surya-main`).
 3. Confirmed local bridge script: Surya + OCRmyPDF internals (`Ocrmypdf+surya`).
-4. Not confirmed as ready package in local set: MinerU plugin, Chandra plugin.
+4. Confirmed: Chandra via OCRmyPDF plugin (`ocrmypdf-chandra-main`).
+5. Not confirmed as ready package in local set: MinerU plugin.
 
 This means:
 
 1. You can already run searchable PDF via `paddleocr` if `ocrmypdf_paddleocr` is installed.
 2. For `surya`, UniScan can use `ocrmypdf_surya` after local plugin installation.
-3. For `mineru`, `chandra`, UniScan has plugin hooks and module detection, but actual plugin package must be installed/provided.
+3. For `chandra`, UniScan can use `ocrmypdf_chandra` after local plugin installation.
+4. For `mineru`, UniScan has plugin hooks and module detection, but actual plugin package must be installed/provided.
 
 ## Plugin source safety rule
 
