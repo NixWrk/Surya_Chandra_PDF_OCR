@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from uniscan.cli import main
+from uniscan.export import export_pages_as_pdf
+from uniscan.ocr.artifact_searchable import (
+    _parse_artifact_filename,
+    _split_text_to_pages,
+    run_artifact_searchable_package,
+)
+
+
+def _build_sample_pdf(tmp_path: Path, name: str, page_values: list[int]) -> Path:
+    pages: list[np.ndarray] = []
+    for value in page_values:
+        pages.append(np.full((200, 300, 3), value, dtype=np.uint8))
+    pdf_path = tmp_path / f"{name}.pdf"
+    export_pages_as_pdf(pages, out_pdf=pdf_path, dpi=120)
+    return pdf_path
+
+
+def _extract_pdf_text(pdf_path: Path) -> str:
+    import fitz  # type: ignore
+
+    doc = fitz.open(str(pdf_path))
+    try:
+        return "\n".join(page.get_text("text") for page in doc)
+    finally:
+        doc.close()
+
+
+def test_parse_artifact_filename() -> None:
+    document, engine = _parse_artifact_filename(Path("ГОСТ__chandra.txt"))
+    assert document == "ГОСТ"
+    assert engine == "chandra"
+
+    with pytest.raises(ValueError):
+        _parse_artifact_filename(Path("broken_name.txt"))
+
+
+def test_split_text_to_pages_with_markers() -> None:
+    text = "\n".join(
+        [
+            "[SOURCE PAGE 1]",
+            "Page one text",
+            "[SOURCE PAGE 2]",
+            "Page two text",
+        ]
+    )
+    pages = _split_text_to_pages(text, 2)
+    assert pages == ["Page one text", "Page two text"]
+
+
+def test_run_artifact_searchable_package_builds_pdfs(tmp_path: Path) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+
+    _build_sample_pdf(pdf_root, "ГОСТ с плохим качеством скана", [30, 90])
+    (compare_dir / "ГОСТ с плохим качеством скана__chandra.txt").write_text(
+        "Alpha line for page one.\nBeta line for page two.",
+        encoding="utf-8",
+    )
+    (compare_dir / "ГОСТ с плохим качеством скана__surya.txt").write_text(
+        "Surya text content.",
+        encoding="utf-8",
+    )
+    (compare_dir / "Missing Document__olmocr.txt").write_text("text", encoding="utf-8")
+
+    results = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=output_dir,
+        engines=("chandra", "surya", "olmocr"),
+    )
+
+    assert len(results) == 3
+    ok_rows = [row for row in results if row.status == "ok"]
+    err_rows = [row for row in results if row.status == "error"]
+    assert len(ok_rows) == 2
+    assert len(err_rows) == 1
+    assert err_rows[0].engine == "olmocr"
+    assert "not found" in (err_rows[0].error or "").lower()
+
+    for row in ok_rows:
+        assert row.searchable_pdf_path is not None
+        pdf_path = Path(row.searchable_pdf_path)
+        assert pdf_path.exists()
+        extracted = _extract_pdf_text(pdf_path)
+        assert extracted.strip()
+
+    assert (output_dir / "artifact_searchable_summary.json").exists()
+    assert (output_dir / "artifact_searchable_summary.csv").exists()
+
+
+def test_cli_build_searchable_from_artifacts_success(monkeypatch, tmp_path: Path, capsys) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+    output_dir.mkdir()
+
+    def fake_run(**kwargs):
+        assert kwargs["compare_dir"] == compare_dir
+        assert kwargs["pdf_root"] == pdf_root
+        assert kwargs["output_dir"] == output_dir
+        assert kwargs["engines"] == ("chandra", "surya")
+        return [
+            SimpleNamespace(
+                document="ГОСТ",
+                engine="chandra",
+                status="ok",
+                source_pdf_path="x.pdf",
+                text_artifact_path="x.txt",
+                searchable_pdf_path="out.pdf",
+                page_count=2,
+                text_chars=123,
+                elapsed_seconds=1.0,
+                error=None,
+            )
+        ]
+
+    monkeypatch.setattr("uniscan.cli.run_artifact_searchable_package", fake_run)
+    monkeypatch.setattr("uniscan.cli.summarize_artifact_searchable_package", lambda rows: f"rows={len(rows)}")
+
+    exit_code = main(
+        [
+            "build-searchable-from-artifacts",
+            "--compare-dir",
+            str(compare_dir),
+            "--pdf-root",
+            str(pdf_root),
+            "--output",
+            str(output_dir),
+            "--engines",
+            "chandra",
+            "surya",
+        ]
+    )
+    stdout = capsys.readouterr().out
+    assert exit_code == 0
+    assert "rows=1" in stdout
+
+
+def test_cli_build_searchable_from_artifacts_strict_fails(monkeypatch, tmp_path: Path, capsys) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+    output_dir.mkdir()
+
+    def fake_run(**_kwargs):
+        return [
+            SimpleNamespace(
+                document="ГОСТ",
+                engine="chandra",
+                status="ok",
+                source_pdf_path="x.pdf",
+                text_artifact_path="x.txt",
+                searchable_pdf_path="ok.pdf",
+                page_count=2,
+                text_chars=123,
+                elapsed_seconds=1.0,
+                error=None,
+            ),
+            SimpleNamespace(
+                document="ГОСТ",
+                engine="surya",
+                status="error",
+                source_pdf_path="x.pdf",
+                text_artifact_path="y.txt",
+                searchable_pdf_path=None,
+                page_count=0,
+                text_chars=0,
+                elapsed_seconds=1.0,
+                error="broken",
+            ),
+        ]
+
+    monkeypatch.setattr("uniscan.cli.run_artifact_searchable_package", fake_run)
+    monkeypatch.setattr("uniscan.cli.summarize_artifact_searchable_package", lambda _rows: "summary")
+
+    exit_code = main(
+        [
+            "build-searchable-from-artifacts",
+            "--compare-dir",
+            str(compare_dir),
+            "--pdf-root",
+            str(pdf_root),
+            "--output",
+            str(output_dir),
+            "--strict",
+        ]
+    )
+    stdout = capsys.readouterr().out
+    assert exit_code == 1
+    assert "summary" in stdout
+

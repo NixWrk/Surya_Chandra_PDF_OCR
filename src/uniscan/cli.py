@@ -7,8 +7,10 @@ import re
 from pathlib import Path
 
 from uniscan.ocr import (
+    run_artifact_searchable_package,
     run_ocr_benchmark,
     run_ocr_canonical_package,
+    summarize_artifact_searchable_package,
     summarize_ocr_benchmark,
     summarize_ocr_canonical_package,
 )
@@ -196,6 +198,40 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    artifact_searchable_parser = subparsers.add_parser(
+        "build-searchable-from-artifacts",
+        help="Build searchable PDFs from existing OCR TXT artifacts (artifact-first mode).",
+    )
+    artifact_searchable_parser.add_argument(
+        "--compare-dir",
+        required=True,
+        type=Path,
+        help="Folder with '<document>__<engine>.txt' files.",
+    )
+    artifact_searchable_parser.add_argument(
+        "--pdf-root",
+        required=True,
+        type=Path,
+        help="Root folder with source PDFs.",
+    )
+    artifact_searchable_parser.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="Output folder for searchable PDFs and summary files.",
+    )
+    artifact_searchable_parser.add_argument(
+        "--engines",
+        nargs="+",
+        default=None,
+        help="Engine names to include (for example: chandra surya olmocr).",
+    )
+    artifact_searchable_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero exit code when any artifact conversion is not ok.",
+    )
+
     args = parser.parse_args(argv)
     if args.version:
         from uniscan import __version__
@@ -249,6 +285,17 @@ def main(argv: list[str] | None = None) -> int:
             lang=args.lang,
         )
         print(summarize_ocr_canonical_package(results))
+        if args.strict and any(result.status != "ok" for result in results):
+            return 1
+        return 0
+    if args.command == "build-searchable-from-artifacts":
+        results = run_artifact_searchable_package(
+            compare_dir=args.compare_dir,
+            pdf_root=args.pdf_root,
+            output_dir=args.output,
+            engines=tuple(args.engines) if args.engines else None,
+        )
+        print(summarize_artifact_searchable_package(results))
         if args.strict and any(result.status != "ok" for result in results):
             return 1
         return 0

@@ -5,6 +5,11 @@ from .canonical import (
     run_ocr_canonical_package,
     summarize_ocr_canonical_package,
 )
+from .artifact_searchable import (
+    ArtifactSearchableResult,
+    run_artifact_searchable_package,
+    summarize_artifact_searchable_package,
+)
 from .benchmark import (
     OcrBenchmarkResult,
     resolve_pdf_page_indices,
@@ -47,6 +52,7 @@ __all__ = [
     "OCR_ENGINE_PYTESSERACT",
     "OCR_ENGINE_SURYA",
     "OCR_ENGINE_VALUES",
+    "ArtifactSearchableResult",
     "CanonicalOcrResult",
     "OcrDependencyStatus",
     "OcrEngineStatus",
@@ -59,9 +65,11 @@ __all__ = [
     "image_paths_to_searchable_pdf",
     "preprocess_image_file",
     "run_ocr_canonical_package",
+    "run_artifact_searchable_package",
     "run_ocr_benchmark",
     "resolve_pdf_page_indices",
     "sample_pdf_page_indices",
     "summarize_ocr_canonical_package",
+    "summarize_artifact_searchable_package",
     "summarize_ocr_benchmark",
 ]
