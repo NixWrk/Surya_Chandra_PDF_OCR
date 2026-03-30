@@ -361,14 +361,65 @@ def _assign_lines_to_boxes(
     if not boxes:
         return []
 
-    if len(lines) <= len(boxes):
-        return [(boxes[idx], lines[idx]) for idx in range(len(lines))]
+    normalized_boxes = list(boxes)
+    if len(normalized_boxes) > 1:
+        heights = sorted(max(item[3] - item[1], 1.0) for item in normalized_boxes)
+        median_h = float(heights[len(heights) // 2]) if heights else 10.0
+        y_threshold = max(2.0, median_h * 0.7)
+        rows: list[dict[str, float]] = []
+        for x0, y0, x1, y1 in sorted(normalized_boxes, key=lambda item: (item[1], item[0])):
+            cy = (y0 + y1) / 2.0
+            target: dict[str, float] | None = None
+            for row in reversed(rows[-6:]):
+                if abs(cy - row["cy"]) <= y_threshold:
+                    target = row
+                    break
+            if target is None:
+                rows.append(
+                    {
+                        "x0": x0,
+                        "y0": y0,
+                        "x1": x1,
+                        "y1": y1,
+                        "cy": cy,
+                        "count": 1.0,
+                    }
+                )
+            else:
+                count = target["count"]
+                target["x0"] = min(target["x0"], x0)
+                target["y0"] = min(target["y0"], y0)
+                target["x1"] = max(target["x1"], x1)
+                target["y1"] = max(target["y1"], y1)
+                target["cy"] = (target["cy"] * count + cy) / (count + 1.0)
+                target["count"] = count + 1.0
+
+        normalized_boxes = [
+            (row["x0"], row["y0"], row["x1"], row["y1"])
+            for row in sorted(rows, key=lambda row: (row["y0"], row["x0"]))
+        ]
+
+    if len(lines) <= len(normalized_boxes):
+        if len(lines) == 1:
+            x0 = min(item[0] for item in normalized_boxes)
+            y0 = min(item[1] for item in normalized_boxes)
+            x1 = max(item[2] for item in normalized_boxes)
+            y1 = max(item[3] for item in normalized_boxes)
+            return [((x0, y0, x1, y1), lines[0])]
+
+        assignments: list[tuple[tuple[float, float, float, float], str]] = []
+        span = max(len(normalized_boxes) - 1, 1)
+        for idx, line in enumerate(lines):
+            rel = idx / max(len(lines) - 1, 1)
+            box_idx = int(round(rel * span))
+            assignments.append((normalized_boxes[box_idx], line))
+        return assignments
 
     assignments: list[tuple[tuple[float, float, float, float], str]] = []
     cursor = 0
-    for box_idx, box in enumerate(boxes):
+    for box_idx, box in enumerate(normalized_boxes):
         remaining_lines = len(lines) - cursor
-        remaining_boxes = len(boxes) - box_idx
+        remaining_boxes = len(normalized_boxes) - box_idx
         take = max(1, int(math.ceil(remaining_lines / remaining_boxes)))
         chunk = lines[cursor : cursor + take]
         cursor += take

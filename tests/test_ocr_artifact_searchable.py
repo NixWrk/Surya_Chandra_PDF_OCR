@@ -67,6 +67,37 @@ def test_assign_lines_to_boxes_balances_lines() -> None:
     assert "L5" in placements[1][1]
 
 
+def test_assign_lines_to_boxes_merges_row_segments() -> None:
+    lines = ["L1", "L2"]
+    boxes = [
+        (0.0, 0.0, 20.0, 10.0),
+        (24.0, 1.0, 42.0, 11.0),
+        (0.0, 20.0, 25.0, 30.0),
+        (30.0, 21.0, 45.0, 31.0),
+    ]
+    placements = _assign_lines_to_boxes(lines, boxes)
+    assert len(placements) == 2
+    assert placements[0][0][2] >= 40.0
+    assert placements[1][0][2] >= 40.0
+
+
+def test_assign_lines_to_boxes_spreads_assignments_when_many_boxes() -> None:
+    lines = ["L1", "L2", "L3"]
+    boxes = [
+        (0.0, 0.0, 30.0, 10.0),
+        (0.0, 15.0, 30.0, 25.0),
+        (0.0, 30.0, 30.0, 40.0),
+        (0.0, 45.0, 30.0, 55.0),
+        (0.0, 60.0, 30.0, 70.0),
+        (0.0, 75.0, 30.0, 85.0),
+    ]
+    placements = _assign_lines_to_boxes(lines, boxes)
+    assert len(placements) == 3
+    y_positions = [item[0][1] for item in placements]
+    assert y_positions[0] <= 1.0
+    assert y_positions[-1] >= 70.0
+
+
 def test_build_searchable_pdf_keeps_text_when_boxes_are_tiny(monkeypatch, tmp_path: Path) -> None:
     src_pdf = _build_sample_pdf(tmp_path, "tiny_box_fixture", [40])
     out_pdf = tmp_path / "tiny_box_out.pdf"
