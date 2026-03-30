@@ -12,6 +12,28 @@ integration for:
 1. Separate virtual environment per engine is mandatory.
 2. `olmocr` path must remain standalone.
 3. Deliver in small, testable commits.
+4. Artifact-first policy: reuse latest existing `.txt` outputs; rerun OCR only if required artifact is missing.
+
+## Artifact-First Inputs (No Unnecessary Re-Runs)
+
+Primary comparison/input folder:
+
+1. `artifacts/ocr_obs_gost_oldbook_20260327_165121/_compare_txt`
+
+Current reusable files:
+
+1. `ГОСТ с плохим качеством скана__chandra.txt`
+2. `ГОСТ с плохим качеством скана__olmocr.txt`
+3. `ГОСТ с плохим качеством скана__surya.txt`
+4. `Старая книга с частично рукописным текстом__chandra.txt`
+5. `Старая книга с частично рукописным текстом__olmocr.txt`
+6. `Старая книга с частично рукописным текстом__surya.txt`
+
+Operational rule:
+
+1. Before any engine run, check for existing `.txt` for `(document, engine)`.
+2. If file exists and is non-empty, use it as source input for layer-building work.
+3. Run engine only for missing/empty artifacts or when user explicitly requests a fresh rerun.
 
 ## Phase Order
 

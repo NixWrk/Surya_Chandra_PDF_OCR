@@ -41,6 +41,7 @@ Scope:
 Implementation order and commit roadmap:
 
 1. `docs/ocr_searchable_pdf_execution_plan.md`
+2. Use artifact-first mode: reuse latest existing `.txt` outputs and avoid rerunning OCR engines unless artifact is missing.
 
 ## Built-in Searchable PDF Paths (already wired in code)
 
