@@ -25,6 +25,19 @@ This file describes how each OCR engine in UniScan can produce searchable PDFs.
    - `chandra`
    - `olmocr`
 
+## Quality Ranking (2026-03-30)
+
+Fixed result for current OBS document set quality review:
+
+1. `chandra`
+2. `olmocr`
+3. `surya`
+
+Scope:
+
+1. `ГОСТ с плохим качеством скана.pdf`
+2. `Старая книга с частично рукописным текстом.pdf`
+
 ## Built-in Searchable PDF Paths (already wired in code)
 
 1. `pytesseract`
