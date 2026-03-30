@@ -405,6 +405,7 @@ def _build_overlay_page(
         chosen_size = candidate_sizes[-1]
         chosen_leading = max(chosen_size * 1.05, 0.4)
         chosen_lines = [text]
+        fitted = False
 
         for font_size in candidate_sizes:
             leading = max(font_size * 1.05, 0.4)
@@ -419,10 +420,25 @@ def _build_overlay_page(
                 chosen_size = font_size
                 chosen_leading = leading
                 chosen_lines = lines
+                fitted = True
                 break
-            chosen_size = font_size
+
+        if not fitted:
+            # Preserve all text even for very small detected boxes.
+            # We intentionally shrink invisible text size instead of dropping lines.
+            min_font = 0.1
+            lines = _wrap_text_to_width(
+                text,
+                font_name=font_name,
+                font_size=min_font,
+                max_width=width,
+            )
+            chosen_lines = lines
+            if len(lines) == 0:
+                continue
+            leading = max(height / max(len(lines), 1), 0.08)
             chosen_leading = leading
-            chosen_lines = lines[:max_lines]
+            chosen_size = max(min(leading / 1.05, min_font), 0.05)
 
         baseline_y = max(page_height - y0 - chosen_size, 0.5)
         text_obj = pdf_canvas.beginText(max(x0 + 0.5, 0.5), baseline_y)

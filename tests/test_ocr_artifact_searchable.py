@@ -10,6 +10,7 @@ from uniscan.cli import main
 from uniscan.export import export_pages_as_pdf
 from uniscan.ocr.artifact_searchable import (
     _assign_lines_to_boxes,
+    _build_searchable_pdf_from_text,
     _parse_artifact_filename,
     _split_text_to_pages,
     run_artifact_searchable_package,
@@ -64,6 +65,26 @@ def test_assign_lines_to_boxes_balances_lines() -> None:
     assert len(placements) == 2
     assert "L1" in placements[0][1]
     assert "L5" in placements[1][1]
+
+
+def test_build_searchable_pdf_keeps_text_when_boxes_are_tiny(monkeypatch, tmp_path: Path) -> None:
+    src_pdf = _build_sample_pdf(tmp_path, "tiny_box_fixture", [40])
+    out_pdf = tmp_path / "tiny_box_out.pdf"
+    text = "\n".join(f"Line {idx:03d}" for idx in range(120))
+
+    monkeypatch.setattr(
+        "uniscan.ocr.artifact_searchable._estimate_page_line_bboxes",
+        lambda **_kwargs: [(0.0, 0.0, 40.0, 12.0)],
+    )
+
+    _build_searchable_pdf_from_text(
+        source_pdf=src_pdf,
+        text=text,
+        out_pdf=out_pdf,
+    )
+    extracted = _extract_pdf_text(out_pdf)
+    assert "Line 000" in extracted
+    assert "Line 119" in extracted
 
 
 def test_run_artifact_searchable_package_builds_pdfs(tmp_path: Path) -> None:
