@@ -820,10 +820,15 @@ def _run_chandra_direct(
 def _collect_olmocr_workspace_text(workspace: Path) -> tuple[str, int]:
     markdown_candidates: list[Path] = []
     markdown_dir = workspace / "markdown"
+    patterns = ("*.md", "*.markdown", "*.mmd", "*.txt")
     if markdown_dir.exists():
-        markdown_candidates.extend(sorted(markdown_dir.rglob("*.md")))
+        for pattern in patterns:
+            markdown_candidates.extend(sorted(markdown_dir.rglob(pattern)))
     if not markdown_candidates:
-        markdown_candidates.extend(sorted(workspace.rglob("*.md")))
+        for pattern in patterns:
+            markdown_candidates.extend(sorted(workspace.rglob(pattern)))
+    # Preserve first-seen order and drop duplicates when multiple glob patterns match.
+    markdown_candidates = list(dict.fromkeys(markdown_candidates))
 
     text_parts: list[str] = []
     for md_path in markdown_candidates:
@@ -977,6 +982,8 @@ def _run_olmocr_docker(
         command.extend(["--gpu_memory_utilization", gpu_mem_util])
 
     proc = run_cmd(command, capture_output=True, text=True)
+    stderr = (getattr(proc, "stderr", "") or "").strip()
+    stdout = (getattr(proc, "stdout", "") or "").strip()
     if int(getattr(proc, "returncode", 1)) != 0:
         stderr = (getattr(proc, "stderr", "") or "").strip()
         stdout = (getattr(proc, "stdout", "") or "").strip()
@@ -986,7 +993,14 @@ def _run_olmocr_docker(
     if not workspace_dir.exists():
         raise RuntimeError("docker olmOCR finished but did not create workspace.")
 
-    return _collect_olmocr_workspace_text(workspace_dir)
+    try:
+        return _collect_olmocr_workspace_text(workspace_dir)
+    except Exception as exc:
+        details = stderr or stdout
+        if details:
+            details = details[-2000:]
+            raise RuntimeError(f"{exc} | docker output tail: {details}") from exc
+        raise
 
 
 def _run_olmocr_direct(
