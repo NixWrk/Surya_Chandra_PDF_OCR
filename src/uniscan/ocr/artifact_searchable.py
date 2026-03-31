@@ -37,7 +37,7 @@ class CompareTxtBuildResult:
     error: str | None = None
 
 
-_PAGE_MARKER_RE = re.compile(r"^\s*\[SOURCE PAGE\s+(\d+)\]\s*$", re.IGNORECASE)
+_PAGE_MARKER_RE = re.compile(r"^\s*\[SOURCE PAGE\s+(\d+)\]\s*$", re.IGNORECASE | re.MULTILINE)
 
 
 def _normalize_key(value: str) -> str:

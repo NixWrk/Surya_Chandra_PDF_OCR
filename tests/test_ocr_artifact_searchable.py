@@ -13,6 +13,7 @@ from uniscan.ocr.artifact_searchable import (
     _assign_lines_to_boxes,
     _build_searchable_pdf_from_text,
     _estimate_page_split_weights,
+    _has_explicit_page_markers,
     _parse_artifact_filename,
     _split_lines_to_pages_by_weights,
     _split_text_to_pages,
@@ -249,6 +250,11 @@ def test_build_compare_txt_from_benchmark(tmp_path: Path) -> None:
     assert len(err_rows) == 1
     assert (output_dir / "fixture_doc__chandra.txt").exists()
     assert (output_dir / "sources_map.txt").exists()
+
+
+def test_has_explicit_page_markers_detects_marker_in_multiline_text() -> None:
+    text = "preface line\n[SOURCE PAGE 0001]\nbody line"
+    assert _has_explicit_page_markers(text) is True
 
 
 def test_build_compare_txt_from_reports_without_summary(tmp_path: Path) -> None:
