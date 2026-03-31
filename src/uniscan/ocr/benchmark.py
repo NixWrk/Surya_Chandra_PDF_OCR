@@ -831,6 +831,28 @@ def _collect_olmocr_workspace_text(workspace: Path) -> tuple[str, int]:
     markdown_candidates = list(dict.fromkeys(markdown_candidates))
 
     text_parts: list[str] = []
+
+    def _append_payload_text(payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        for key in (
+            "text",
+            "content",
+            "document_text",
+            "document_markdown",
+            "natural_text",
+            "markdown",
+        ):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                text_parts.append(_strip_markdown(value.strip()))
+        for key in ("page_texts", "pages", "page_markdown", "page_text"):
+            value = payload.get(key)
+            for extracted in _collect_text_strings(value):
+                cleaned = _strip_markdown(extracted.strip())
+                if cleaned:
+                    text_parts.append(cleaned)
+
     for md_path in markdown_candidates:
         try:
             raw = md_path.read_text(encoding="utf-8", errors="ignore").strip()
@@ -840,38 +862,54 @@ def _collect_olmocr_workspace_text(workspace: Path) -> tuple[str, int]:
         if cleaned:
             text_parts.append(cleaned)
 
-    if not text_parts:
-        # Fallback for formats that keep text only in Dolma-style JSONL.
-        for jsonl_path in sorted(workspace.rglob("*.jsonl")):
+    # Fallback for formats that keep text in JSON/JSONL payloads.
+    for json_path in sorted(workspace.rglob("*.json")):
+        try:
+            payload = json.loads(json_path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            _append_payload_text(payload)
+        elif isinstance(payload, list):
+            for item in payload:
+                _append_payload_text(item)
+
+    for jsonl_path in sorted(workspace.rglob("*.jsonl")):
+        try:
+            lines = jsonl_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                lines = jsonl_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                payload = json.loads(line)
             except Exception:
                 continue
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except Exception:
-                    continue
-                for key in (
-                    "text",
-                    "content",
-                    "document_text",
-                    "document_markdown",
-                    "natural_text",
-                    "markdown",
-                ):
-                    value = payload.get(key)
-                    if isinstance(value, str) and value.strip():
-                        text_parts.append(_strip_markdown(value.strip()))
-                for key in ("page_texts", "pages", "page_markdown", "page_text"):
-                    value = payload.get(key)
-                    for extracted in _collect_text_strings(value):
-                        cleaned = _strip_markdown(extracted.strip())
-                        if cleaned:
-                            text_parts.append(cleaned)
+            _append_payload_text(payload)
+
+    for compressed_path in sorted(workspace.rglob("*.jsonl.zst")):
+        try:
+            import zstandard as zstd  # type: ignore
+        except Exception:
+            break
+        try:
+            with compressed_path.open("rb") as fh:
+                dctx = zstd.ZstdDecompressor()
+                with dctx.stream_reader(fh) as reader:
+                    raw = reader.read().decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            _append_payload_text(payload)
 
     if not text_parts:
         raise RuntimeError("olmOCR finished without markdown/text artifacts.")
@@ -999,9 +1037,25 @@ def _run_olmocr_docker(
         return _collect_olmocr_workspace_text(workspace_dir)
     except Exception as exc:
         details = stderr or stdout
+        file_hints: list[str] = []
+        try:
+            for path in sorted(workspace_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                file_hints.append(str(path.relative_to(workspace_dir)))
+                if len(file_hints) >= 25:
+                    break
+        except Exception:
+            pass
         if details:
             details = details[-2000:]
+            if file_hints:
+                raise RuntimeError(
+                    f"{exc} | docker output tail: {details} | workspace files: {', '.join(file_hints)}"
+                ) from exc
             raise RuntimeError(f"{exc} | docker output tail: {details}") from exc
+        if file_hints:
+            raise RuntimeError(f"{exc} | workspace files: {', '.join(file_hints)}") from exc
         raise
 
 
