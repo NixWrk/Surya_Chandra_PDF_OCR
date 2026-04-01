@@ -32,6 +32,19 @@ def _build_sample_pdf(tmp_path: Path, name: str, page_values: list[int]) -> Path
     return pdf_path
 
 
+def _rotate_pdf_90(source_pdf: Path, out_pdf: Path) -> Path:
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(str(source_pdf))
+    writer = PdfWriter()
+    for page in reader.pages:
+        page.rotate(90)
+        writer.add_page(page)
+    with out_pdf.open("wb") as fh:
+        writer.write(fh)
+    return out_pdf
+
+
 def _extract_pdf_text(pdf_path: Path) -> str:
     import fitz  # type: ignore
 
@@ -148,6 +161,28 @@ def test_placements_from_surya_geometry_scales_and_cleans_text() -> None:
     assert bbox == pytest.approx((50.0, 100.0, 150.0, 130.0))
 
 
+def test_placements_from_surya_geometry_auto_spread_orders_left_then_right() -> None:
+    payload = {
+        "image_width": 2000.0,
+        "image_height": 1000.0,
+        "lines": [
+            {"text": "L-top", "bbox": [80.0, 80.0, 900.0, 120.0]},
+            {"text": "R-top", "bbox": [1100.0, 85.0, 1900.0, 125.0]},
+            {"text": "L-bottom", "bbox": [80.0, 820.0, 900.0, 860.0]},
+            {"text": "R-bottom", "bbox": [1100.0, 825.0, 1900.0, 865.0]},
+            {"text": "L-mid", "bbox": [80.0, 450.0, 900.0, 490.0]},
+            {"text": "R-mid", "bbox": [1100.0, 455.0, 1900.0, 495.0]},
+        ],
+    }
+    placements = _placements_from_surya_geometry(
+        page_data=payload,
+        page_width=1000.0,
+        page_height=500.0,
+    )
+    ordered_texts = [text for _, text in placements]
+    assert ordered_texts == ["L-top", "L-mid", "L-bottom", "R-top", "R-mid", "R-bottom"]
+
+
 def test_build_searchable_pdf_keeps_text_when_boxes_are_tiny(monkeypatch, tmp_path: Path) -> None:
     src_pdf = _build_sample_pdf(tmp_path, "tiny_box_fixture", [40])
     out_pdf = tmp_path / "tiny_box_out.pdf"
@@ -166,6 +201,32 @@ def test_build_searchable_pdf_keeps_text_when_boxes_are_tiny(monkeypatch, tmp_pa
     extracted = _extract_pdf_text(out_pdf)
     assert "Line 000" in extracted
     assert "Line 119" in extracted
+
+
+def test_build_searchable_pdf_normalizes_rotated_pages(tmp_path: Path) -> None:
+    base_pdf = _build_sample_pdf(tmp_path, "rotated_fixture_base", [80])
+    rotated_pdf = _rotate_pdf_90(base_pdf, tmp_path / "rotated_fixture.pdf")
+    out_pdf = tmp_path / "rotated_out.pdf"
+
+    _build_searchable_pdf_from_text(
+        source_pdf=rotated_pdf,
+        text="[SOURCE PAGE 1]\nROTATED PAGE TEXT\n",
+        out_pdf=out_pdf,
+        surya_geometry_by_page={
+            1: {
+                "image_width": 300.0,
+                "image_height": 200.0,
+                "lines": [{"text": "ROTATED PAGE TEXT", "bbox": [30.0, 40.0, 260.0, 85.0]}],
+            }
+        },
+    )
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(out_pdf))
+    assert int(reader.pages[0].get("/Rotate", 0) or 0) == 0
+    extracted = _extract_pdf_text(out_pdf)
+    assert "ROTATED PAGE TEXT" in extracted
 
 
 def test_run_artifact_searchable_package_builds_pdfs(tmp_path: Path) -> None:

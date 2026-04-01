@@ -666,7 +666,13 @@ def _placements_from_surya_geometry(
 
     scale_x = page_width / image_width
     scale_y = page_height / image_height
-    placements: list[tuple[tuple[float, float, float, float], str]] = []
+    placement_rows: list[
+        tuple[
+            tuple[float, float, float, float],
+            str,
+            float,
+        ]
+    ] = []
     for item in raw_lines:
         if not isinstance(item, dict):
             continue
@@ -689,10 +695,58 @@ def _placements_from_surya_geometry(
         by1 = min(page_height, y1 * scale_y)
         if bx1 <= bx0 or by1 <= by0:
             continue
-        placements.append(((bx0, by0, bx1, by1), text))
+        center_x_px = (x0 + x1) * 0.5
+        placement_rows.append(((bx0, by0, bx1, by1), text, center_x_px))
 
-    placements.sort(key=lambda item: (item[0][1], item[0][0]))
-    return placements
+    if not placement_rows:
+        return []
+
+    # Automatic spread ordering:
+    # for wide pages with content on both halves, keep reading order as
+    # left page top->bottom, then right page top->bottom.
+    page_aspect = (page_width / page_height) if page_height > 0 else 0.0
+    spread_split_x = image_width * 0.5
+    if page_aspect >= 1.15:
+        left_count = sum(1 for _, _, cx in placement_rows if cx < image_width * 0.47)
+        right_count = sum(1 for _, _, cx in placement_rows if cx > image_width * 0.53)
+        min_side = max(3, int(len(placement_rows) * 0.12))
+        is_spread = left_count >= min_side and right_count >= min_side
+    else:
+        is_spread = False
+
+    if is_spread:
+        placement_rows.sort(
+            key=lambda row: (
+                1 if row[2] >= spread_split_x else 0,
+                row[0][1],
+                row[0][0],
+            )
+        )
+    else:
+        placement_rows.sort(key=lambda row: (row[0][1], row[0][0]))
+
+    return [(bbox, text) for bbox, text, _ in placement_rows]
+
+
+def _page_rotation_degrees(source_page) -> int:
+    raw_value = source_page.get("/Rotate", 0)
+    try:
+        return int(raw_value) % 360
+    except Exception:
+        return 0
+
+
+def _normalize_source_page_rotation(source_page) -> None:
+    if not hasattr(source_page, "transfer_rotation_to_content"):
+        return
+    if _page_rotation_degrees(source_page) == 0:
+        return
+    try:
+        source_page.transfer_rotation_to_content()
+    except Exception:
+        # Keep best-effort behavior: if normalization fails, continue with
+        # current page geometry instead of aborting the whole document.
+        return
 
 
 def _build_overlay_page(
@@ -782,15 +836,18 @@ def _build_searchable_pdf_from_text(
             page_text = page_texts[page_idx] if page_idx < len(page_texts) else ""
             surya_page = (surya_geometry_by_page or {}).get(page_idx + 1)
             if page_text.strip() or isinstance(surya_page, dict):
+                _normalize_source_page_rotation(source_page)
                 crop_box = source_page.cropbox
                 media_box = source_page.mediabox
                 crop_x0 = float(crop_box.left)
                 crop_y0 = float(crop_box.bottom)
                 crop_width = float(crop_box.width)
                 crop_height = float(crop_box.height)
+                media_width = float(media_box.width)
+                media_height = float(media_box.height)
                 layout_width, layout_height = page_layout_sizes[page_idx]
-                page_width = layout_width if layout_width > 0 else (crop_width if crop_width > 0 else float(media_box.width))
-                page_height = layout_height if layout_height > 0 else (crop_height if crop_height > 0 else float(media_box.height))
+                page_width = crop_width if crop_width > 0 else (layout_width if layout_width > 0 else media_width)
+                page_height = crop_height if crop_height > 0 else (layout_height if layout_height > 0 else media_height)
                 page_lines = _split_page_text_lines(page_text)
                 placements: list[tuple[tuple[float, float, float, float], str]]
                 if isinstance(surya_page, dict):
