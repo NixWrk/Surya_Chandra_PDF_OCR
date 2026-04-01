@@ -340,75 +340,80 @@ def _estimate_page_line_bboxes(
         gray = img[:, :, 0]
 
     _, binary_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    binary_inv = cv2.morphologyEx(binary_inv, cv2.MORPH_OPEN, kernel, iterations=1)
+    # Keep character strokes while removing isolated salt noise.
+    binary_inv = cv2.morphologyEx(
+        binary_inv,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
+        iterations=1,
+    )
+    # Connect nearby characters along the same baseline into denser text rows.
+    binary_inv = cv2.morphologyEx(
+        binary_inv,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1)),
+        iterations=1,
+    )
 
-    contours, _ = cv2.findContours(binary_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    components: list[tuple[float, float, float, float, float, float, float]] = []
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        area = w * h
-        if area < 20:
-            continue
-        if h < 4 or h > (pix.height * 0.25):
-            continue
-        if w < 2:
-            continue
-        x0 = float(x)
-        y0 = float(y)
-        x1 = float(x + w)
-        y1 = float(y + h)
-        cx = (x0 + x1) / 2.0
-        cy = (y0 + y1) / 2.0
-        components.append((x0, y0, x1, y1, cx, cy, float(h)))
-
-    if not components:
+    row_ink = np.count_nonzero(binary_inv, axis=1)
+    min_row_ink = max(6, int(pix.width * 0.004))
+    active_rows = row_ink >= min_row_ink
+    if not np.any(active_rows):
         return []
 
-    heights = [item[6] for item in components]
-    median_h = float(sorted(heights)[len(heights) // 2]) if heights else 10.0
-    y_threshold = max(4.0, median_h * 0.6)
-    gap_threshold = max(20.0, median_h * 2.5)
+    runs: list[tuple[int, int]] = []
+    start_idx: int | None = None
+    for idx, active in enumerate(active_rows):
+        if active and start_idx is None:
+            start_idx = idx
+        elif not active and start_idx is not None:
+            runs.append((start_idx, idx - 1))
+            start_idx = None
+    if start_idx is not None:
+        runs.append((start_idx, len(active_rows) - 1))
 
-    components.sort(key=lambda item: (item[5], item[0]))
-    lines: list[dict[str, object]] = []
-    for comp in components:
-        x0, y0, x1, y1, _cx, cy, _h = comp
-        target: dict[str, object] | None = None
-        for line in reversed(lines[-8:]):
-            line_cy = float(line["cy"])
-            if abs(cy - line_cy) <= y_threshold:
-                target = line
-                break
-        if target is None:
-            target = {"items": [], "cy": cy}
-            lines.append(target)
-        target_items = target["items"]
-        assert isinstance(target_items, list)
-        target_items.append((x0, y0, x1, y1))
-        target["cy"] = (float(target["cy"]) + cy) / 2.0
+    if not runs:
+        return []
+
+    merged_runs: list[tuple[int, int]] = []
+    for y0, y1 in runs:
+        if not merged_runs:
+            merged_runs.append((y0, y1))
+            continue
+        prev_y0, prev_y1 = merged_runs[-1]
+        # Merge tiny vertical gaps to keep one box per text line.
+        if (y0 - prev_y1) <= 2:
+            merged_runs[-1] = (prev_y0, y1)
+        else:
+            merged_runs.append((y0, y1))
 
     raw_boxes: list[tuple[float, float, float, float]] = []
-    for line in lines:
-        items = list(line["items"])
-        if not items:
+    min_box_width = max(10, int(pix.width * 0.05))
+    for y0, y1 in merged_runs:
+        h = y1 - y0 + 1
+        if h < 3 or h > int(pix.height * 0.20):
             continue
-        items.sort(key=lambda item: item[0])
-        seg_x0, seg_y0, seg_x1, seg_y1 = items[0]
-        prev_x1 = seg_x1
-        for x0, y0, x1, y1 in items[1:]:
-            if (x0 - prev_x1) > gap_threshold:
-                if (seg_x1 - seg_x0) >= 2.0 and (seg_y1 - seg_y0) >= 2.0:
-                    raw_boxes.append((seg_x0, seg_y0, seg_x1, seg_y1))
-                seg_x0, seg_y0, seg_x1, seg_y1 = x0, y0, x1, y1
-            else:
-                seg_x0 = min(seg_x0, x0)
-                seg_y0 = min(seg_y0, y0)
-                seg_x1 = max(seg_x1, x1)
-                seg_y1 = max(seg_y1, y1)
-            prev_x1 = x1
-        if (seg_x1 - seg_x0) >= 2.0 and (seg_y1 - seg_y0) >= 2.0:
-            raw_boxes.append((seg_x0, seg_y0, seg_x1, seg_y1))
+        band = binary_inv[y0 : y1 + 1, :]
+        col_ink = np.count_nonzero(band, axis=0)
+        min_col_ink = max(1, int(h * 0.12))
+        active_cols = np.where(col_ink >= min_col_ink)[0]
+        if active_cols.size == 0:
+            continue
+        x0 = int(active_cols[0])
+        x1 = int(active_cols[-1]) + 1
+        if (x1 - x0) < min_box_width:
+            continue
+        # Small padding keeps descenders/ascenders inside the target box.
+        py = max(1, int(h * 0.15))
+        px = max(1, int((x1 - x0) * 0.01))
+        raw_boxes.append(
+            (
+                float(max(0, x0 - px)),
+                float(max(0, y0 - py)),
+                float(min(pix.width, x1 + px)),
+                float(min(pix.height, y1 + py)),
+            )
+        )
 
     if not raw_boxes:
         return []
@@ -611,8 +616,11 @@ def _build_searchable_pdf_from_text(
 
     page_count = len(reader.pages)
     page_line_boxes: list[list[tuple[float, float, float, float]]] = []
+    page_layout_sizes: list[tuple[float, float]] = []
     for page_idx in range(page_count):
-        page_line_boxes.append(_estimate_page_line_bboxes(page=layout_doc[page_idx]))
+        layout_page = layout_doc[page_idx]
+        page_line_boxes.append(_estimate_page_line_bboxes(page=layout_page))
+        page_layout_sizes.append((float(layout_page.rect.width), float(layout_page.rect.height)))
 
     page_texts = _split_text_to_pages(text, page_count)
     marker_pages_detected = bool(_PAGE_MARKER_RE.search(text)) or ("\f" in text)
@@ -629,8 +637,15 @@ def _build_searchable_pdf_from_text(
         for page_idx, source_page in enumerate(reader.pages):
             page_text = page_texts[page_idx] if page_idx < len(page_texts) else ""
             if page_text.strip():
-                page_width = float(source_page.mediabox.width)
-                page_height = float(source_page.mediabox.height)
+                crop_box = source_page.cropbox
+                media_box = source_page.mediabox
+                crop_x0 = float(crop_box.left)
+                crop_y0 = float(crop_box.bottom)
+                crop_width = float(crop_box.width)
+                crop_height = float(crop_box.height)
+                layout_width, layout_height = page_layout_sizes[page_idx]
+                page_width = layout_width if layout_width > 0 else (crop_width if crop_width > 0 else float(media_box.width))
+                page_height = layout_height if layout_height > 0 else (crop_height if crop_height > 0 else float(media_box.height))
                 line_boxes = page_line_boxes[page_idx]
                 page_lines = _split_page_text_lines(page_text)
                 placements = _assign_lines_to_boxes(page_lines, line_boxes)
@@ -642,7 +657,10 @@ def _build_searchable_pdf_from_text(
                     placements=placements,
                     font_name=font_name,
                 )
-                source_page.merge_page(overlay_page)
+                if abs(crop_x0) > 1e-6 or abs(crop_y0) > 1e-6:
+                    source_page.merge_translated_page(overlay_page, crop_x0, crop_y0)
+                else:
+                    source_page.merge_page(overlay_page)
             writer.add_page(source_page)
     finally:
         layout_doc.close()
