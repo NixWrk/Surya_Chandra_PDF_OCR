@@ -558,7 +558,11 @@ def _load_surya_page_geometry(
     if isinstance(pdf_path, str) and pdf_path.strip():
         source_stem = Path(pdf_path).stem
         if _normalize_key(source_stem) != _normalize_key(document):
-            return {}
+            # Keep best-effort behavior: some benchmark runs may preserve
+            # mojibake file names in JSON paths, while compare_txt already
+            # uses normalized UTF-8 names. In that case geometry is still
+            # valid for this engine folder and should not be dropped.
+            pass
 
     pages = payload.get("pages")
     if not isinstance(pages, list):

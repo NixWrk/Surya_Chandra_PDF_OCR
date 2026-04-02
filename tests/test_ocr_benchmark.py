@@ -531,6 +531,31 @@ def test_configure_chandra_runtime_device_raises_when_gpu_required_without_cuda(
         ocr_benchmark_mod._configure_chandra_runtime_device()
 
 
+def test_chandra_chunk_lines_preserves_explicit_breaks() -> None:
+    raw = "<p>FIRST LINE<br/>SECOND LINE</p><div>THIRD LINE</div>"
+    lines = ocr_benchmark_mod._chandra_chunk_lines(raw)
+    assert lines == ["FIRST LINE", "SECOND LINE", "THIRD LINE"]
+
+
+def test_chandra_expand_chunk_to_line_boxes_splits_rows() -> None:
+    lines = [
+        "ONE VERY LONG LINE THAT SHOULD BE WRAPPED INTO MULTIPLE SEGMENTS "
+        "TO IMPROVE SEARCHABLE PDF SELECTION QUALITY",
+        "TAIL LINE",
+    ]
+    placements = ocr_benchmark_mod._chandra_expand_chunk_to_line_boxes(
+        lines=lines,
+        bbox=[100.0, 200.0, 500.0, 320.0],
+    )
+
+    assert len(placements) >= 3
+    ys = [float(item["bbox"][1]) for item in placements]
+    assert ys == sorted(ys)
+    assert all(float(item["bbox"][0]) == pytest.approx(100.0) for item in placements)
+    assert all(float(item["bbox"][2]) == pytest.approx(500.0) for item in placements)
+    assert any("TAIL LINE" in str(item["text"]) for item in placements)
+
+
 def test_surya_module_cli_uses_only_staged_inputs(tmp_path, monkeypatch) -> None:
     image_path = tmp_path / "page_0001.png"
     image_path.write_bytes(b"img")

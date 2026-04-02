@@ -342,6 +342,71 @@ def test_run_artifact_searchable_package_uses_chandra_sidecar_geometry(tmp_path:
     assert "CHANDRA GEOMETRY LINE" in extracted
 
 
+def test_run_artifact_searchable_package_uses_chandra_geometry_on_pdf_name_mismatch(tmp_path: Path) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+
+    doc_name = "fixture_doc"
+    _build_sample_pdf(pdf_root, doc_name, [50])
+    (compare_dir / f"{doc_name}__chandra.txt").write_text("", encoding="utf-8")
+
+    chandra_dir = compare_dir.parent / "chandra"
+    chandra_dir.mkdir()
+    (chandra_dir / "pages.json").write_text(
+        json.dumps(
+            {
+                # Intentionally mismatched stem (simulates mojibake path in JSON).
+                "pdf_path": str(pdf_root / "Ð¤Ð°Ð¹Ð».pdf"),
+                "engine": "chandra",
+                "pages": [
+                    {
+                        "source_page": 1,
+                        "geometry_file": "page_0001.chandra.json",
+                        "geometry_type": "chandra_text_lines",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (chandra_dir / "page_0001.chandra.json").write_text(
+        json.dumps(
+            {
+                "images": [
+                    {
+                        "image_name": "00001.png",
+                        "pages": [
+                            {
+                                "image_bbox": [0, 0, 300, 200],
+                                "text_lines": [
+                                    {"text": "GEOMETRY STILL APPLIED", "bbox": [30, 30, 260, 70]}
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=output_dir,
+        engines=("chandra",),
+    )
+
+    assert len(rows) == 1
+    assert rows[0].status == "ok"
+    assert rows[0].searchable_pdf_path is not None
+    extracted = _extract_pdf_text(Path(rows[0].searchable_pdf_path))
+    assert "GEOMETRY STILL APPLIED" in extracted
+
+
 def test_run_artifact_searchable_package_require_markers(tmp_path: Path) -> None:
     compare_dir = tmp_path / "compare"
     pdf_root = tmp_path / "pdf_root"

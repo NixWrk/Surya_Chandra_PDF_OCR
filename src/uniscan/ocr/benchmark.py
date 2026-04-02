@@ -316,6 +316,116 @@ def _artifact_path_for_engine(output_dir: Path, pdf_stem: str, engine: str) -> P
     return output_dir / f"{pdf_stem}_{engine}{suffix}"
 
 
+_CHANDRA_NON_TEXT_LABELS: set[str] = {
+    "blank-page",
+    "image",
+    "figure",
+    "diagram",
+}
+
+
+def _chandra_chunk_lines(raw_content: Any) -> list[str]:
+    if raw_content is None:
+        return []
+
+    raw = str(raw_content).replace("\u00a0", " ")
+    if not raw.strip():
+        return []
+
+    # Preserve explicit line boundaries from lightweight HTML payload.
+    raw = re.sub(r"(?i)<br\s*/?>", "\n", raw)
+    raw = re.sub(
+        r"(?i)</(p|div|li|h[1-6]|tr|caption|table|ul|ol|pre|code|blockquote)>",
+        "\n",
+        raw,
+    )
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = re.sub(r"[ \t\r\f\v]+", " ", raw)
+    raw = re.sub(r"\n{2,}", "\n", raw)
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    return lines
+
+
+def _wrap_text_to_target_chars(text: str, *, target_chars: int) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= target_chars:
+        return [text]
+
+    words = text.split()
+    if len(words) <= 1:
+        return [text]
+
+    parts: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for word in words:
+        extra = len(word) + (1 if current else 0)
+        if current and (current_len + extra) > target_chars:
+            parts.append(" ".join(current).strip())
+            current = [word]
+            current_len = len(word)
+        else:
+            current.append(word)
+            current_len += extra
+    if current:
+        parts.append(" ".join(current).strip())
+    return [part for part in parts if part]
+
+
+def _chandra_expand_chunk_to_line_boxes(
+    *,
+    lines: Sequence[str],
+    bbox: Sequence[float],
+) -> list[dict[str, object]]:
+    if not lines:
+        return []
+    if len(bbox) != 4:
+        return []
+    try:
+        x0 = float(bbox[0])
+        y0 = float(bbox[1])
+        x1 = float(bbox[2])
+        y1 = float(bbox[3])
+    except Exception:
+        return []
+    if x1 <= x0 or y1 <= y0:
+        return []
+
+    width = x1 - x0
+    expanded_lines: list[str] = []
+    # Approximate max chars per line from block width to avoid one huge
+    # paragraph being placed into a single text row.
+    target_chars = max(18, min(140, int(width / 7.2)))
+    for raw_line in lines:
+        expanded_lines.extend(_wrap_text_to_target_chars(raw_line, target_chars=target_chars))
+    if not expanded_lines:
+        return []
+
+    line_count = len(expanded_lines)
+    line_height = max((y1 - y0) / float(line_count), 1.0)
+    # Small padding keeps glyph ascenders/descenders selectable.
+    pad = min(1.2, line_height * 0.12)
+
+    placements: list[dict[str, object]] = []
+    for idx, line in enumerate(expanded_lines):
+        ly0 = y0 + (line_height * idx)
+        ly1 = y0 + (line_height * (idx + 1))
+        by0 = max(y0, ly0 - pad)
+        by1 = min(y1, ly1 + pad)
+        if by1 <= by0:
+            by0 = ly0
+            by1 = ly1
+        placements.append(
+            {
+                "text": line,
+                "bbox": [x0, by0, x1, by1],
+            }
+        )
+    return placements
+
+
 def _markerized_pages_text(
     *,
     page_texts: Sequence[str],
@@ -927,13 +1037,6 @@ def _run_chandra_module(
     from chandra.model.schema import BatchInputItem
     from chandra.input import load_image
 
-    def _chunk_text(raw_content: Any) -> str:
-        if raw_content is None:
-            return ""
-        text = re.sub(r"<[^>]+>", " ", str(raw_content))
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
-
     def _safe_bbox(raw_bbox: Any, width: int, height: int) -> list[float] | None:
         if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
             return None
@@ -978,13 +1081,23 @@ def _run_chandra_module(
                 for chunk in chunks:
                     if not isinstance(chunk, dict):
                         continue
-                    line_text = _chunk_text(chunk.get("content"))
-                    if not line_text:
+                    label = str(chunk.get("label") or "").strip().lower()
+                    if label in _CHANDRA_NON_TEXT_LABELS:
                         continue
-                    page_texts.append(line_text)
+
+                    chunk_lines = _chandra_chunk_lines(chunk.get("content"))
+                    if not chunk_lines:
+                        continue
+
+                    page_texts.extend(chunk_lines)
                     bbox = _safe_bbox(chunk.get("bbox"), width, height)
                     if bbox is not None:
-                        page_lines.append({"text": line_text, "bbox": bbox})
+                        page_lines.extend(
+                            _chandra_expand_chunk_to_line_boxes(
+                                lines=chunk_lines,
+                                bbox=bbox,
+                            )
+                        )
             if not page_texts:
                 md = getattr(result, "markdown", "") or ""
                 md = _strip_markdown(md.strip())
