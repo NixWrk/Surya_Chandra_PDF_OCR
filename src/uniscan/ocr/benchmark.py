@@ -426,6 +426,11 @@ def _chandra_expand_chunk_to_line_boxes(
     return placements
 
 
+def _chandra_allow_cli_fallback() -> bool:
+    # By default, prefer deterministic module path with geometry sidecar.
+    return _env_bool("UNISCAN_CHANDRA_ALLOW_CLI_FALLBACK", default=False)
+
+
 def _markerized_pages_text(
     *,
     page_texts: Sequence[str],
@@ -1024,6 +1029,7 @@ def _run_chandra_module(
     if len(image_paths) == 0:
         raise ValueError("No images for Chandra OCR.")
 
+    work_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
     selected_device = _configure_chandra_runtime_device()
     # Chandra uses PIL internally — lift the decompression-bomb guard.
@@ -1109,6 +1115,16 @@ def _run_chandra_module(
 
         if not page_texts:
             raise RuntimeError(f"Chandra OCR produced no text for {image_path.name}.")
+
+        if not page_lines and page_texts:
+            # Keep geometry mode usable even when upstream parser returns
+            # content without valid per-block bboxes.
+            page_lines.extend(
+                _chandra_expand_chunk_to_line_boxes(
+                    lines=page_texts,
+                    bbox=[0.0, 0.0, float(width), float(height)],
+                )
+            )
 
         collected.append("\n".join(page_texts))
         if page_lines:
@@ -1207,6 +1223,12 @@ def _run_chandra_direct(
         return _run_chandra_module(image_paths, lang=lang, work_dir=work_dir)
     except Exception as exc:
         module_error = exc
+
+    if not _chandra_allow_cli_fallback():
+        raise RuntimeError(
+            "Chandra module path failed. CLI fallback is disabled to avoid "
+            f"text-only degradation: {module_error}"
+        ) from module_error
 
     # Fallback: CLI binary via shutil.which.
     try:

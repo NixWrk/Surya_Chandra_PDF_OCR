@@ -556,6 +556,56 @@ def test_chandra_expand_chunk_to_line_boxes_splits_rows() -> None:
     assert any("TAIL LINE" in str(item["text"]) for item in placements)
 
 
+def test_run_chandra_direct_disables_cli_fallback_by_default(monkeypatch, tmp_path: Path) -> None:
+    image_path = tmp_path / "p1.png"
+    image_path.write_bytes(b"img")
+
+    def fail_module(*_args, **_kwargs):
+        raise RuntimeError("module failed")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("CLI fallback must stay disabled by default")
+
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_chandra_module", fail_module)
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_chandra_cli", fail_if_called)
+    monkeypatch.delenv("UNISCAN_CHANDRA_ALLOW_CLI_FALLBACK", raising=False)
+
+    with pytest.raises(RuntimeError, match="CLI fallback is disabled"):
+        ocr_benchmark_mod._run_chandra_direct(
+            [image_path],
+            lang="rus",
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: None,
+            run_cmd=lambda *_args, **_kwargs: None,
+        )
+
+
+def test_run_chandra_direct_allows_cli_fallback_when_enabled(monkeypatch, tmp_path: Path) -> None:
+    image_path = tmp_path / "p1.png"
+    image_path.write_bytes(b"img")
+
+    def fail_module(*_args, **_kwargs):
+        raise RuntimeError("module failed")
+
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_chandra_module", fail_module)
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_run_chandra_cli",
+        lambda *_args, **_kwargs: ("cli-ok", 6),
+    )
+    monkeypatch.setenv("UNISCAN_CHANDRA_ALLOW_CLI_FALLBACK", "1")
+
+    text, chars = ocr_benchmark_mod._run_chandra_direct(
+        [image_path],
+        lang="rus",
+        work_dir=tmp_path / "work",
+        which_fn=lambda _name: None,
+        run_cmd=lambda *_args, **_kwargs: None,
+    )
+    assert text == "cli-ok"
+    assert chars == 6
+
+
 def test_surya_module_cli_uses_only_staged_inputs(tmp_path, monkeypatch) -> None:
     image_path = tmp_path / "page_0001.png"
     image_path.write_bytes(b"img")
