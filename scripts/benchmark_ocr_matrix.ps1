@@ -12,7 +12,8 @@ param(
     [string]$BootstrapVersion = "3.11",
     [string]$TesseractPath = "",
     [switch]$Recreate,
-    [switch]$SkipEditableInstall
+    [switch]$SkipEditableInstall,
+    [switch]$SkipDependencyInstall
 )
 
 Set-StrictMode -Version Latest
@@ -353,114 +354,119 @@ foreach ($engine in $engineMatrix) {
             throw "Python interpreter not found in venv: $venvPython"
         }
 
-        $null = Invoke-Logged -Exe $venvPython -ArgList @("-m", "pip", "install", "--upgrade", "pip", "setuptools<82", "wheel") -LogPath $logPath -StepName "Install base tooling"
-
-        if (-not $SkipEditableInstall) {
-            $null = Invoke-Logged -Exe $venvPython -ArgList @("-m", "pip", "install", "--upgrade", "-e", $RepoRoot) -LogPath $logPath -StepName "Install project editable"
+        if ($SkipDependencyInstall) {
+            "Skipping dependency installation steps (-SkipDependencyInstall)." | Tee-Object -FilePath $logPath -Append | Out-Host
         }
+        else {
+            $null = Invoke-Logged -Exe $venvPython -ArgList @("-m", "pip", "install", "--upgrade", "pip", "setuptools<82", "wheel") -LogPath $logPath -StepName "Install base tooling"
 
-        # Install PyTorch with CUDA support for GPU-enabled engines.
-        # Surya is handled separately because current surya-ocr pins may upgrade
-        # torch and break preinstalled torchvision/torchaudio combos.
-        if ($engine["gpu_torch"] -eq $true) {
-            if ($engineName -eq "chandra") {
-                "Skipping generic torch install for chandra; will resolve CUDA build after engine deps." | Tee-Object -FilePath $logPath -Append | Out-Host
+            if (-not $SkipEditableInstall) {
+                $null = Invoke-Logged -Exe $venvPython -ArgList @("-m", "pip", "install", "--upgrade", "-e", $RepoRoot) -LogPath $logPath -StepName "Install project editable"
             }
-            elseif ($engineName -ne "surya") {
-                if ($torchGpuOk) {
-                    $null = Invoke-Logged -Exe $venvPython -ArgList @(
-                        "-m", "pip", "install", "--upgrade",
-                        "torch", "torchvision", "torchaudio",
-                        "--index-url", "https://download.pytorch.org/whl/cu121"
-                    ) -LogPath $logPath -StepName "Install PyTorch+CUDA (cu121)"
+
+            # Install PyTorch with CUDA support for GPU-enabled engines.
+            # Surya is handled separately because current surya-ocr pins may upgrade
+            # torch and break preinstalled torchvision/torchaudio combos.
+            if ($engine["gpu_torch"] -eq $true) {
+                if ($engineName -eq "chandra") {
+                    "Skipping generic torch install for chandra; will resolve CUDA build after engine deps." | Tee-Object -FilePath $logPath -Append | Out-Host
+                }
+                elseif ($engineName -ne "surya") {
+                    if ($torchGpuOk) {
+                        $null = Invoke-Logged -Exe $venvPython -ArgList @(
+                            "-m", "pip", "install", "--upgrade",
+                            "torch", "torchvision", "torchaudio",
+                            "--index-url", "https://download.pytorch.org/whl/cu121"
+                        ) -LogPath $logPath -StepName "Install PyTorch+CUDA (cu121)"
+                    }
+                    else {
+                        "GPU compute $gpuComputeCap < 3.5; installing PyTorch CPU." | Tee-Object -FilePath $logPath -Append | Out-Host
+                        $null = Invoke-Logged -Exe $venvPython -ArgList @(
+                            "-m", "pip", "install", "--upgrade",
+                            "torch", "torchvision", "torchaudio"
+                        ) -LogPath $logPath -StepName "Install PyTorch CPU (fallback)"
+                    }
                 }
                 else {
-                    "GPU compute $gpuComputeCap < 3.5; installing PyTorch CPU." | Tee-Object -FilePath $logPath -Append | Out-Host
+                    "Skipping preinstall torch stack for surya; engine deps will resolve torch first." | Tee-Object -FilePath $logPath -Append | Out-Host
+                }
+            }
+
+            # Install PaddlePaddle: GPU from official CN index if supported, else CPU
+            if ($engine["gpu_paddle"] -eq $true) {
+                $paddleInstalled = $false
+                if ($paddleGpuOk) {
+                    try {
+                        $null = Invoke-Logged -Exe $venvPython -ArgList @(
+                            "-m", "pip", "install",
+                            "paddlepaddle-gpu==3.2.2",
+                            "-i", "https://www.paddlepaddle.org.cn/packages/stable/cu118/"
+                        ) -LogPath $logPath -StepName "Install PaddlePaddle-GPU (cu118)"
+                        $paddleInstalled = $true
+                    }
+                    catch {
+                        "PaddlePaddle-GPU install failed, falling back to CPU." | Tee-Object -FilePath $logPath -Append | Out-Host
+                    }
+                }
+                else {
+                    "GPU compute $gpuComputeCap < 7.5; skipping PaddlePaddle-GPU." | Tee-Object -FilePath $logPath -Append | Out-Host
+                }
+                if (-not $paddleInstalled) {
                     $null = Invoke-Logged -Exe $venvPython -ArgList @(
                         "-m", "pip", "install", "--upgrade",
-                        "torch", "torchvision", "torchaudio"
-                    ) -LogPath $logPath -StepName "Install PyTorch CPU (fallback)"
+                        "paddlepaddle==3.1.1"
+                    ) -LogPath $logPath -StepName "Install PaddlePaddle-CPU (fallback)"
                 }
             }
-            else {
-                "Skipping preinstall torch stack for surya; engine deps will resolve torch first." | Tee-Object -FilePath $logPath -Append | Out-Host
-            }
-        }
 
-        # Install PaddlePaddle: GPU from official CN index if supported, else CPU
-        if ($engine["gpu_paddle"] -eq $true) {
-            $paddleInstalled = $false
-            if ($paddleGpuOk) {
-                try {
-                    $null = Invoke-Logged -Exe $venvPython -ArgList @(
-                        "-m", "pip", "install",
-                        "paddlepaddle-gpu==3.2.2",
-                        "-i", "https://www.paddlepaddle.org.cn/packages/stable/cu118/"
-                    ) -LogPath $logPath -StepName "Install PaddlePaddle-GPU (cu118)"
-                    $paddleInstalled = $true
-                }
-                catch {
-                    "PaddlePaddle-GPU install failed, falling back to CPU." | Tee-Object -FilePath $logPath -Append | Out-Host
-                }
-            }
-            else {
-                "GPU compute $gpuComputeCap < 7.5; skipping PaddlePaddle-GPU." | Tee-Object -FilePath $logPath -Append | Out-Host
-            }
-            if (-not $paddleInstalled) {
+            $null = Invoke-Logged -Exe $venvPython -ArgList (@("-m", "pip", "install", "--upgrade") + $engineDeps) -LogPath $logPath -StepName "Install engine deps"
+
+            if ($engineName -eq "surya") {
+                # Ensure torchvision/torchaudio ABI matches the torch version
+                # resolved by surya-ocr dependency constraints.
                 $null = Invoke-Logged -Exe $venvPython -ArgList @(
                     "-m", "pip", "install", "--upgrade",
-                    "paddlepaddle==3.1.1"
-                ) -LogPath $logPath -StepName "Install PaddlePaddle-CPU (fallback)"
+                    "torchvision", "torchaudio"
+                ) -LogPath $logPath -StepName "Align torchvision/torchaudio with torch"
             }
-        }
-
-        $null = Invoke-Logged -Exe $venvPython -ArgList (@("-m", "pip", "install", "--upgrade") + $engineDeps) -LogPath $logPath -StepName "Install engine deps"
-
-        if ($engineName -eq "surya") {
-            # Ensure torchvision/torchaudio ABI matches the torch version
-            # resolved by surya-ocr dependency constraints.
-            $null = Invoke-Logged -Exe $venvPython -ArgList @(
-                "-m", "pip", "install", "--upgrade",
-                "torchvision", "torchaudio"
-            ) -LogPath $logPath -StepName "Align torchvision/torchaudio with torch"
-        }
-        if ($engineName -eq "chandra") {
-            if (-not $torchGpuOk) {
-                throw "Chandra GPU mode requires CUDA-capable PyTorch, but GPU compute capability is too low ($gpuComputeCap)."
-            }
-
-            $chandraCudaReady = $false
-            $cudaTorchIndices = @(
-                "https://download.pytorch.org/whl/cu128",
-                "https://download.pytorch.org/whl/cu126",
-                "https://download.pytorch.org/whl/cu124",
-                "https://download.pytorch.org/whl/cu121"
-            )
-            foreach ($torchIndex in $cudaTorchIndices) {
-                try {
-                    $null = Invoke-Logged -Exe $venvPython -ArgList @(
-                        "-m", "pip", "install", "--upgrade",
-                        "torch", "torchvision",
-                        "--index-url", $torchIndex
-                    ) -LogPath $logPath -StepName "Install Chandra CUDA torch ($torchIndex)"
-                }
-                catch {
-                    ("[warn] CUDA torch install failed from {0}" -f $torchIndex) | Tee-Object -FilePath $logPath -Append | Out-Host
-                    continue
+            if ($engineName -eq "chandra") {
+                if (-not $torchGpuOk) {
+                    throw "Chandra GPU mode requires CUDA-capable PyTorch, but GPU compute capability is too low ($gpuComputeCap)."
                 }
 
-                $cudaProbeExit = Invoke-Logged -Exe $venvPython -ArgList @(
-                    "-c",
-                    "import sys, torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); sys.exit(0 if torch.cuda.is_available() else 1)"
-                ) -LogPath $logPath -StepName "Probe Chandra CUDA torch ($torchIndex)" -AllowFailure
-                if ($cudaProbeExit -eq 0) {
-                    $chandraCudaReady = $true
-                    break
-                }
-            }
+                $chandraCudaReady = $false
+                $cudaTorchIndices = @(
+                    "https://download.pytorch.org/whl/cu128",
+                    "https://download.pytorch.org/whl/cu126",
+                    "https://download.pytorch.org/whl/cu124",
+                    "https://download.pytorch.org/whl/cu121"
+                )
+                foreach ($torchIndex in $cudaTorchIndices) {
+                    try {
+                        $null = Invoke-Logged -Exe $venvPython -ArgList @(
+                            "-m", "pip", "install", "--upgrade",
+                            "torch", "torchvision",
+                            "--index-url", $torchIndex
+                        ) -LogPath $logPath -StepName "Install Chandra CUDA torch ($torchIndex)"
+                    }
+                    catch {
+                        ("[warn] CUDA torch install failed from {0}" -f $torchIndex) | Tee-Object -FilePath $logPath -Append | Out-Host
+                        continue
+                    }
 
-            if (-not $chandraCudaReady) {
-                throw "Failed to activate CUDA-enabled torch for Chandra. Aborting to avoid CPU fallback."
+                    $cudaProbeExit = Invoke-Logged -Exe $venvPython -ArgList @(
+                        "-c",
+                        "import sys, torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); sys.exit(0 if torch.cuda.is_available() else 1)"
+                    ) -LogPath $logPath -StepName "Probe Chandra CUDA torch ($torchIndex)" -AllowFailure
+                    if ($cudaProbeExit -eq 0) {
+                        $chandraCudaReady = $true
+                        break
+                    }
+                }
+
+                if (-not $chandraCudaReady) {
+                    throw "Failed to activate CUDA-enabled torch for Chandra. Aborting to avoid CPU fallback."
+                }
             }
         }
         $entry.install_exit_code = 0
