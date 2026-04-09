@@ -154,9 +154,10 @@ def test_normalize_alignment_token_folds_latin_cyrillic_ocr_noise() -> None:
 def test_align_token_indices_matches_monotonic_sequence() -> None:
     src = ["gost", "19126", "79", "medicinskie"]
     dst = ["gost", "19126", "79", "medicinskie"]
-    aligned, coverage = _align_token_indices(source_tokens=src, target_tokens=dst)
+    aligned, coverage, score = _align_token_indices(source_tokens=src, target_tokens=dst)
     assert coverage == pytest.approx(1.0)
     assert aligned == [0, 1, 2, 3]
+    assert score > 0
 
 
 def test_placements_from_chandra_text_aligned_to_geometry_uses_geometry_boxes() -> None:
@@ -185,6 +186,29 @@ def test_placements_from_chandra_text_aligned_to_geometry_uses_geometry_boxes() 
     first_bbox, first_text = placements[0]
     assert "ИНСТРУМЕНТЫ" in first_text
     assert first_bbox[0] == pytest.approx(100.0, abs=2.0)
+
+
+def test_placements_from_chandra_text_aligned_to_geometry_handles_spread_rowwise_order() -> None:
+    page_lines = ["L1 R1", "L2 R2"]
+    page_data = {
+        "image_width": 2000.0,
+        "image_height": 1000.0,
+        "lines": [
+            {"text": "L1", "bbox": [100.0, 100.0, 300.0, 140.0]},
+            {"text": "R1", "bbox": [1200.0, 100.0, 1400.0, 140.0]},
+            {"text": "L2", "bbox": [100.0, 220.0, 300.0, 260.0]},
+            {"text": "R2", "bbox": [1200.0, 220.0, 1400.0, 260.0]},
+        ],
+    }
+    placements, coverage = _placements_from_chandra_text_aligned_to_geometry(
+        page_lines=page_lines,
+        page_data=page_data,
+        page_width=1000.0,
+        page_height=500.0,
+    )
+    assert coverage > 0.95
+    texts = [text.strip() for _, text in placements if text.strip()]
+    assert texts[:4] == ["L1", "R1", "L2", "R2"]
 
 
 def test_expand_lines_to_target_count_splits_long_lines() -> None:

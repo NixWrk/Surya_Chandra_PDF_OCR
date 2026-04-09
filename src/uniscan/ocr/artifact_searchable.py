@@ -602,11 +602,11 @@ def _align_token_indices(
     *,
     source_tokens: Sequence[str],
     target_tokens: Sequence[str],
-) -> tuple[list[int | None], float]:
+) -> tuple[list[int | None], float, float]:
     n = len(source_tokens)
     m = len(target_tokens)
     if n == 0 or m == 0:
-        return ([None] * n, 0.0)
+        return ([None] * n, 0.0, float("-inf"))
 
     gap_penalty = -0.45
     dp = [[0.0] * (m + 1) for _ in range(n + 1)]
@@ -661,7 +661,7 @@ def _align_token_indices(
 
     matched = sum(1 for item in aligned if item is not None)
     coverage = float(matched) / float(max(1, n))
-    return aligned, coverage
+    return aligned, coverage, dp[n][m]
 
 
 def _interpolate_bbox(
@@ -690,15 +690,22 @@ def _placements_from_chandra_text_aligned_to_geometry(
     if not page_lines:
         return ([], 0.0)
 
-    geometry_rows = _placements_from_surya_geometry(
+    geometry_row_candidates: list[list[tuple[tuple[float, float, float, float], str]]] = []
+    geometry_rows_auto = _placements_from_surya_geometry(
         page_data=page_data,
         page_width=page_width,
         page_height=page_height,
     )
-    geometry_tokens: list[tuple[tuple[float, float, float, float], str]] = []
-    for row_bbox, row_text in geometry_rows:
-        geometry_tokens.extend(_split_line_to_token_boxes(row_text, bbox=row_bbox))
-    if not geometry_tokens:
+    if geometry_rows_auto:
+        geometry_row_candidates.append(geometry_rows_auto)
+    geometry_rows_yx = _placements_from_surya_geometry_yx(
+        page_data=page_data,
+        page_width=page_width,
+        page_height=page_height,
+    )
+    if geometry_rows_yx:
+        geometry_row_candidates.append(geometry_rows_yx)
+    if not geometry_row_candidates:
         return ([], 0.0)
 
     src_tokens: list[tuple[str, bool]] = []
@@ -712,45 +719,66 @@ def _placements_from_chandra_text_aligned_to_geometry(
         return ([], 0.0)
 
     normalized_src = [_normalize_alignment_token(token) for token, _ in src_tokens]
-    normalized_geo = [_normalize_alignment_token(token) for _, token in geometry_tokens]
-    aligned_indices, coverage = _align_token_indices(
-        source_tokens=normalized_src,
-        target_tokens=normalized_geo,
-    )
-    if coverage < 0.45:
-        return ([], coverage)
+    best_alignment: list[int | None] = []
+    best_geo_bboxes: list[tuple[float, float, float, float]] = []
+    best_coverage = -1.0
+    best_score = float("-inf")
+    for geometry_rows in geometry_row_candidates:
+        geometry_tokens: list[tuple[tuple[float, float, float, float], str]] = []
+        for row_bbox, row_text in geometry_rows:
+            geometry_tokens.extend(_split_line_to_token_boxes(row_text, bbox=row_bbox))
+        if not geometry_tokens:
+            continue
+        normalized_geo = [_normalize_alignment_token(token) for _, token in geometry_tokens]
+        aligned_indices, coverage, score = _align_token_indices(
+            source_tokens=normalized_src,
+            target_tokens=normalized_geo,
+        )
+        if (
+            coverage > best_coverage
+            or (abs(coverage - best_coverage) <= 1e-9 and score > best_score)
+        ):
+            best_coverage = coverage
+            best_score = score
+            best_alignment = aligned_indices
+            best_geo_bboxes = [bbox for bbox, _ in geometry_tokens]
 
-    geo_bboxes = [bbox for bbox, _ in geometry_tokens]
+    if not best_geo_bboxes:
+        return ([], 0.0)
+    if best_coverage < 0.45:
+        return ([], max(best_coverage, 0.0))
+
+    geo_bboxes = best_geo_bboxes
     token_count = len(src_tokens)
     geo_count = len(geo_bboxes)
 
     placements: list[tuple[tuple[float, float, float, float], str]] = []
     for idx, (token_text, has_trailing_space) in enumerate(src_tokens):
-        mapped = aligned_indices[idx]
+        mapped = best_alignment[idx]
         bbox: tuple[float, float, float, float] | None = None
         if mapped is not None and 0 <= mapped < geo_count:
             bbox = geo_bboxes[mapped]
         else:
             left_idx = idx - 1
-            while left_idx >= 0 and aligned_indices[left_idx] is None:
+            while left_idx >= 0 and best_alignment[left_idx] is None:
                 left_idx -= 1
             right_idx = idx + 1
-            while right_idx < token_count and aligned_indices[right_idx] is None:
+            while right_idx < token_count and best_alignment[right_idx] is None:
                 right_idx += 1
 
             if left_idx >= 0 and right_idx < token_count:
-                left_mapped = aligned_indices[left_idx]
-                right_mapped = aligned_indices[right_idx]
+                left_mapped = best_alignment[left_idx]
+                right_mapped = best_alignment[right_idx]
                 if left_mapped is not None and right_mapped is not None:
                     span = float(right_idx - left_idx)
                     ratio = float(idx - left_idx) / span if span > 0 else 0.0
                     bbox = _interpolate_bbox(geo_bboxes[left_mapped], geo_bboxes[right_mapped], ratio)
             elif left_idx >= 0:
-                left_mapped = aligned_indices[left_idx]
+                left_mapped = best_alignment[left_idx]
                 if left_mapped is not None:
                     bbox = geo_bboxes[left_mapped]
             elif right_idx < token_count:
-                right_mapped = aligned_indices[right_idx]
+                right_mapped = best_alignment[right_idx]
                 if right_mapped is not None:
                     bbox = geo_bboxes[right_mapped]
 
@@ -767,7 +795,7 @@ def _placements_from_chandra_text_aligned_to_geometry(
         payload = f"{token_text} " if has_trailing_space else token_text
         placements.append((bbox, payload))
 
-    return (placements, coverage)
+    return (placements, best_coverage)
 
 
 def _expand_lines_to_target_count(
@@ -1101,6 +1129,56 @@ def _placements_from_surya_geometry(
         placement_rows.sort(key=lambda row: (row[0][1], row[0][0]))
 
     return [(bbox, text) for bbox, text, _ in placement_rows]
+
+
+def _placements_from_surya_geometry_yx(
+    *,
+    page_data: dict[str, object],
+    page_width: float,
+    page_height: float,
+) -> list[tuple[tuple[float, float, float, float], str]]:
+    raw_lines = page_data.get("lines")
+    if not isinstance(raw_lines, list):
+        return []
+    image_width = float(page_data.get("image_width") or 0.0)
+    image_height = float(page_data.get("image_height") or 0.0)
+    if image_width <= 0.0 or image_height <= 0.0:
+        return []
+
+    scale_x = page_width / image_width
+    scale_y = page_height / image_height
+    placement_rows: list[
+        tuple[
+            tuple[float, float, float, float],
+            str,
+        ]
+    ] = []
+    for item in raw_lines:
+        if not isinstance(item, dict):
+            continue
+        text = _clean_overlay_line(str(item.get("text") or ""))
+        bbox = item.get("bbox")
+        if (
+            not text
+            or not isinstance(bbox, list)
+            or len(bbox) != 4
+            or not all(isinstance(value, (int, float)) for value in bbox)
+        ):
+            continue
+        x0 = min(float(bbox[0]), float(bbox[2]))
+        y0 = min(float(bbox[1]), float(bbox[3]))
+        x1 = max(float(bbox[0]), float(bbox[2]))
+        y1 = max(float(bbox[1]), float(bbox[3]))
+        bx0 = max(0.0, x0 * scale_x)
+        by0 = max(0.0, y0 * scale_y)
+        bx1 = min(page_width, x1 * scale_x)
+        by1 = min(page_height, y1 * scale_y)
+        if bx1 <= bx0 or by1 <= by0:
+            continue
+        placement_rows.append(((bx0, by0, bx1, by1), text))
+
+    placement_rows.sort(key=lambda row: (row[0][1], row[0][0]))
+    return placement_rows
 
 
 def _geometry_boxes_in_reading_order(
