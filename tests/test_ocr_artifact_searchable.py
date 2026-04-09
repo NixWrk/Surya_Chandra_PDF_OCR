@@ -10,6 +10,7 @@ import pytest
 from uniscan.cli import main
 from uniscan.export import export_pages_as_pdf
 from uniscan.ocr.artifact_searchable import (
+    _align_token_indices,
     _assign_lines_to_boxes,
     _build_searchable_pdf_from_text,
     _estimate_page_split_weights,
@@ -17,9 +18,12 @@ from uniscan.ocr.artifact_searchable import (
     _geometry_boxes_in_reading_order,
     _geometry_lines_in_reading_order,
     _has_explicit_page_markers,
+    _normalize_alignment_token,
+    _placements_from_chandra_text_aligned_to_geometry,
     _placements_from_geometry_text_with_linefit,
     _placements_from_surya_geometry,
     _parse_artifact_filename,
+    _split_line_to_token_boxes,
     _split_line_to_word_fragments,
     _split_lines_to_pages_by_weights,
     _split_text_to_pages,
@@ -129,6 +133,58 @@ def test_split_line_to_word_fragments_keeps_single_token() -> None:
     parts = _split_line_to_word_fragments("ГОСТ19126", bbox=(0.0, 0.0, 100.0, 20.0))
     assert len(parts) == 1
     assert parts[0][1] == "ГОСТ19126"
+
+
+def test_split_line_to_token_boxes_keeps_token_count() -> None:
+    parts = _split_line_to_token_boxes(
+        "ИНСТРУМЕНТЫ МЕДИЦИНСКИЕ МЕТАЛЛИЧЕСКИЕ",
+        bbox=(10.0, 20.0, 210.0, 40.0),
+    )
+    assert len(parts) == 3
+    assert parts[0][1] == "ИНСТРУМЕНТЫ"
+    assert parts[-1][1] == "МЕТАЛЛИЧЕСКИЕ"
+    assert parts[0][0][0] < parts[1][0][0] < parts[2][0][0]
+
+
+def test_normalize_alignment_token_folds_latin_cyrillic_ocr_noise() -> None:
+    assert _normalize_alignment_token("FOCT") == _normalize_alignment_token("ГОСТ")
+    assert _normalize_alignment_token("СЭВ") == _normalize_alignment_token("CEB")
+
+
+def test_align_token_indices_matches_monotonic_sequence() -> None:
+    src = ["gost", "19126", "79", "medicinskie"]
+    dst = ["gost", "19126", "79", "medicinskie"]
+    aligned, coverage = _align_token_indices(source_tokens=src, target_tokens=dst)
+    assert coverage == pytest.approx(1.0)
+    assert aligned == [0, 1, 2, 3]
+
+
+def test_placements_from_chandra_text_aligned_to_geometry_uses_geometry_boxes() -> None:
+    page_lines = [
+        "ИНСТРУМЕНТЫ МЕДИЦИНСКИЕ",
+        "МЕТАЛЛИЧЕСКИЕ",
+    ]
+    page_data = {
+        "image_width": 1000.0,
+        "image_height": 1000.0,
+        "lines": [
+            {"text": "ИНСТРУМЕНТЫ", "bbox": [100.0, 100.0, 300.0, 140.0]},
+            {"text": "МЕДИЦИНСКИЕ", "bbox": [310.0, 100.0, 600.0, 140.0]},
+            {"text": "МЕТАЛЛИЧЕСКИЕ", "bbox": [120.0, 180.0, 560.0, 220.0]},
+        ],
+    }
+    placements, coverage = _placements_from_chandra_text_aligned_to_geometry(
+        page_lines=page_lines,
+        page_data=page_data,
+        page_width=1000.0,
+        page_height=1000.0,
+    )
+    assert coverage > 0.8
+    assert len(placements) >= 3
+    # first token should be near first geometry box
+    first_bbox, first_text = placements[0]
+    assert "ИНСТРУМЕНТЫ" in first_text
+    assert first_bbox[0] == pytest.approx(100.0, abs=2.0)
 
 
 def test_expand_lines_to_target_count_splits_long_lines() -> None:

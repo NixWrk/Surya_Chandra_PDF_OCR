@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import difflib
 import json
 import math
 import os
@@ -38,6 +39,45 @@ class CompareTxtBuildResult:
 
 
 _PAGE_MARKER_RE = re.compile(r"^\s*\[SOURCE PAGE\s+(\d+)\]\s*$", re.IGNORECASE | re.MULTILINE)
+_TOKEN_RE = re.compile(r"\S+")
+
+_ALIGN_CHAR_FOLD = {
+    # Cyrillic -> ASCII-like fold
+    "а": "a",
+    "б": "6",
+    "в": "b",
+    "г": "g",
+    "д": "d",
+    "е": "e",
+    "ё": "e",
+    "з": "3",
+    "и": "u",
+    "й": "u",
+    "к": "k",
+    "л": "n",
+    "м": "m",
+    "н": "h",
+    "о": "o",
+    "п": "n",
+    "р": "p",
+    "с": "c",
+    "т": "t",
+    "у": "y",
+    "ф": "f",
+    "х": "x",
+    "ц": "u",
+    "ч": "4",
+    "ш": "w",
+    "щ": "w",
+    "ь": "",
+    "ы": "bl",
+    "ъ": "",
+    "э": "e",
+    "ю": "io",
+    "я": "ya",
+    # Latin OCR confusions
+    "f": "g",  # FOCT -> ГОСТ (common OCR confusion)
+}
 
 
 def _normalize_key(value: str) -> str:
@@ -492,6 +532,242 @@ def _split_line_to_word_fragments(
             cursor = gx1
 
     return placements or [((x0, y0, x1, y1), line)]
+
+
+def _split_line_to_token_boxes(
+    line: str,
+    *,
+    bbox: tuple[float, float, float, float],
+) -> list[tuple[tuple[float, float, float, float], str]]:
+    x0, y0, x1, y1 = bbox
+    width = x1 - x0
+    if width <= 0.5:
+        token = _clean_overlay_line(line)
+        return [((x0, y0, x1, y1), token)] if token else []
+
+    tokens = _TOKEN_RE.findall(line)
+    if not tokens:
+        return []
+    if len(tokens) == 1:
+        return [((x0, y0, x1, y1), tokens[0])]
+
+    token_units = [max(len(token), 1) for token in tokens]
+    gap_units = 1
+    total_units = float(sum(token_units) + gap_units * (len(tokens) - 1))
+    if total_units <= 0.0:
+        return [((x0, y0, x1, y1), token) for token in tokens]
+
+    placements: list[tuple[tuple[float, float, float, float], str]] = []
+    cursor = x0
+    for idx, token in enumerate(tokens):
+        token_w = width * (float(token_units[idx]) / total_units)
+        fx0 = cursor
+        fx1 = min(x1, fx0 + token_w)
+        if fx1 > fx0:
+            placements.append(((fx0, y0, fx1, y1), token))
+        cursor = fx1
+        if idx < (len(tokens) - 1):
+            cursor = min(x1, cursor + (width * float(gap_units) / total_units))
+    return placements
+
+
+def _normalize_alignment_token(token: str) -> str:
+    clean = _clean_overlay_line(token).lower().replace("ё", "е")
+    folded = "".join(_ALIGN_CHAR_FOLD.get(ch, ch) for ch in clean)
+    folded = re.sub(r"[^0-9a-zа-я]+", "", folded)
+    return folded
+
+
+def _token_match_score(left: str, right: str) -> float:
+    if not left or not right:
+        return -0.8
+    if left == right:
+        return 2.0
+    if left in right or right in left:
+        if min(len(left), len(right)) >= 4:
+            return 1.05
+    ratio = difflib.SequenceMatcher(None, left, right).ratio()
+    if ratio >= 0.92:
+        return 1.6
+    if ratio >= 0.82:
+        return 1.15
+    if ratio >= 0.72:
+        return 0.7
+    if ratio >= 0.62:
+        return 0.25
+    return -0.7
+
+
+def _align_token_indices(
+    *,
+    source_tokens: Sequence[str],
+    target_tokens: Sequence[str],
+) -> tuple[list[int | None], float]:
+    n = len(source_tokens)
+    m = len(target_tokens)
+    if n == 0 or m == 0:
+        return ([None] * n, 0.0)
+
+    gap_penalty = -0.45
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    back = [[0] * (m + 1) for _ in range(n + 1)]  # 0 diag, 1 up, 2 left
+
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] + gap_penalty
+        back[i][0] = 1
+    for j in range(1, m + 1):
+        dp[0][j] = dp[0][j - 1] + gap_penalty
+        back[0][j] = 2
+
+    score_cache: dict[tuple[str, str], float] = {}
+    for i in range(1, n + 1):
+        src = source_tokens[i - 1]
+        for j in range(1, m + 1):
+            dst = target_tokens[j - 1]
+            key = (src, dst)
+            match_score = score_cache.get(key)
+            if match_score is None:
+                match_score = _token_match_score(src, dst)
+                score_cache[key] = match_score
+
+            diag = dp[i - 1][j - 1] + match_score
+            up = dp[i - 1][j] + gap_penalty
+            left = dp[i][j - 1] + gap_penalty
+            if diag >= up and diag >= left:
+                dp[i][j] = diag
+                back[i][j] = 0
+            elif up >= left:
+                dp[i][j] = up
+                back[i][j] = 1
+            else:
+                dp[i][j] = left
+                back[i][j] = 2
+
+    aligned: list[int | None] = [None] * n
+    i = n
+    j = m
+    while i > 0 and j > 0:
+        step = back[i][j]
+        if step == 0:
+            score = _token_match_score(source_tokens[i - 1], target_tokens[j - 1])
+            if score >= 0.6:
+                aligned[i - 1] = j - 1
+            i -= 1
+            j -= 1
+        elif step == 1:
+            i -= 1
+        else:
+            j -= 1
+
+    matched = sum(1 for item in aligned if item is not None)
+    coverage = float(matched) / float(max(1, n))
+    return aligned, coverage
+
+
+def _interpolate_bbox(
+    left_bbox: tuple[float, float, float, float],
+    right_bbox: tuple[float, float, float, float],
+    ratio: float,
+) -> tuple[float, float, float, float]:
+    lx0, ly0, lx1, ly1 = left_bbox
+    rx0, ry0, rx1, ry1 = right_bbox
+    t = min(max(ratio, 0.0), 1.0)
+    return (
+        lx0 + (rx0 - lx0) * t,
+        ly0 + (ry0 - ly0) * t,
+        lx1 + (rx1 - lx1) * t,
+        ly1 + (ry1 - ly1) * t,
+    )
+
+
+def _placements_from_chandra_text_aligned_to_geometry(
+    *,
+    page_lines: Sequence[str],
+    page_data: dict[str, object],
+    page_width: float,
+    page_height: float,
+) -> tuple[list[tuple[tuple[float, float, float, float], str]], float]:
+    if not page_lines:
+        return ([], 0.0)
+
+    geometry_rows = _placements_from_surya_geometry(
+        page_data=page_data,
+        page_width=page_width,
+        page_height=page_height,
+    )
+    geometry_tokens: list[tuple[tuple[float, float, float, float], str]] = []
+    for row_bbox, row_text in geometry_rows:
+        geometry_tokens.extend(_split_line_to_token_boxes(row_text, bbox=row_bbox))
+    if not geometry_tokens:
+        return ([], 0.0)
+
+    src_tokens: list[tuple[str, bool]] = []
+    for line in page_lines:
+        tokens = _TOKEN_RE.findall(line)
+        if not tokens:
+            continue
+        for idx, token in enumerate(tokens):
+            src_tokens.append((token, idx < (len(tokens) - 1)))
+    if not src_tokens:
+        return ([], 0.0)
+
+    normalized_src = [_normalize_alignment_token(token) for token, _ in src_tokens]
+    normalized_geo = [_normalize_alignment_token(token) for _, token in geometry_tokens]
+    aligned_indices, coverage = _align_token_indices(
+        source_tokens=normalized_src,
+        target_tokens=normalized_geo,
+    )
+    if coverage < 0.45:
+        return ([], coverage)
+
+    geo_bboxes = [bbox for bbox, _ in geometry_tokens]
+    token_count = len(src_tokens)
+    geo_count = len(geo_bboxes)
+
+    placements: list[tuple[tuple[float, float, float, float], str]] = []
+    for idx, (token_text, has_trailing_space) in enumerate(src_tokens):
+        mapped = aligned_indices[idx]
+        bbox: tuple[float, float, float, float] | None = None
+        if mapped is not None and 0 <= mapped < geo_count:
+            bbox = geo_bboxes[mapped]
+        else:
+            left_idx = idx - 1
+            while left_idx >= 0 and aligned_indices[left_idx] is None:
+                left_idx -= 1
+            right_idx = idx + 1
+            while right_idx < token_count and aligned_indices[right_idx] is None:
+                right_idx += 1
+
+            if left_idx >= 0 and right_idx < token_count:
+                left_mapped = aligned_indices[left_idx]
+                right_mapped = aligned_indices[right_idx]
+                if left_mapped is not None and right_mapped is not None:
+                    span = float(right_idx - left_idx)
+                    ratio = float(idx - left_idx) / span if span > 0 else 0.0
+                    bbox = _interpolate_bbox(geo_bboxes[left_mapped], geo_bboxes[right_mapped], ratio)
+            elif left_idx >= 0:
+                left_mapped = aligned_indices[left_idx]
+                if left_mapped is not None:
+                    bbox = geo_bboxes[left_mapped]
+            elif right_idx < token_count:
+                right_mapped = aligned_indices[right_idx]
+                if right_mapped is not None:
+                    bbox = geo_bboxes[right_mapped]
+
+            if bbox is None and geo_count > 0:
+                if token_count == 1:
+                    approx_idx = 0
+                else:
+                    approx_idx = int(round((float(idx) / float(token_count - 1)) * float(geo_count - 1)))
+                approx_idx = min(max(approx_idx, 0), geo_count - 1)
+                bbox = geo_bboxes[approx_idx]
+
+        if bbox is None:
+            continue
+        payload = f"{token_text} " if has_trailing_space else token_text
+        placements.append((bbox, payload))
+
+    return (placements, coverage)
 
 
 def _expand_lines_to_target_count(
@@ -1120,23 +1396,27 @@ def _build_searchable_pdf_from_text(
                 placements: list[tuple[tuple[float, float, float, float], str]]
                 if isinstance(surya_page, dict):
                     if geometry_linefit_prefer:
-                        geometry_boxes = _geometry_boxes_in_reading_order(
+                        placements, alignment_coverage = _placements_from_chandra_text_aligned_to_geometry(
+                            page_lines=page_lines,
                             page_data=surya_page,
                             page_width=page_width,
                             page_height=page_height,
                         )
-                        fit_lines = page_lines
-                        if geometry_boxes and page_lines:
-                            # Chandra often emits paragraph-like lines.
-                            # Expand lines towards geometry density so one
-                            # placement row is not overloaded with too much text.
-                            min_target = max(1, int(len(geometry_boxes) * 0.85))
-                            if len(page_lines) < min_target:
-                                fit_lines = _expand_lines_to_target_count(
-                                    page_lines,
-                                    target_count=min_target,
-                                )
-                        placements = _assign_lines_to_boxes(fit_lines, geometry_boxes)
+                        if not placements or alignment_coverage < 0.45:
+                            geometry_boxes = _geometry_boxes_in_reading_order(
+                                page_data=surya_page,
+                                page_width=page_width,
+                                page_height=page_height,
+                            )
+                            fit_lines = page_lines
+                            if geometry_boxes and page_lines:
+                                min_target = max(1, int(len(geometry_boxes) * 0.85))
+                                if len(page_lines) < min_target:
+                                    fit_lines = _expand_lines_to_target_count(
+                                        page_lines,
+                                        target_count=min_target,
+                                    )
+                            placements = _assign_lines_to_boxes(fit_lines, geometry_boxes)
                         if not placements:
                             placements = _placements_from_geometry_text_with_linefit(
                                 page_data=surya_page,
