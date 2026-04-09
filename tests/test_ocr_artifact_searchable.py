@@ -117,8 +117,9 @@ def test_split_line_to_word_fragments_splits_into_tokens() -> None:
         "ИНСТРУМЕНТЫ МЕДИЦИНСКИЕ МЕТАЛЛИЧЕСКИЕ",
         bbox=(10.0, 20.0, 210.0, 40.0),
     )
-    assert len(parts) == 3
+    assert len(parts) == 5
     assert parts[0][1].startswith("ИНСТРУМЕНТЫ")
+    assert parts[1][1] == " "
     assert parts[-1][1].strip() == "МЕТАЛЛИЧЕСКИЕ"
     assert parts[0][0][0] < parts[1][0][0] < parts[2][0][0]
 

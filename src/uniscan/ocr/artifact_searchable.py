@@ -481,11 +481,15 @@ def _split_line_to_word_fragments(
         fx0 = cursor
         fx1 = min(x1, fx0 + token_w)
         if fx1 > fx0:
-            text = f"{token} " if idx < (len(tokens) - 1) else token
-            placements.append(((fx0, y0, fx1, y1), text))
+            placements.append(((fx0, y0, fx1, y1), token))
         cursor = fx1
         if idx < (len(tokens) - 1):
-            cursor = min(x1, cursor + (width * float(gap_units) / total_units))
+            gap_w = width * float(gap_units) / total_units
+            gx0 = cursor
+            gx1 = min(x1, gx0 + gap_w)
+            if gx1 > gx0:
+                placements.append(((gx0, y0, gx1, y1), " "))
+            cursor = gx1
 
     return placements or [((x0, y0, x1, y1), line)]
 
@@ -1000,8 +1004,8 @@ def _build_overlay_page(
                 height = max(fy1 - fy0 - 0.4, 0.4)
                 font_size = max(min(height * 0.80, 32.0), 0.12)
                 natural_width = max(pdfmetrics.stringWidth(frag_text, font_name, font_size), 0.01)
-                # Avoid aggressive stretching: it hurts selection fidelity.
-                horiz_scale = max(min((width / natural_width) * 100.0, 220.0), 35.0)
+                # Keep scaling narrow to preserve selection fidelity.
+                horiz_scale = max(min((width / natural_width) * 100.0, 140.0), 70.0)
                 baseline_y = max(page_height - fy1 + (height - font_size) * 0.55, 0.2)
 
                 text_obj = pdf_canvas.beginText(max(fx0 + 0.2, 0.2), baseline_y)
