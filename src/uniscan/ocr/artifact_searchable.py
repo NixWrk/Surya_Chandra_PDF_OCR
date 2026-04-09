@@ -738,6 +738,101 @@ def _placements_from_surya_geometry(
     return [(bbox, text) for bbox, text, _ in placement_rows]
 
 
+def _geometry_lines_in_reading_order(
+    *,
+    page_data: dict[str, object],
+    page_width: float,
+    page_height: float,
+) -> list[str]:
+    raw_lines = page_data.get("lines")
+    if not isinstance(raw_lines, list):
+        return []
+    image_width = float(page_data.get("image_width") or 0.0)
+    image_height = float(page_data.get("image_height") or 0.0)
+    if image_width <= 0.0 or image_height <= 0.0:
+        return []
+
+    placement_rows: list[
+        tuple[
+            str,
+            float,
+            float,
+            float,
+            float,
+            float,
+        ]
+    ] = []
+    for item in raw_lines:
+        if not isinstance(item, dict):
+            continue
+        text = _clean_overlay_line(str(item.get("text") or ""))
+        bbox = item.get("bbox")
+        if (
+            not text
+            or not isinstance(bbox, list)
+            or len(bbox) != 4
+            or not all(isinstance(value, (int, float)) for value in bbox)
+        ):
+            continue
+        x0 = min(float(bbox[0]), float(bbox[2]))
+        y0 = min(float(bbox[1]), float(bbox[3]))
+        x1 = max(float(bbox[0]), float(bbox[2]))
+        y1 = max(float(bbox[1]), float(bbox[3]))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        center_x_px = (x0 + x1) * 0.5
+        placement_rows.append((text, x0, y0, x1, y1, center_x_px))
+
+    if not placement_rows:
+        return []
+
+    page_aspect = (page_width / page_height) if page_height > 0 else 0.0
+    spread_split_x = image_width * 0.5
+    if page_aspect >= 1.15:
+        left_count = sum(1 for _, _, _, _, _, cx in placement_rows if cx < image_width * 0.47)
+        right_count = sum(1 for _, _, _, _, _, cx in placement_rows if cx > image_width * 0.53)
+        min_side = max(3, int(len(placement_rows) * 0.12))
+        is_spread = left_count >= min_side and right_count >= min_side
+    else:
+        is_spread = False
+
+    if is_spread:
+        placement_rows.sort(
+            key=lambda row: (
+                1 if row[5] >= spread_split_x else 0,
+                row[2],
+                row[1],
+            )
+        )
+    else:
+        placement_rows.sort(key=lambda row: (row[2], row[1]))
+
+    return [text for text, *_ in placement_rows]
+
+
+def _placements_from_geometry_text_with_linefit(
+    *,
+    page_data: dict[str, object],
+    page_width: float,
+    page_height: float,
+    line_boxes: Sequence[tuple[float, float, float, float]],
+) -> list[tuple[tuple[float, float, float, float], str]]:
+    lines = _geometry_lines_in_reading_order(
+        page_data=page_data,
+        page_width=page_width,
+        page_height=page_height,
+    )
+    if lines and line_boxes:
+        fitted = _assign_lines_to_boxes(lines, list(line_boxes))
+        if fitted:
+            return fitted
+    return _placements_from_surya_geometry(
+        page_data=page_data,
+        page_width=page_width,
+        page_height=page_height,
+    )
+
+
 def _page_rotation_degrees(source_page) -> int:
     raw_value = source_page.get("/Rotate", 0)
     try:
@@ -811,6 +906,7 @@ def _build_searchable_pdf_from_text(
     text: str,
     out_pdf: Path,
     surya_geometry_by_page: dict[int, dict[str, object]] | None = None,
+    geometry_linefit_prefer: bool = False,
 ) -> tuple[int, int]:
     from pypdf import PdfReader, PdfWriter
     import fitz  # type: ignore
@@ -859,15 +955,23 @@ def _build_searchable_pdf_from_text(
                 page_width = crop_width if crop_width > 0 else (layout_width if layout_width > 0 else media_width)
                 page_height = crop_height if crop_height > 0 else (layout_height if layout_height > 0 else media_height)
                 page_lines = _split_page_text_lines(page_text)
+                line_boxes = page_line_boxes[page_idx]
                 placements: list[tuple[tuple[float, float, float, float], str]]
                 if isinstance(surya_page, dict):
-                    placements = _placements_from_surya_geometry(
-                        page_data=surya_page,
-                        page_width=page_width,
-                        page_height=page_height,
-                    )
+                    if geometry_linefit_prefer:
+                        placements = _placements_from_geometry_text_with_linefit(
+                            page_data=surya_page,
+                            page_width=page_width,
+                            page_height=page_height,
+                            line_boxes=line_boxes,
+                        )
+                    else:
+                        placements = _placements_from_surya_geometry(
+                            page_data=surya_page,
+                            page_width=page_width,
+                            page_height=page_height,
+                        )
                 else:
-                    line_boxes = page_line_boxes[page_idx]
                     placements = _assign_lines_to_boxes(page_lines, line_boxes)
                     if not placements and page_lines:
                         placements = [((4.0, 4.0, page_width - 4.0, page_height - 4.0), "\n".join(page_lines))]
@@ -991,6 +1095,7 @@ def run_artifact_searchable_package(
                 text=text,
                 out_pdf=out_pdf,
                 surya_geometry_by_page=surya_geometry_by_page,
+                geometry_linefit_prefer=(engine == "chandra"),
             )
             extracted = _extract_pdf_text(out_pdf)
             if not extracted.strip():

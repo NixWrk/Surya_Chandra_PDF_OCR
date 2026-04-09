@@ -13,7 +13,9 @@ from uniscan.ocr.artifact_searchable import (
     _assign_lines_to_boxes,
     _build_searchable_pdf_from_text,
     _estimate_page_split_weights,
+    _geometry_lines_in_reading_order,
     _has_explicit_page_markers,
+    _placements_from_geometry_text_with_linefit,
     _placements_from_surya_geometry,
     _parse_artifact_filename,
     _split_lines_to_pages_by_weights,
@@ -181,6 +183,70 @@ def test_placements_from_surya_geometry_auto_spread_orders_left_then_right() -> 
     )
     ordered_texts = [text for _, text in placements]
     assert ordered_texts == ["L-top", "L-mid", "L-bottom", "R-top", "R-mid", "R-bottom"]
+
+
+def test_geometry_lines_in_reading_order_auto_spread() -> None:
+    payload = {
+        "image_width": 2000.0,
+        "image_height": 1000.0,
+        "lines": [
+            {"text": "L-top", "bbox": [80.0, 80.0, 900.0, 120.0]},
+            {"text": "R-top", "bbox": [1100.0, 85.0, 1900.0, 125.0]},
+            {"text": "L-bottom", "bbox": [80.0, 820.0, 900.0, 860.0]},
+            {"text": "R-bottom", "bbox": [1100.0, 825.0, 1900.0, 865.0]},
+            {"text": "L-mid", "bbox": [80.0, 450.0, 900.0, 490.0]},
+            {"text": "R-mid", "bbox": [1100.0, 455.0, 1900.0, 495.0]},
+        ],
+    }
+    lines = _geometry_lines_in_reading_order(
+        page_data=payload,
+        page_width=1000.0,
+        page_height=500.0,
+    )
+    assert lines == ["L-top", "L-mid", "L-bottom", "R-top", "R-mid", "R-bottom"]
+
+
+def test_placements_from_geometry_text_with_linefit_prefers_detected_boxes() -> None:
+    payload = {
+        "image_width": 1000.0,
+        "image_height": 1000.0,
+        "lines": [
+            {"text": "LINE A", "bbox": [100.0, 100.0, 900.0, 160.0]},
+            {"text": "LINE B", "bbox": [100.0, 200.0, 900.0, 260.0]},
+        ],
+    }
+    line_boxes = [
+        (10.0, 20.0, 120.0, 36.0),
+        (12.0, 40.0, 125.0, 56.0),
+    ]
+    placements = _placements_from_geometry_text_with_linefit(
+        page_data=payload,
+        page_width=500.0,
+        page_height=500.0,
+        line_boxes=line_boxes,
+    )
+    assert len(placements) == 2
+    assert placements[0][0] == pytest.approx(line_boxes[0])
+    assert placements[1][0] == pytest.approx(line_boxes[1])
+    assert [text for _, text in placements] == ["LINE A", "LINE B"]
+
+
+def test_placements_from_geometry_text_with_linefit_falls_back_to_geometry() -> None:
+    payload = {
+        "image_width": 1000.0,
+        "image_height": 2000.0,
+        "lines": [{"text": "SINGLE", "bbox": [100.0, 200.0, 300.0, 260.0]}],
+    }
+    placements = _placements_from_geometry_text_with_linefit(
+        page_data=payload,
+        page_width=500.0,
+        page_height=1000.0,
+        line_boxes=[],
+    )
+    assert len(placements) == 1
+    bbox, text = placements[0]
+    assert text == "SINGLE"
+    assert bbox == pytest.approx((50.0, 100.0, 150.0, 130.0))
 
 
 def test_build_searchable_pdf_keeps_text_when_boxes_are_tiny(monkeypatch, tmp_path: Path) -> None:
