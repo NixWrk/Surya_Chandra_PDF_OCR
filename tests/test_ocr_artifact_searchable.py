@@ -13,6 +13,7 @@ from uniscan.ocr.artifact_searchable import (
     _assign_lines_to_boxes,
     _build_searchable_pdf_from_text,
     _estimate_page_split_weights,
+    _geometry_boxes_in_reading_order,
     _geometry_lines_in_reading_order,
     _has_explicit_page_markers,
     _placements_from_geometry_text_with_linefit,
@@ -204,6 +205,30 @@ def test_geometry_lines_in_reading_order_auto_spread() -> None:
         page_height=500.0,
     )
     assert lines == ["L-top", "L-mid", "L-bottom", "R-top", "R-mid", "R-bottom"]
+
+
+def test_geometry_boxes_in_reading_order_auto_spread() -> None:
+    payload = {
+        "image_width": 2000.0,
+        "image_height": 1000.0,
+        "lines": [
+            {"text": "L-top", "bbox": [80.0, 80.0, 900.0, 120.0]},
+            {"text": "R-top", "bbox": [1100.0, 85.0, 1900.0, 125.0]},
+            {"text": "L-bottom", "bbox": [80.0, 820.0, 900.0, 860.0]},
+            {"text": "R-bottom", "bbox": [1100.0, 825.0, 1900.0, 865.0]},
+            {"text": "L-mid", "bbox": [80.0, 450.0, 900.0, 490.0]},
+            {"text": "R-mid", "bbox": [1100.0, 455.0, 1900.0, 495.0]},
+        ],
+    }
+    boxes = _geometry_boxes_in_reading_order(
+        page_data=payload,
+        page_width=1000.0,
+        page_height=500.0,
+    )
+    assert len(boxes) == 6
+    y_positions = [item[1] for item in boxes]
+    assert y_positions[:3] == sorted(y_positions[:3])
+    assert y_positions[3:] == sorted(y_positions[3:])
 
 
 def test_placements_from_geometry_text_with_linefit_prefers_detected_boxes() -> None:
@@ -406,6 +431,70 @@ def test_run_artifact_searchable_package_uses_chandra_sidecar_geometry(tmp_path:
     assert rows[0].searchable_pdf_path is not None
     extracted = _extract_pdf_text(Path(rows[0].searchable_pdf_path))
     assert "CHANDRA GEOMETRY LINE" in extracted
+
+
+def test_run_artifact_searchable_package_reads_nested_chandra_pages_json(tmp_path: Path) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+
+    doc_name = "fixture_doc"
+    _build_sample_pdf(pdf_root, doc_name, [40])
+    (compare_dir / f"{doc_name}__chandra.txt").write_text("TXT LINE SHOULD WIN", encoding="utf-8")
+
+    nested_dir = compare_dir.parent / "chandra" / "chandra"
+    nested_dir.mkdir(parents=True)
+    (nested_dir / "pages.json").write_text(
+        json.dumps(
+            {
+                "pdf_path": str((pdf_root / f"{doc_name}.pdf")),
+                "engine": "chandra",
+                "pages": [
+                    {
+                        "source_page": 1,
+                        "geometry_file": "page_0001.chandra.json",
+                        "geometry_type": "chandra_text_lines",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (nested_dir / "page_0001.chandra.json").write_text(
+        json.dumps(
+            {
+                "images": [
+                    {
+                        "image_name": "00001.png",
+                        "pages": [
+                            {
+                                "image_bbox": [0, 0, 300, 200],
+                                "text_lines": [
+                                    {"text": "GEOMETRY LINE", "bbox": [20, 20, 280, 60]}
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=output_dir,
+        engines=("chandra",),
+    )
+
+    assert len(rows) == 1
+    assert rows[0].status == "ok"
+    assert rows[0].searchable_pdf_path is not None
+    extracted = _extract_pdf_text(Path(rows[0].searchable_pdf_path))
+    assert "TXT LINE SHOULD WIN" in extracted
 
 
 def test_run_artifact_searchable_package_uses_chandra_geometry_on_pdf_name_mismatch(tmp_path: Path) -> None:

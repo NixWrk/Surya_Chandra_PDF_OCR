@@ -541,11 +541,20 @@ def _load_surya_page_geometry(
     document: str,
     engine: str = "surya",
     geometry_types: Sequence[str] = ("surya_text_lines",),
+    engine_dir_override: Path | None = None,
 ) -> dict[int, dict[str, object]]:
-    engine_dir = compare_dir.parent / engine
-    pages_json_path = engine_dir / "pages.json"
-    if not pages_json_path.exists():
+    if engine_dir_override is not None:
+        root_engine_dir = Path(engine_dir_override)
+    else:
+        root_engine_dir = compare_dir.parent / engine
+    pages_json_candidates = [
+        root_engine_dir / "pages.json",
+        root_engine_dir / engine / "pages.json",
+    ]
+    pages_json_path = next((path for path in pages_json_candidates if path.exists()), None)
+    if pages_json_path is None:
         return {}
+    engine_dir = pages_json_path.parent
 
     try:
         payload = json.loads(pages_json_path.read_text(encoding="utf-8", errors="ignore"))
@@ -736,6 +745,73 @@ def _placements_from_surya_geometry(
         placement_rows.sort(key=lambda row: (row[0][1], row[0][0]))
 
     return [(bbox, text) for bbox, text, _ in placement_rows]
+
+
+def _geometry_boxes_in_reading_order(
+    *,
+    page_data: dict[str, object],
+    page_width: float,
+    page_height: float,
+) -> list[tuple[float, float, float, float]]:
+    raw_lines = page_data.get("lines")
+    if not isinstance(raw_lines, list):
+        return []
+    image_width = float(page_data.get("image_width") or 0.0)
+    image_height = float(page_data.get("image_height") or 0.0)
+    if image_width <= 0.0 or image_height <= 0.0:
+        return []
+
+    scale_x = page_width / image_width
+    scale_y = page_height / image_height
+    rows: list[tuple[tuple[float, float, float, float], float]] = []
+    for item in raw_lines:
+        if not isinstance(item, dict):
+            continue
+        bbox = item.get("bbox")
+        if (
+            not isinstance(bbox, list)
+            or len(bbox) != 4
+            or not all(isinstance(value, (int, float)) for value in bbox)
+        ):
+            continue
+        x0 = min(float(bbox[0]), float(bbox[2]))
+        y0 = min(float(bbox[1]), float(bbox[3]))
+        x1 = max(float(bbox[0]), float(bbox[2]))
+        y1 = max(float(bbox[1]), float(bbox[3]))
+        bx0 = max(0.0, x0 * scale_x)
+        by0 = max(0.0, y0 * scale_y)
+        bx1 = min(page_width, x1 * scale_x)
+        by1 = min(page_height, y1 * scale_y)
+        if bx1 <= bx0 or by1 <= by0:
+            continue
+        center_x_px = (x0 + x1) * 0.5
+        rows.append(((bx0, by0, bx1, by1), center_x_px))
+
+    if not rows:
+        return []
+
+    page_aspect = (page_width / page_height) if page_height > 0 else 0.0
+    spread_split_x = image_width * 0.5
+    if page_aspect >= 1.15:
+        left_count = sum(1 for _, cx in rows if cx < image_width * 0.47)
+        right_count = sum(1 for _, cx in rows if cx > image_width * 0.53)
+        min_side = max(3, int(len(rows) * 0.12))
+        is_spread = left_count >= min_side and right_count >= min_side
+    else:
+        is_spread = False
+
+    if is_spread:
+        rows.sort(
+            key=lambda row: (
+                1 if row[1] >= spread_split_x else 0,
+                row[0][1],
+                row[0][0],
+            )
+        )
+    else:
+        rows.sort(key=lambda row: (row[0][1], row[0][0]))
+
+    return [bbox for bbox, _ in rows]
 
 
 def _geometry_lines_in_reading_order(
@@ -959,12 +1035,19 @@ def _build_searchable_pdf_from_text(
                 placements: list[tuple[tuple[float, float, float, float], str]]
                 if isinstance(surya_page, dict):
                     if geometry_linefit_prefer:
-                        placements = _placements_from_geometry_text_with_linefit(
+                        geometry_boxes = _geometry_boxes_in_reading_order(
                             page_data=surya_page,
                             page_width=page_width,
                             page_height=page_height,
-                            line_boxes=line_boxes,
                         )
+                        placements = _assign_lines_to_boxes(page_lines, geometry_boxes)
+                        if not placements:
+                            placements = _placements_from_geometry_text_with_linefit(
+                                page_data=surya_page,
+                                page_width=page_width,
+                                page_height=page_height,
+                                line_boxes=line_boxes,
+                            )
                     else:
                         placements = _placements_from_surya_geometry(
                             page_data=surya_page,
@@ -1083,11 +1166,17 @@ def run_artifact_searchable_package(
                     geometry_types=("surya_text_lines",),
                 )
             if engine == "chandra":
+                chandra_geometry_dir = os.getenv("UNISCAN_CHANDRA_GEOMETRY_DIR", "").strip()
+                geometry_override = Path(chandra_geometry_dir) if chandra_geometry_dir else None
+                geometry_types = ("chandra_text_lines",)
+                if geometry_override is not None:
+                    geometry_types = ("surya_text_lines", "chandra_text_lines")
                 surya_geometry_by_page = _load_surya_page_geometry(
                     compare_dir=resolved_compare,
                     document=document,
                     engine="chandra",
-                    geometry_types=("chandra_text_lines",),
+                    geometry_types=geometry_types,
+                    engine_dir_override=geometry_override,
                 )
             out_pdf = resolved_output / document / f"{document}__{engine}_searchable.pdf"
             page_count, text_chars = _build_searchable_pdf_from_text(
