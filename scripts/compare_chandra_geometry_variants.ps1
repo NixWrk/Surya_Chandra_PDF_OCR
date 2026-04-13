@@ -31,61 +31,20 @@ if (-not (Test-Path -LiteralPath $Python)) {
     throw "Python interpreter not found: $Python"
 }
 
-$compareDir = Join-Path $runRootResolved "_compare_txt"
-$compareArgs = @(
-    "-m", "uniscan", "prepare-compare-txt",
-    "--benchmark-root", $runRootResolved,
-    "--output", $compareDir,
-    "--engines", "chandra", "surya",
-    "--strict"
-)
-
-Write-Host "[compare] Preparing TXT artifacts ..."
-& $Python @compareArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "prepare-compare-txt failed with exit code $LASTEXITCODE"
-}
-
-$outputBase = Join-Path $runRootResolved "searchable_pdf_geometry_compare"
-$outChandraGeometry = Join-Path $outputBase "chandra_text__chandra_geometry"
-$outSuryaGeometry = Join-Path $outputBase "chandra_text__surya_geometry"
-
-foreach ($target in @($outChandraGeometry, $outSuryaGeometry)) {
-    if (Test-Path -LiteralPath $target) {
-        Remove-Item -LiteralPath $target -Recurse -Force
-    }
-}
-
-Write-Host "[compare] Building variant A: chandra text + chandra geometry ..."
-$buildA = @(
-    "-m", "uniscan", "build-searchable-from-artifacts",
-    "--compare-dir", $compareDir,
+Write-Host "[compare] Running application workflow ..."
+$argsList = @(
+    "-m", "uniscan", "compare-chandra-geometry",
+    "--run-root", $runRootResolved,
     "--pdf-root", $pdfRootResolved,
-    "--output", $outChandraGeometry,
-    "--engines", "chandra",
     "--strict"
 )
-& $Python @buildA
+& $Python @argsList
 if ($LASTEXITCODE -ne 0) {
-    throw "build-searchable-from-artifacts (chandra geometry) failed with exit code $LASTEXITCODE"
-}
-
-Write-Host "[compare] Building variant B: chandra text + surya geometry ..."
-$env:UNISCAN_CHANDRA_GEOMETRY_DIR = (Join-Path $runRootResolved "surya")
-$buildB = @(
-    "-m", "uniscan", "build-searchable-from-artifacts",
-    "--compare-dir", $compareDir,
-    "--pdf-root", $pdfRootResolved,
-    "--output", $outSuryaGeometry,
-    "--engines", "chandra",
-    "--strict"
-)
-& $Python @buildB
-if ($LASTEXITCODE -ne 0) {
-    throw "build-searchable-from-artifacts (surya geometry) failed with exit code $LASTEXITCODE"
+    throw "compare-chandra-geometry failed with exit code $LASTEXITCODE"
 }
 
 Write-Host ""
 Write-Host "Done. Geometry comparison outputs:"
-Write-Host "  A (Chandra geometry): $outChandraGeometry"
-Write-Host "  B (Surya geometry):   $outSuryaGeometry"
+$outputBase = Join-Path $runRootResolved "searchable_pdf_geometry_compare"
+Write-Host "  A (Chandra geometry): $(Join-Path $outputBase 'chandra_text__chandra_geometry')"
+Write-Host "  B (Surya geometry):   $(Join-Path $outputBase 'chandra_text__surya_geometry')"

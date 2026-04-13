@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import re
 from pathlib import Path
 
+from uniscan.app import build_chandra_geometry_variants, parse_page_numbers
 from uniscan.ocr import (
     build_compare_txt_from_benchmark,
     run_artifact_searchable_package,
@@ -19,27 +19,6 @@ from uniscan.ocr import (
 from uniscan.ocr.preprocessing import PREPROCESSING_MODES
 from uniscan.tools import run_crop_benchmark, summarize_benchmark_results
 from uniscan.ui import run_app
-
-
-def _parse_page_numbers(raw_values: list[str] | None) -> tuple[int, ...] | None:
-    if not raw_values:
-        return None
-    tokens: list[str] = []
-    for raw in raw_values:
-        tokens.extend(part for part in re.split(r"[\s,;]+", raw.strip()) if part)
-    if not tokens:
-        return None
-
-    pages: list[int] = []
-    for token in tokens:
-        try:
-            page = int(token)
-        except ValueError as exc:
-            raise ValueError(f"Invalid page value: {token}") from exc
-        if page < 1:
-            raise ValueError(f"Invalid page value: {page}. Page numbers must be >= 1.")
-        pages.append(page)
-    return tuple(pages)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -267,6 +246,34 @@ def main(argv: list[str] | None = None) -> int:
         help="Return non-zero exit code when any selected engine failed to export compare_txt.",
     )
 
+    geometry_compare_parser = subparsers.add_parser(
+        "compare-chandra-geometry",
+        help="Build two searchable PDFs: chandra text + (chandra geometry / surya geometry).",
+    )
+    geometry_compare_parser.add_argument(
+        "--run-root",
+        required=True,
+        type=Path,
+        help="Benchmark run root folder (contains chandra/surya artifacts).",
+    )
+    geometry_compare_parser.add_argument(
+        "--pdf-root",
+        required=True,
+        type=Path,
+        help="Root folder with source PDFs.",
+    )
+    geometry_compare_parser.add_argument(
+        "--output",
+        default=None,
+        type=Path,
+        help="Optional output root for geometry-compare PDFs.",
+    )
+    geometry_compare_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero exit code when any stage failed.",
+    )
+
     args = parser.parse_args(argv)
     if args.version:
         from uniscan import __version__
@@ -344,6 +351,19 @@ def main(argv: list[str] | None = None) -> int:
         print(summarize_compare_txt_build(results))
         if args.strict and any(result.status != "ok" for result in results):
             return 1
+        return 0
+    if args.command == "compare-chandra-geometry":
+        summary = build_chandra_geometry_variants(
+            run_root=args.run_root,
+            pdf_root=args.pdf_root,
+            output_root=args.output,
+            strict=bool(args.strict),
+        )
+        print(f"compare_dir={summary.compare_dir}")
+        print(f"output_root={summary.output_root}")
+        print("variants:")
+        print("  - chandra_text__chandra_geometry")
+        print("  - chandra_text__surya_geometry")
         return 0
     return run_app()
 

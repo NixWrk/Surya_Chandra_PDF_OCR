@@ -25,6 +25,15 @@ This script does three stages:
 2. Build variant A: `chandra` text + `chandra` geometry.
 3. Build variant B: `chandra` text + `surya` geometry (`UNISCAN_CHANDRA_GEOMETRY_DIR=<run>\surya`).
 
+Direct CLI equivalent (single command):
+
+```powershell
+.\.venv\Scripts\python.exe -m uniscan compare-chandra-geometry `
+  --run-root "D:\Git_Code\Surya_Chandra_PDF_OCR\outputs\basic_gui_runs\ГОСТ с плохим качеством скана_20260410_182529" `
+  --pdf-root "O:\OBS_TEST\PDF2OBS\PDFS" `
+  --strict
+```
+
 ## Manual Commands (Equivalent)
 
 ```powershell

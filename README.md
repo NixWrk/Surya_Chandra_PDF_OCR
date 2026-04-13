@@ -12,7 +12,17 @@
 python -m uniscan benchmark-ocr --help
 python -m uniscan prepare-compare-txt --help
 python -m uniscan build-searchable-from-artifacts --help
+python -m uniscan compare-chandra-geometry --help
 ```
+
+## Сервисный слой (web-ready)
+
+Для будущего web GUI в проект вынесен application-layer:
+
+- `src/uniscan/app/page_spec.py` — единый парсер страниц (`1,3,5-8`)
+- `src/uniscan/app/ocr_pipeline.py` — оркестрация OCR/артефактных workflow
+
+Базовый GUI использует именно этот слой, а не shell-команды напрямую.
 
 ## Базовый GUI (минимальный)
 

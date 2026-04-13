@@ -2,45 +2,30 @@
 
 from __future__ import annotations
 
-import os
-import subprocess
-import re
-import sys
 import threading
-import time
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 
-from uniscan.ocr import detect_ocr_engine_status
+from uniscan.app import (
+    DEFAULT_BASIC_GUI_LANG,
+    MODE_BOTH,
+    MODE_HYBRID,
+    MODE_SURYA,
+    BasicOcrRunSummary,
+    MODE_TO_ENGINES,
+    parse_page_numbers,
+    run_basic_ocr_benchmark,
+)
 
 
-DEFAULT_LANG = "rus+eng"
-MODE_SURYA = "surya"
-MODE_HYBRID = "hybrid"
-MODE_BOTH = "both"
+DEFAULT_LANG = DEFAULT_BASIC_GUI_LANG
 
 MODE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Surya", MODE_SURYA),
     ("Гибрид", MODE_HYBRID),
     ("Оба", MODE_BOTH),
 )
-
-MODE_TO_ENGINES: dict[str, tuple[str, ...]] = {
-    MODE_SURYA: ("surya",),
-    MODE_HYBRID: ("chandra",),
-    MODE_BOTH: ("surya", "chandra"),
-}
-
-
-@dataclass(slots=True, frozen=True)
-class RunSummary:
-    run_dir: Path
-    result_files: tuple[Path, ...]
-    failed_engines: tuple[str, ...]
-    skipped_engines: tuple[str, ...]
 
 
 class BasicOcrGui(tk.Tk):
@@ -49,8 +34,8 @@ class BasicOcrGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("UniScan Basic OCR")
-        self.geometry("720x250")
-        self.minsize(680, 230)
+        self.geometry("760x260")
+        self.minsize(700, 240)
 
         self.pdf_path_var = tk.StringVar()
         self.mode_label_var = tk.StringVar(value=MODE_OPTIONS[0][0])
@@ -93,7 +78,7 @@ class BasicOcrGui(tk.Tk):
         self.mode_combo.current(0)
         ttk.Label(
             row_mode,
-            text="Гибрид = Chandra (с Surya-геометрией в текущем пайплайне)",
+            text="Гибрид = Chandra (совмещение с доступной геометрией в пайплайне)",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         row_pages = ttk.Frame(root)
@@ -146,52 +131,6 @@ class BasicOcrGui(tk.Tk):
         self.pages_entry.configure(state=state)
         self.mode_combo.configure(state="disabled" if running else "readonly")
 
-    def _parse_pages_spec(self, raw: str) -> tuple[int, ...] | None:
-        normalized = raw.strip().replace("–", "-").replace("—", "-")
-        if not normalized:
-            return None
-
-        tokens = [token for token in re.split(r"[,\s;]+", normalized) if token]
-        if not tokens:
-            return None
-
-        pages: list[int] = []
-        seen: set[int] = set()
-        for token in tokens:
-            if "-" in token:
-                parts = token.split("-")
-                if len(parts) != 2 or not parts[0] or not parts[1]:
-                    raise ValueError(f"Некорректный диапазон: {token}")
-                try:
-                    start = int(parts[0])
-                    end = int(parts[1])
-                except ValueError as exc:
-                    raise ValueError(f"Некорректный диапазон: {token}") from exc
-                if start < 1 or end < 1:
-                    raise ValueError(f"Номер страницы должен быть >= 1: {token}")
-                step = 1 if end >= start else -1
-                for page in range(start, end + step, step):
-                    if page in seen:
-                        continue
-                    seen.add(page)
-                    pages.append(page)
-                continue
-
-            try:
-                page = int(token)
-            except ValueError as exc:
-                raise ValueError(f"Некорректный номер страницы: {token}") from exc
-            if page < 1:
-                raise ValueError(f"Номер страницы должен быть >= 1: {page}")
-            if page in seen:
-                continue
-            seen.add(page)
-            pages.append(page)
-
-        if not pages:
-            return None
-        return tuple(pages)
-
     def _start_run(self) -> None:
         if self._worker is not None and self._worker.is_alive():
             return
@@ -204,22 +143,9 @@ class BasicOcrGui(tk.Tk):
                 raise RuntimeError("Поддерживается только PDF.")
 
             mode_key = self._selected_mode_key()
-            requested_engines = MODE_TO_ENGINES.get(mode_key)
-            if not requested_engines:
+            if mode_key not in MODE_TO_ENGINES:
                 raise RuntimeError("Не удалось определить выбранный режим.")
-            page_numbers = self._parse_pages_spec(self.pages_var.get())
-
-            ready_engines: list[str] = []
-            skipped_engines: list[str] = []
-            for engine in requested_engines:
-                status = detect_ocr_engine_status(engine)
-                if status.ready:
-                    ready_engines.append(engine)
-                    continue
-                missing_deps = ", ".join(status.missing) if status.missing else "unknown"
-                skipped_engines.append(f"{engine}: {missing_deps}")
-            if not ready_engines:
-                raise RuntimeError("Нет доступных движков:\n\n" + "\n".join(skipped_engines))
+            page_numbers = parse_page_numbers(self.pages_var.get())
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc))
             return
@@ -229,14 +155,9 @@ class BasicOcrGui(tk.Tk):
         self.status_var.set("Подготовка...")
         self._set_running(True)
 
-        if skipped_engines:
-            self.status_var.set(
-                "Часть движков пропущена: " + ", ".join(item.split(":", 1)[0] for item in skipped_engines)
-            )
-
         self._worker = threading.Thread(
             target=self._run_worker,
-            args=(pdf_path, tuple(ready_engines), tuple(skipped_engines), page_numbers),
+            args=(pdf_path, mode_key, page_numbers),
             daemon=True,
         )
         self._worker.start()
@@ -244,126 +165,23 @@ class BasicOcrGui(tk.Tk):
     def _run_worker(
         self,
         pdf_path: Path,
-        engines: tuple[str, ...],
-        skipped_engines: tuple[str, ...],
+        mode_key: str,
         page_numbers: tuple[int, ...] | None,
     ) -> None:
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_dir = (Path.cwd() / "outputs" / "basic_gui_runs" / f"{pdf_path.stem}_{timestamp}").resolve()
-            run_dir.mkdir(parents=True, exist_ok=True)
-
-            result_files: list[Path] = []
-            failed_engines: list[str] = []
-            total = max(1, len(engines))
-
-            for index, engine in enumerate(engines, start=1):
-                start_percent = int(((index - 1) / total) * 100)
-                end_percent = int((index / total) * 100)
-                self.after(0, self._ui_set_progress, start_percent, f"Запуск: {engine}")
-
-                engine_output = run_dir / engine
-                engine_output.mkdir(parents=True, exist_ok=True)
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "uniscan",
-                    "benchmark-ocr",
-                    "--pdf",
-                    str(pdf_path),
-                    "--output",
-                    str(engine_output),
-                    "--engines",
-                    engine,
-                    "--lang",
-                    DEFAULT_LANG,
-                    "--strict",
-                ]
-                if page_numbers is None:
-                    cmd.extend(["--sample-size", "999999"])
-                else:
-                    cmd.extend(["--pages", ",".join(str(page) for page in page_numbers)])
-                try:
-                    self._run_engine_with_progress(
-                        cmd=cmd,
-                        engine=engine,
-                        start_percent=start_percent,
-                        end_percent=end_percent,
-                    )
-                except Exception as exc:
-                    failed_engines.append(f"{engine}: {exc}")
-                    self.after(0, self._ui_set_progress, end_percent, f"Ошибка: {engine}")
-                    continue
-
-                report_path = engine_output / f"{pdf_path.stem}_ocr_benchmark.json"
-                result_files.append(report_path)
-                self.after(0, self._ui_set_progress, end_percent, f"Готово: {engine}")
-
-            if len(failed_engines) >= len(engines):
-                details = "\n\n".join(failed_engines)
-                raise RuntimeError(f"Ни один движок не завершился успешно.\n\n{details}")
-
-            summary = RunSummary(
-                run_dir=run_dir,
-                result_files=tuple(result_files),
-                failed_engines=tuple(failed_engines),
-                skipped_engines=tuple(skipped_engines),
+            summary = run_basic_ocr_benchmark(
+                pdf_path=pdf_path,
+                mode_key=mode_key,
+                page_numbers=page_numbers,
+                lang=DEFAULT_LANG,
+                progress=self._queue_progress,
             )
             self.after(0, self._ui_done, summary)
         except Exception as exc:
             self.after(0, self._ui_error, str(exc))
 
-    def _run_engine_with_progress(
-        self,
-        *,
-        cmd: list[str],
-        engine: str,
-        start_percent: int,
-        end_percent: int,
-    ) -> None:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=self._engine_env(engine),
-        )
-        started = time.monotonic()
-        span = max(1, end_percent - start_percent)
-        pseudo = start_percent
-
-        while True:
-            try:
-                stdout, stderr = proc.communicate(timeout=0.9)
-                break
-            except subprocess.TimeoutExpired:
-                elapsed_seconds = int(time.monotonic() - started)
-                advance = min(span - 1, elapsed_seconds // 3)
-                target_progress = start_percent + advance
-                if target_progress > pseudo:
-                    pseudo = target_progress
-                self.after(
-                    0,
-                    self._ui_set_progress,
-                    pseudo,
-                    f"Запуск: {engine} ({elapsed_seconds}с)",
-                )
-
-        if proc.returncode == 0:
-            return
-
-        tail = (stderr or stdout or "").strip()
-        if tail:
-            tail_lines = "\n".join(tail.splitlines()[-20:])
-        else:
-            tail_lines = "no error details"
-        raise RuntimeError(f"Движок '{engine}' завершился с ошибкой:\n\n{tail_lines}")
-
-    def _engine_env(self, engine: str) -> dict[str, str]:
-        _ = engine
-        return os.environ.copy()
+    def _queue_progress(self, value: int, status: str) -> None:
+        self.after(0, self._ui_set_progress, value, status)
 
     def _ui_set_progress(self, value: int, status: str) -> None:
         bounded = max(0, min(100, int(value)))
@@ -371,12 +189,13 @@ class BasicOcrGui(tk.Tk):
         self.progress_text_var.set(f"{bounded}%")
         self.status_var.set(status)
 
-    def _ui_done(self, summary: RunSummary) -> None:
+    def _ui_done(self, summary: BasicOcrRunSummary) -> None:
         self._set_running(False)
         self._ui_set_progress(100, "Завершено")
         result_lines = "\n".join(str(path) for path in summary.result_files if path.exists())
         if not result_lines:
             result_lines = "(файлы отчётов не найдены)"
+
         extra_lines: list[str] = []
         if summary.skipped_engines:
             extra_lines.append("Пропущены (нет зависимостей):")
@@ -388,6 +207,7 @@ class BasicOcrGui(tk.Tk):
             extra_lines.append("")
         extra = ("\n".join(extra_lines)).strip()
         details_block = f"\n\n{extra}" if extra else ""
+
         messagebox.showinfo(
             "Готово",
             "OCR выполнен.\n\n"
@@ -410,3 +230,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
