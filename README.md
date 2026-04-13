@@ -90,7 +90,7 @@ python -m uniscan searchable-pdf `
    - индикатор прогресса выполнения,
    - итоговый результат: searchable PDF (входной файл перезаписывается).
 
-## HTTP API (PDF bytes -> PDF bytes)
+## Web GUI + HTTP API
 
 Запуск локального web-сервиса:
 
@@ -100,18 +100,22 @@ python -m uniscan serve-http --host 127.0.0.1 --port 8000
 
 Доступно:
 
-1. `GET /` — простая web-страница для загрузки PDF.
+1. `GET /` — web GUI (загрузка PDF, выбор режима, страницы, live-прогресс, скачивание результата).
 2. `GET /health` — health-check JSON.
-3. `POST /searchable-pdf` — принимает raw PDF bytes, возвращает searchable PDF bytes.
+3. `POST /api/jobs` — создать async OCR-job (raw PDF bytes в body).
+4. `GET /api/jobs/{id}` — статус job (`queued/running/done/error`) + progress.
+5. `GET /api/jobs/{id}/result` — скачать готовый searchable PDF.
+6. `POST /searchable-pdf` — синхронный endpoint (raw PDF bytes -> PDF bytes), для скриптов.
 
-Параметры `POST /searchable-pdf` (query string):
+Параметры query string для `POST /api/jobs` и `POST /searchable-pdf`:
 
 1. `mode`: `chandra`, `surya`, `chandra+surya` (по умолчанию).
 2. `pages`: например `1,3,5-8` (опционально).
 3. `lang`: OCR language, по умолчанию `rus+eng`.
 4. `strict`: `1/0`, `true/false` (по умолчанию strict).
+5. `filename`: имя для скачиваемого файла в web GUI.
 
-Пример из PowerShell:
+Пример sync-вызова из PowerShell:
 
 ```powershell
 $inPdf = "D:\Git_Code\PDFS\ГОСТ с плохим качеством скана.pdf"
@@ -123,6 +127,29 @@ Invoke-WebRequest `
   -InFile $inPdf `
   -ContentType "application/pdf" `
   -OutFile $outPdf
+```
+
+Пример async-цикла из PowerShell:
+
+```powershell
+$inPdf = "D:\Git_Code\PDFS\ГОСТ с плохим качеством скана.pdf"
+
+$create = Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/api/jobs?mode=chandra%2Bsurya&pages=1-3&filename=gost.pdf" `
+  -Method Post `
+  -InFile $inPdf `
+  -ContentType "application/pdf"
+
+$jobId = $create.job_id
+do {
+  Start-Sleep -Milliseconds 800
+  $status = Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/jobs/$jobId"
+  "$($status.status) $($status.progress)% $($status.message)"
+} while ($status.status -in @("queued","running"))
+
+if ($status.status -eq "done") {
+  Invoke-WebRequest -Uri "http://127.0.0.1:8000/api/jobs/$jobId/result" -OutFile "D:\Git_Code\PDFS\ГОСТ_async_result.pdf"
+}
 ```
 
 ## Docker
