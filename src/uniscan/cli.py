@@ -26,6 +26,7 @@ from uniscan.ocr import (
 from uniscan.ocr.preprocessing import PREPROCESSING_MODES
 from uniscan.tools import run_crop_benchmark, summarize_benchmark_results
 from uniscan.ui import run_app
+from uniscan.web import run_http_server
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -323,6 +324,33 @@ def main(argv: list[str] | None = None) -> int:
         help="Return non-zero exit code on any failed stage.",
     )
 
+    serve_http_parser = subparsers.add_parser(
+        "serve-http",
+        help="Run minimal HTTP API (PDF bytes in -> PDF bytes out).",
+    )
+    serve_http_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host/IP to bind HTTP server to.",
+    )
+    serve_http_parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="TCP port for HTTP server.",
+    )
+    serve_http_parser.add_argument(
+        "--work-root",
+        default=None,
+        type=Path,
+        help="Optional workspace for intermediate run artifacts.",
+    )
+    serve_http_parser.add_argument(
+        "--lang",
+        default="rus+eng",
+        help="Default OCR language code for incoming HTTP requests.",
+    )
+
     args = parser.parse_args(argv)
     if args.version:
         from uniscan import __version__
@@ -342,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if any(result.output_pdf is not None for result in results) else 1
     if args.command == "benchmark-ocr":
         try:
-            page_numbers = _parse_page_numbers(args.pages)
+            page_numbers = parse_page_numbers(args.pages)
         except ValueError as exc:
             parser.error(str(exc))
         results = run_ocr_benchmark(
@@ -360,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "benchmark-ocr-canonical":
         try:
-            page_numbers = _parse_page_numbers(args.pages)
+            page_numbers = parse_page_numbers(args.pages)
         except ValueError as exc:
             parser.error(str(exc))
         results = run_ocr_canonical_package(
@@ -434,6 +462,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"output_pdf={summary.output_pdf_path}")
         if summary.overwritten_input_path is not None:
             print(f"overwritten={summary.overwritten_input_path}")
+        return 0
+    if args.command == "serve-http":
+        run_http_server(
+            host=args.host,
+            port=int(args.port),
+            work_root=args.work_root,
+            lang=args.lang,
+        )
         return 0
     return run_app()
 

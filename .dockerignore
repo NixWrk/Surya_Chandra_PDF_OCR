@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.cache
+outputs
+.hf_cache
+.tmp*
+.uv_cache
+OCRmypdf_plugins

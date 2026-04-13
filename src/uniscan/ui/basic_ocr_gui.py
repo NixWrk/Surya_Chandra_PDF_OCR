@@ -1,4 +1,4 @@
-"""Minimal OCR GUI: PDF file + mode selector + progress."""
+"""Minimal OCR GUI: input PDF + mode selection + progress + final PDF output."""
 
 from __future__ import annotations
 
@@ -9,33 +9,32 @@ import tkinter as tk
 
 from uniscan.app import (
     DEFAULT_BASIC_GUI_LANG,
-    MODE_BOTH,
-    MODE_HYBRID,
-    MODE_SURYA,
-    BasicOcrRunSummary,
-    MODE_TO_ENGINES,
+    PDF_MODE_CHANDRA,
+    PDF_MODE_HYBRID,
+    PDF_MODE_SURYA,
+    SearchablePdfSummary,
+    build_searchable_pdf,
     parse_page_numbers,
-    run_basic_ocr_benchmark,
 )
 
 
 DEFAULT_LANG = DEFAULT_BASIC_GUI_LANG
 
 MODE_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("Surya", MODE_SURYA),
-    ("Гибрид", MODE_HYBRID),
-    ("Оба", MODE_BOTH),
+    ("Chandra + Surya (default)", PDF_MODE_HYBRID),
+    ("Chandra", PDF_MODE_CHANDRA),
+    ("Surya", PDF_MODE_SURYA),
 )
 
 
 class BasicOcrGui(tk.Tk):
-    """Minimal launcher for running OCR benchmark on selected engines."""
+    """Minimal launcher for searchable PDF generation."""
 
     def __init__(self) -> None:
         super().__init__()
         self.title("UniScan Basic OCR")
-        self.geometry("760x260")
-        self.minsize(700, 240)
+        self.geometry("820x280")
+        self.minsize(760, 260)
 
         self.pdf_path_var = tk.StringVar()
         self.mode_label_var = tk.StringVar(value=MODE_OPTIONS[0][0])
@@ -65,20 +64,20 @@ class BasicOcrGui(tk.Tk):
 
         row_mode = ttk.Frame(root)
         row_mode.pack(fill=tk.X, pady=(0, 12))
-        ttk.Label(row_mode, text="Модель:", width=12).pack(side=tk.LEFT)
+        ttk.Label(row_mode, text="Режим:", width=12).pack(side=tk.LEFT)
         mode_labels = [label for label, _value in MODE_OPTIONS]
         self.mode_combo = ttk.Combobox(
             row_mode,
             values=mode_labels,
             textvariable=self.mode_label_var,
             state="readonly",
-            width=20,
+            width=28,
         )
         self.mode_combo.pack(side=tk.LEFT, padx=(0, 8))
         self.mode_combo.current(0)
         ttk.Label(
             row_mode,
-            text="Гибрид = Chandra (совмещение с доступной геометрией в пайплайне)",
+            text="По умолчанию: Chandra text + Surya geometry.",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         row_pages = ttk.Frame(root)
@@ -117,12 +116,12 @@ class BasicOcrGui(tk.Tk):
         if path:
             self.pdf_path_var.set(path)
 
-    def _selected_mode_key(self) -> str:
+    def _selected_mode(self) -> str:
         selected = self.mode_label_var.get().strip()
         for label, key in MODE_OPTIONS:
             if selected == label:
                 return key
-        return MODE_SURYA
+        return PDF_MODE_HYBRID
 
     def _set_running(self, running: bool) -> None:
         state = tk.DISABLED if running else tk.NORMAL
@@ -138,13 +137,11 @@ class BasicOcrGui(tk.Tk):
         try:
             pdf_path = Path(self.pdf_path_var.get().strip())
             if not pdf_path.exists() or not pdf_path.is_file():
-                raise RuntimeError("Выбери существующий PDF файл.")
+                raise RuntimeError("Выберите существующий PDF файл.")
             if pdf_path.suffix.lower() != ".pdf":
                 raise RuntimeError("Поддерживается только PDF.")
 
-            mode_key = self._selected_mode_key()
-            if mode_key not in MODE_TO_ENGINES:
-                raise RuntimeError("Не удалось определить выбранный режим.")
+            mode = self._selected_mode()
             page_numbers = parse_page_numbers(self.pages_var.get())
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc))
@@ -157,7 +154,7 @@ class BasicOcrGui(tk.Tk):
 
         self._worker = threading.Thread(
             target=self._run_worker,
-            args=(pdf_path, mode_key, page_numbers),
+            args=(pdf_path, mode, page_numbers),
             daemon=True,
         )
         self._worker.start()
@@ -165,15 +162,18 @@ class BasicOcrGui(tk.Tk):
     def _run_worker(
         self,
         pdf_path: Path,
-        mode_key: str,
+        mode: str,
         page_numbers: tuple[int, ...] | None,
     ) -> None:
         try:
-            summary = run_basic_ocr_benchmark(
+            summary = build_searchable_pdf(
                 pdf_path=pdf_path,
-                mode_key=mode_key,
+                mode=mode,
                 page_numbers=page_numbers,
                 lang=DEFAULT_LANG,
+                strict=True,
+                overwrite_input_path=True,
+                return_bytes=False,
                 progress=self._queue_progress,
             )
             self.after(0, self._ui_done, summary)
@@ -189,30 +189,28 @@ class BasicOcrGui(tk.Tk):
         self.progress_text_var.set(f"{bounded}%")
         self.status_var.set(status)
 
-    def _ui_done(self, summary: BasicOcrRunSummary) -> None:
+    def _ui_done(self, summary: SearchablePdfSummary) -> None:
         self._set_running(False)
         self._ui_set_progress(100, "Завершено")
-        result_lines = "\n".join(str(path) for path in summary.result_files if path.exists())
-        if not result_lines:
-            result_lines = "(файлы отчётов не найдены)"
 
         extra_lines: list[str] = []
-        if summary.skipped_engines:
+        if summary.benchmark.skipped_engines:
             extra_lines.append("Пропущены (нет зависимостей):")
-            extra_lines.extend(summary.skipped_engines)
+            extra_lines.extend(summary.benchmark.skipped_engines)
             extra_lines.append("")
-        if summary.failed_engines:
+        if summary.benchmark.failed_engines:
             extra_lines.append("С ошибкой:")
-            extra_lines.extend(summary.failed_engines)
+            extra_lines.extend(summary.benchmark.failed_engines)
             extra_lines.append("")
         extra = ("\n".join(extra_lines)).strip()
         details_block = f"\n\n{extra}" if extra else ""
 
         messagebox.showinfo(
             "Готово",
-            "OCR выполнен.\n\n"
-            f"Папка результата:\n{summary.run_dir}\n\n"
-            f"Отчёты:\n{result_lines}"
+            "Searchable PDF собран.\n\n"
+            f"Режим: {summary.mode}\n"
+            f"Итоговый PDF:\n{summary.output_pdf_path}\n\n"
+            f"Папка run-артефактов:\n{summary.run_dir}"
             f"{details_block}",
         )
 
@@ -230,4 +228,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
