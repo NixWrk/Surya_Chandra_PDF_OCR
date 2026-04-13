@@ -13,6 +13,7 @@ python -m uniscan benchmark-ocr --help
 python -m uniscan prepare-compare-txt --help
 python -m uniscan build-searchable-from-artifacts --help
 python -m uniscan compare-chandra-geometry --help
+python -m uniscan searchable-pdf --help
 ```
 
 ## Сервисный слой (web-ready)
@@ -23,6 +24,53 @@ python -m uniscan compare-chandra-geometry --help
 - `src/uniscan/app/ocr_pipeline.py` — оркестрация OCR/артефактных workflow
 
 Базовый GUI использует именно этот слой, а не shell-команды напрямую.
+
+## Контракт Вход/Выход PDF
+
+По умолчанию система работает в режиме `chandra+surya`:
+
+- OCR-текст: `chandra`
+- Геометрия: `surya`
+
+Поддерживаемые режимы (`mode`):
+
+1. `chandra`
+2. `surya`
+3. `chandra+surya` (по умолчанию)
+
+### Если на вход передан путь к PDF
+
+Входной файл перезаписывается итоговым searchable PDF.
+
+```powershell
+python -m uniscan searchable-pdf `
+  --pdf "D:\path\input.pdf" `
+  --mode chandra+surya
+```
+
+### Если на вход переданы bytes PDF (например upload в web/gui)
+
+Используйте Python API `build_searchable_pdf(...)` и получайте `output_pdf_bytes`.
+
+```python
+from uniscan.app import build_searchable_pdf
+
+result = build_searchable_pdf(
+    pdf_bytes=uploaded_pdf_bytes,
+    mode="chandra+surya",  # default
+)
+
+searchable_pdf_bytes = result.output_pdf_bytes
+```
+
+### Дополнительно: обработка выбранных страниц
+
+```powershell
+python -m uniscan searchable-pdf `
+  --pdf "D:\path\input.pdf" `
+  --mode chandra `
+  --pages 1,3,5-8
+```
 
 ## Базовый GUI (минимальный)
 

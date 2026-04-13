@@ -8,6 +8,11 @@ from .ocr_pipeline import (
     MODE_TO_ENGINES,
     BasicOcrRunSummary,
     ChandraGeometryVariantsSummary,
+    PDF_MODE_CHANDRA,
+    PDF_MODE_HYBRID,
+    PDF_MODE_SURYA,
+    SearchablePdfSummary,
+    build_searchable_pdf,
     build_chandra_geometry_variants,
     run_basic_ocr_benchmark,
 )
@@ -19,10 +24,14 @@ __all__ = [
     "MODE_HYBRID",
     "MODE_SURYA",
     "MODE_TO_ENGINES",
+    "PDF_MODE_CHANDRA",
+    "PDF_MODE_HYBRID",
+    "PDF_MODE_SURYA",
     "BasicOcrRunSummary",
     "ChandraGeometryVariantsSummary",
+    "SearchablePdfSummary",
+    "build_searchable_pdf",
     "build_chandra_geometry_variants",
     "parse_page_numbers",
     "run_basic_ocr_benchmark",
 ]
-

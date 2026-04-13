@@ -5,7 +5,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from uniscan.app import build_chandra_geometry_variants, parse_page_numbers
+from uniscan.app import (
+    PDF_MODE_CHANDRA,
+    PDF_MODE_HYBRID,
+    PDF_MODE_SURYA,
+    build_chandra_geometry_variants,
+    build_searchable_pdf,
+    parse_page_numbers,
+)
 from uniscan.ocr import (
     build_compare_txt_from_benchmark,
     run_artifact_searchable_package,
@@ -274,6 +281,48 @@ def main(argv: list[str] | None = None) -> int:
         help="Return non-zero exit code when any stage failed.",
     )
 
+    searchable_pdf_parser = subparsers.add_parser(
+        "searchable-pdf",
+        help=(
+            "Process one PDF and return one searchable PDF. "
+            "By default runs hybrid chandra+surya mode and overwrites input path."
+        ),
+    )
+    searchable_pdf_parser.add_argument(
+        "--pdf",
+        required=True,
+        type=Path,
+        help="Input PDF path. The file is overwritten with searchable output.",
+    )
+    searchable_pdf_parser.add_argument(
+        "--mode",
+        choices=[PDF_MODE_CHANDRA, PDF_MODE_SURYA, PDF_MODE_HYBRID],
+        default=PDF_MODE_HYBRID,
+        help="OCR mode. Default: chandra+surya.",
+    )
+    searchable_pdf_parser.add_argument(
+        "--pages",
+        nargs="+",
+        default=None,
+        help="Optional 1-based pages (for example: --pages 1,3,5-8).",
+    )
+    searchable_pdf_parser.add_argument(
+        "--lang",
+        default="rus+eng",
+        help="OCR language code passed to benchmark stage.",
+    )
+    searchable_pdf_parser.add_argument(
+        "--work-root",
+        default=None,
+        type=Path,
+        help="Optional workspace for intermediate run artifacts.",
+    )
+    searchable_pdf_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero exit code on any failed stage.",
+    )
+
     args = parser.parse_args(argv)
     if args.version:
         from uniscan import __version__
@@ -364,6 +413,27 @@ def main(argv: list[str] | None = None) -> int:
         print("variants:")
         print("  - chandra_text__chandra_geometry")
         print("  - chandra_text__surya_geometry")
+        return 0
+    if args.command == "searchable-pdf":
+        try:
+            page_numbers = parse_page_numbers(args.pages)
+        except ValueError as exc:
+            parser.error(str(exc))
+        summary = build_searchable_pdf(
+            pdf_path=args.pdf,
+            mode=args.mode,
+            page_numbers=page_numbers,
+            lang=args.lang,
+            work_root=args.work_root,
+            strict=bool(args.strict),
+            overwrite_input_path=True,
+            return_bytes=False,
+        )
+        print(f"mode={summary.mode}")
+        print(f"run_dir={summary.run_dir}")
+        print(f"output_pdf={summary.output_pdf_path}")
+        if summary.overwritten_input_path is not None:
+            print(f"overwritten={summary.overwritten_input_path}")
         return 0
     return run_app()
 
