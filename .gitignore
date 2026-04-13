@@ -9,6 +9,10 @@ __pycache__/
 .surya_cache/
 .ultralytics/
 .tmp/
+.tmp_bootstrap/
+.tmp_runtime/
+.tmp_pytest/
+pytest-cache-files-*/
 .uv_cache/
 .uv_python/
 .venv/

@@ -643,68 +643,52 @@ def _run_surya_module_cli(
     *,
     lang: str,
     work_dir: Path,
+    which_fn,
     run_cmd,
 ) -> tuple[str, int]:
     if len(image_paths) == 0:
         raise ValueError("No images for Surya OCR.")
 
-    input_dir = work_dir / "surya_input"
-    input_dir.mkdir(parents=True, exist_ok=True)
-    # Surya CLI consumes a directory. For pagewise mode we must isolate input
-    # files, otherwise every call re-processes all sibling pages and pollutes
-    # per-page artifacts with foreign text.
-    ordered_names: list[str] = []
-    for idx, image_path in enumerate(image_paths, start=1):
-        src = Path(image_path)
-        if not src.exists():
-            continue
-        if len(image_paths) == 1:
-            target_name = src.name
-        else:
-            target_name = f"{idx:04d}_{src.name}"
-        target = input_dir / target_name
-        shutil.copy2(src, target)
-        ordered_names.append(target_name)
+    def _stage_inputs() -> tuple[Path, list[str]]:
+        input_dir = work_dir / "surya_input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        # Surya CLI consumes a directory. For pagewise mode we must isolate
+        # files, otherwise every call re-processes sibling pages and pollutes
+        # per-page artifacts with foreign text.
+        ordered_names: list[str] = []
+        for idx, image_path in enumerate(image_paths, start=1):
+            src = Path(image_path)
+            if not src.exists():
+                continue
+            if len(image_paths) == 1:
+                target_name = src.name
+            else:
+                target_name = f"{idx:04d}_{src.name}"
+            target = input_dir / target_name
+            shutil.copy2(src, target)
+            ordered_names.append(target_name)
 
-    if not ordered_names:
-        raise RuntimeError("Surya input directory is empty after staging images.")
+        if not ordered_names:
+            raise RuntimeError("Surya input directory is empty after staging images.")
+        return input_dir, ordered_names
 
-    output_root = work_dir / "surya_out"
-    output_root.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MODEL_CACHE_DIR", str(_DEFAULT_SURYA_MODEL_CACHE_HOME))
-    os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
-    os.environ.setdefault("MODELSCOPE_CACHE", str(_DEFAULT_MODELSCOPE_CACHE_HOME))
-    # Surya opens images via PIL internally — lift the decompression-bomb
-    # guard so it can process high-resolution pages.
-    try:
-        from PIL import Image as _PIL_Image  # type: ignore
-        _PIL_Image.MAX_IMAGE_PIXELS = None
-    except Exception:
-        pass
-    from surya.scripts.ocr_text import ocr_text_cli
+    def _collect_results(
+        *,
+        output_root: Path,
+        input_dir: Path,
+        ordered_names: Sequence[str],
+    ) -> tuple[str, int]:
+        results_json = output_root / input_dir.name / "results.json"
+        if not results_json.exists():
+            raise RuntimeError(f"Surya did not produce results file: {results_json}")
 
-    args = [
-        str(input_dir),
-        "--output_dir",
-        str(output_root),
-    ]
-    try:
-        ocr_text_cli.main(args=args, standalone_mode=False)
-    except SystemExit as exc:
-        if int(getattr(exc, "code", 1) or 0) != 0:
-            raise RuntimeError(f"surya.scripts.ocr_text exited with code {exc.code}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"surya.scripts.ocr_text failed: {exc}") from exc
+        payload = json.loads(results_json.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("Surya results payload has unexpected format.")
 
-    results_json = output_root / input_dir.name / "results.json"
-    if not results_json.exists():
-        raise RuntimeError(f"Surya did not produce results file: {results_json}")
-
-    payload = json.loads(results_json.read_text(encoding="utf-8"))
-    collected: list[str] = []
-    sidecar_images: list[dict[str, Any]] = []
-    consumed = False
-    if isinstance(payload, dict):
+        collected: list[str] = []
+        sidecar_images: list[dict[str, Any]] = []
+        consumed = False
         for image_name in ordered_names:
             pages = payload.get(image_name)
             if not isinstance(pages, list):
@@ -752,28 +736,122 @@ def _run_surya_module_cli(
             if image_payload["pages"]:
                 sidecar_images.append(image_payload)
 
-    # Fallback for unknown payload layouts.
-    if not consumed:
-        for pages in payload.values():
-            if not isinstance(pages, list):
-                continue
-            for page in pages:
-                if not isinstance(page, dict):
+        # Fallback for unknown payload layouts.
+        if not consumed:
+            for pages in payload.values():
+                if not isinstance(pages, list):
                     continue
-                for line in page.get("text_lines", []):
-                    if isinstance(line, dict):
-                        text = (line.get("text") or "").strip()
-                        if text:
-                            collected.append(text)
-    if sidecar_images:
-        sidecar_path = work_dir / "surya_page_lines.json"
-        sidecar_path.write_text(
-            json.dumps({"images": sidecar_images}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+                for page in pages:
+                    if not isinstance(page, dict):
+                        continue
+                    for line in page.get("text_lines", []):
+                        if isinstance(line, dict):
+                            text = (line.get("text") or "").strip()
+                            if text:
+                                collected.append(text)
+        if sidecar_images:
+            sidecar_path = work_dir / "surya_page_lines.json"
+            sidecar_path.write_text(
+                json.dumps({"images": sidecar_images}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        text = "\n".join(collected)
+        return text, len(text)
+
+    def _run_cli_with_geometry(
+        *,
+        input_dir: Path,
+        ordered_names: Sequence[str],
+        output_root: Path,
+    ) -> tuple[str, int]:
+        surya_cmd = which_fn("surya_ocr") or which_fn("surya_ocr.exe")
+        if not surya_cmd:
+            raise RuntimeError("surya_ocr CLI was not found in PATH.")
+
+        errors: list[str] = []
+        candidate_commands = (
+            [str(surya_cmd), str(input_dir), "--output_dir", str(output_root)],
+            [str(surya_cmd), "--input", str(input_dir), "--output_dir", str(output_root)],
+        )
+        for command in candidate_commands:
+            proc = run_cmd(command, capture_output=True, text=True)
+            if int(getattr(proc, "returncode", 1)) != 0:
+                stderr = (getattr(proc, "stderr", "") or "").strip()
+                stdout = (getattr(proc, "stdout", "") or "").strip()
+                details = stderr or stdout or "unknown cli error"
+                errors.append(details)
+                continue
+            try:
+                return _collect_results(
+                    output_root=output_root,
+                    input_dir=input_dir,
+                    ordered_names=ordered_names,
+                )
+            except Exception as exc:
+                errors.append(str(exc))
+
+        if not errors:
+            raise RuntimeError("surya_ocr CLI failed without diagnostic output.")
+        raise RuntimeError(" | ".join(errors))
+
+    input_dir = work_dir / "surya_input"
+    ordered_names: list[str]
+    input_dir, ordered_names = _stage_inputs()
+
+    output_root = work_dir / "surya_out"
+    output_root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MODEL_CACHE_DIR", str(_DEFAULT_SURYA_MODEL_CACHE_HOME))
+    os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
+    os.environ.setdefault("MODELSCOPE_CACHE", str(_DEFAULT_MODELSCOPE_CACHE_HOME))
+    # Surya opens images via PIL internally — lift the decompression-bomb
+    # guard so it can process high-resolution pages.
+    try:
+        from PIL import Image as _PIL_Image  # type: ignore
+        _PIL_Image.MAX_IMAGE_PIXELS = None
+    except Exception:
+        pass
+    try:
+        from surya.scripts.ocr_text import ocr_text_cli
+    except Exception:
+        return _run_cli_with_geometry(
+            input_dir=input_dir,
+            ordered_names=ordered_names,
+            output_root=output_root,
         )
 
-    text = "\n".join(collected)
-    return text, len(text)
+    args = [
+        str(input_dir),
+        "--output_dir",
+        str(output_root),
+    ]
+    try:
+        ocr_text_cli.main(args=args, standalone_mode=False)
+    except SystemExit as exc:
+        if int(getattr(exc, "code", 1) or 0) != 0:
+            return _run_cli_with_geometry(
+                input_dir=input_dir,
+                ordered_names=ordered_names,
+                output_root=output_root,
+            )
+    except Exception as exc:
+        return _run_cli_with_geometry(
+            input_dir=input_dir,
+            ordered_names=ordered_names,
+            output_root=output_root,
+        )
+    try:
+        return _collect_results(
+            output_root=output_root,
+            input_dir=input_dir,
+            ordered_names=ordered_names,
+        )
+    except Exception:
+        return _run_cli_with_geometry(
+            input_dir=input_dir,
+            ordered_names=ordered_names,
+            output_root=output_root,
+        )
 
 
 def _run_mineru_module_cli(
@@ -958,7 +1036,13 @@ def _run_surya_direct(
 ) -> tuple[str, int]:
     module_error: Exception | None = None
     try:
-        return _run_surya_module_cli(image_paths, lang=lang, work_dir=work_dir, run_cmd=run_cmd)
+        return _run_surya_module_cli(
+            image_paths,
+            lang=lang,
+            work_dir=work_dir,
+            which_fn=which_fn,
+            run_cmd=run_cmd,
+        )
     except Exception as exc:
         module_error = exc
 

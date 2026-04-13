@@ -14,6 +14,39 @@ python -m uniscan prepare-compare-txt --help
 python -m uniscan build-searchable-from-artifacts --help
 ```
 
+## Базовый GUI (минимальный)
+
+```powershell
+.\run_basic_gui.cmd
+```
+
+Что делает:
+
+1. Создаёт `.venv` прямо в этом репозитории.
+2. Устанавливает проект и OCR-движки в локальный `.venv` (`surya-ocr`, `chandra-ocr[hf]`, `pypdf`, `reportlab` и др.).
+3. Запускает минимальный GUI:
+   - выбор одного PDF,
+   - выбор режима: `Surya` / `Гибрид` / `Оба`,
+   - выбор страниц (например: `1,3,5-8`, пусто = все страницы),
+   - индикатор прогресса выполнения.
+
+Примечание:
+
+- `Гибрид` в этом GUI запускает движок `chandra` (гибридная ветка проекта: текст Chandra + Surya-геометрия в пайплайне).
+
+## Сравнение геометрии (Chandra text)
+
+Собрать два searchable PDF с одинаковым `chandra`-текстом и разной геометрией:
+
+```powershell
+.\scripts\compare_chandra_geometry_variants.ps1 `
+  -RunRoot "D:\Git_Code\Surya_Chandra_PDF_OCR\outputs\basic_gui_runs\ГОСТ с плохим качеством скана_20260410_182529" `
+  -PdfRoot "O:\OBS_TEST\PDF2OBS\PDFS"
+```
+
+Подробный воспроизводимый путь зафиксирован в:
+`docs/benchmark_runs/2026-04-13_chandra_geometry_compare_path.md`
+
 ## Что внутри
 
 - OCR benchmark matrix и артефактный pipeline

@@ -992,13 +992,30 @@ def _load_surya_page_geometry(
 ) -> dict[int, dict[str, object]]:
     if engine_dir_override is not None:
         root_engine_dir = Path(engine_dir_override)
+        pages_json_candidates = [
+            root_engine_dir / "pages.json",
+            root_engine_dir / "surya" / "pages.json",
+            root_engine_dir / "chandra" / "pages.json",
+            root_engine_dir / engine / "pages.json",
+        ]
     else:
         root_engine_dir = compare_dir.parent / engine
-    pages_json_candidates = [
-        root_engine_dir / "pages.json",
-        root_engine_dir / engine / "pages.json",
-    ]
+        pages_json_candidates = [
+            root_engine_dir / "pages.json",
+            root_engine_dir / engine / "pages.json",
+        ]
     pages_json_path = next((path for path in pages_json_candidates if path.exists()), None)
+    if pages_json_path is None and engine_dir_override is not None and root_engine_dir.exists():
+        nested_pages = sorted(root_engine_dir.rglob("pages.json"), key=lambda item: len(item.parts))
+        preferred = next(
+            (
+                path
+                for path in nested_pages
+                if path.parent.name.strip().lower() in {"surya", "chandra"}
+            ),
+            None,
+        )
+        pages_json_path = preferred if preferred is not None else (nested_pages[0] if nested_pages else None)
     if pages_json_path is None:
         return {}
     engine_dir = pages_json_path.parent
