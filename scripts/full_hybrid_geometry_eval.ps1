@@ -13,7 +13,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Resolve-CheckedFile {
+function Resolve-CheckedPathFile {
     param(
         [Parameter(Mandatory = $true)]
         [string]$PathValue,
@@ -23,8 +23,21 @@ function Resolve-CheckedFile {
         throw "${Label} not found: $PathValue"
     }
     $item = Get-Item -LiteralPath $PathValue
-    if (-not $item.PSIsContainer -and $item.Extension -ieq ".pdf") {
+    if (-not $item.PSIsContainer) {
         return (Resolve-Path -LiteralPath $PathValue).Path
+    }
+    throw "${Label} is not a file: $PathValue"
+}
+
+function Resolve-CheckedPdfFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PathValue,
+        [string]$Label = "PDF"
+    )
+    $resolved = Resolve-CheckedPathFile -PathValue $PathValue -Label $Label
+    if ([System.IO.Path]::GetExtension($resolved) -ieq ".pdf") {
+        return $resolved
     }
     throw "${Label} is not a PDF file: $PathValue"
 }
@@ -135,9 +148,9 @@ function Invoke-HybridVariantBuild {
 }
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
-$pythonResolved = Resolve-CheckedFile -PathValue (Join-Path $repoRoot $Python) -Label "Python"
-$gostPdfResolved = Resolve-CheckedFile -PathValue $GostPdf -Label "Gost PDF"
-$bookPdfResolved = Resolve-CheckedFile -PathValue $BookPdf -Label "Book PDF"
+$pythonResolved = Resolve-CheckedPathFile -PathValue (Join-Path $repoRoot $Python) -Label "Python"
+$gostPdfResolved = Resolve-CheckedPdfFile -PathValue $GostPdf -Label "Gost PDF"
+$bookPdfResolved = Resolve-CheckedPdfFile -PathValue $BookPdf -Label "Book PDF"
 $pdfRootResolved = Resolve-CheckedDir -PathValue $PdfRoot -Label "PDF root"
 
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
