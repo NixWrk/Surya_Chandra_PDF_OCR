@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,12 +13,15 @@ from uniscan.export import export_pages_as_pdf
 from uniscan.ocr.artifact_searchable import (
     _align_token_indices,
     _assign_lines_to_boxes,
+    _blend_placements_vertical,
     _build_searchable_pdf_from_text,
+    _build_geometry_candidates,
     _estimate_page_split_weights,
     _expand_lines_to_target_count,
     _geometry_boxes_in_reading_order,
     _geometry_lines_in_reading_order,
     _has_explicit_page_markers,
+    _normalize_hybrid_policy,
     _normalize_alignment_token,
     _placements_from_chandra_text_aligned_to_geometry,
     _placements_from_geometry_text_with_linefit,
@@ -175,6 +179,14 @@ def test_align_token_indices_matches_monotonic_sequence() -> None:
     assert score > 0
 
 
+def test_normalize_hybrid_policy_accepts_aliases() -> None:
+    assert _normalize_hybrid_policy(None) == "auto"
+    assert _normalize_hybrid_policy("surya") == "surya_only"
+    assert _normalize_hybrid_policy("soft-line") == "softline"
+    with pytest.raises(ValueError):
+        _normalize_hybrid_policy("unknown")
+
+
 def test_placements_from_chandra_text_aligned_to_geometry_uses_geometry_boxes() -> None:
     page_lines = [
         "ИНСТРУМЕНТЫ МЕДИЦИНСКИЕ",
@@ -224,6 +236,60 @@ def test_placements_from_chandra_text_aligned_to_geometry_handles_spread_rowwise
     assert coverage > 0.95
     texts = [text.strip() for _, text in placements if text.strip()]
     assert texts[:4] == ["L1", "R1", "L2", "R2"]
+
+
+def test_build_geometry_candidates_prefers_secondary_when_primary_weak() -> None:
+    page_lines = ["INSTRUMENTS MEDICAL", "METALLIC"]
+    primary_page = {
+        "image_width": 1000.0,
+        "image_height": 1000.0,
+        "lines": [
+            {"text": "foo bar", "bbox": [100.0, 100.0, 380.0, 145.0]},
+            {"text": "baz", "bbox": [100.0, 190.0, 300.0, 235.0]},
+        ],
+    }
+    secondary_page = {
+        "image_width": 1000.0,
+        "image_height": 1000.0,
+        "lines": [
+            {"text": "INSTRUMENTS", "bbox": [100.0, 100.0, 320.0, 145.0]},
+            {"text": "MEDICAL", "bbox": [340.0, 100.0, 600.0, 145.0]},
+            {"text": "METALLIC", "bbox": [100.0, 190.0, 500.0, 235.0]},
+        ],
+    }
+    line_boxes = [(95.0, 95.0, 610.0, 150.0), (95.0, 186.0, 510.0, 240.0)]
+    candidates = _build_geometry_candidates(
+        page_lines=page_lines,
+        page_width=1000.0,
+        page_height=1000.0,
+        line_boxes=line_boxes,
+        primary_page_data=primary_page,
+        secondary_page_data=secondary_page,
+    )
+    assert candidates
+    assert candidates[0].source == "secondary"
+    assert candidates[0].coverage >= 0.8
+
+
+def test_blend_placements_vertical_moves_tokens_towards_reference_lines() -> None:
+    placements = [
+        ((10.0, 100.0, 60.0, 120.0), "A"),
+        ((10.0, 200.0, 70.0, 220.0), "B"),
+    ]
+    reference_boxes = [
+        (0.0, 110.0, 150.0, 130.0),
+        (0.0, 210.0, 150.0, 230.0),
+    ]
+    blended = _blend_placements_vertical(
+        placements=placements,
+        reference_boxes=reference_boxes,
+        page_height=1000.0,
+    )
+    assert len(blended) == 2
+    assert blended[0][0][0] == pytest.approx(10.0)
+    assert blended[0][0][2] == pytest.approx(60.0)
+    assert blended[0][0][1] > 100.0
+    assert blended[0][0][3] > 120.0
 
 
 def test_expand_lines_to_target_count_splits_long_lines() -> None:
@@ -683,6 +749,101 @@ def test_run_artifact_searchable_package_uses_chandra_geometry_on_pdf_name_misma
     assert rows[0].searchable_pdf_path is not None
     extracted = _extract_pdf_text(Path(rows[0].searchable_pdf_path))
     assert "GEOMETRY STILL APPLIED" in extracted
+
+
+def test_run_artifact_searchable_package_writes_geometry_debug_log(tmp_path: Path) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+
+    doc_name = "fixture_doc"
+    _build_sample_pdf(pdf_root, doc_name, [50, 80])
+    (compare_dir / f"{doc_name}__chandra.txt").write_text(
+        "[SOURCE PAGE 1]\nCHANDRA PAGE ONE\n[SOURCE PAGE 2]\nCHANDRA PAGE TWO\n",
+        encoding="utf-8",
+    )
+
+    def _write_pages(root: Path, geometry_type: str, prefix: str, text1: str, text2: str) -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "pages.json").write_text(
+            json.dumps(
+                {
+                    "pdf_path": str(pdf_root / f"{doc_name}.pdf"),
+                    "engine": prefix,
+                    "pages": [
+                        {"source_page": 1, "geometry_file": f"page_0001.{prefix}.json", "geometry_type": geometry_type},
+                        {"source_page": 2, "geometry_file": f"page_0002.{prefix}.json", "geometry_type": geometry_type},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / f"page_0001.{prefix}.json").write_text(
+            json.dumps(
+                {
+                    "images": [
+                        {"image_name": "00001.png", "pages": [{"image_bbox": [0, 0, 300, 200], "text_lines": [{"text": text1, "bbox": [20, 20, 280, 60]}]}]}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / f"page_0002.{prefix}.json").write_text(
+            json.dumps(
+                {
+                    "images": [
+                        {"image_name": "00002.png", "pages": [{"image_bbox": [0, 0, 300, 200], "text_lines": [{"text": text2, "bbox": [20, 120, 280, 160]}]}]}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    _write_pages(
+        compare_dir.parent / "chandra",
+        geometry_type="chandra_text_lines",
+        prefix="chandra",
+        text1="CHANDRA PAGE ONE",
+        text2="CHANDRA PAGE TWO",
+    )
+    surya_override = tmp_path / "surya_override"
+    _write_pages(
+        surya_override / "surya",
+        geometry_type="surya_text_lines",
+        prefix="surya",
+        text1="SURYA PAGE ONE",
+        text2="SURYA PAGE TWO",
+    )
+
+    old_geom = os.environ.get("UNISCAN_CHANDRA_GEOMETRY_DIR")
+    try:
+        os.environ["UNISCAN_CHANDRA_GEOMETRY_DIR"] = str(surya_override / "surya")
+        rows = run_artifact_searchable_package(
+            compare_dir=compare_dir,
+            pdf_root=pdf_root,
+            output_dir=output_dir,
+            engines=("chandra",),
+            chandra_geometry_policy="auto",
+            geometry_debug_log=True,
+        )
+    finally:
+        if old_geom is None:
+            os.environ.pop("UNISCAN_CHANDRA_GEOMETRY_DIR", None)
+        else:
+            os.environ["UNISCAN_CHANDRA_GEOMETRY_DIR"] = old_geom
+
+    assert len(rows) == 1
+    assert rows[0].status == "ok"
+    assert rows[0].geometry_log_path is not None
+    log_path = Path(rows[0].geometry_log_path)
+    assert log_path.exists()
+    payload = json.loads(log_path.read_text(encoding="utf-8"))
+    assert payload["policy"] == "auto"
+    assert len(payload["pages"]) == 2
+    assert payload["pages"][0]["page"] == 1
+    assert payload["pages"][0]["candidate_count"] >= 1
 
 
 def test_run_artifact_searchable_package_require_markers(tmp_path: Path) -> None:

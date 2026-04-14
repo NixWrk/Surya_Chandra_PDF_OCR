@@ -225,6 +225,30 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Require explicit page markers in TXT artifacts ([SOURCE PAGE N] or form-feed).",
     )
+    artifact_searchable_parser.add_argument(
+        "--chandra-geometry-policy",
+        choices=("auto", "surya_only", "softline"),
+        default="auto",
+        help=(
+            "Hybrid placement policy for chandra artifacts when geometry override is used. "
+            "'auto' picks the best per page; 'surya_only' forces surya geometry; "
+            "'softline' keeps surya geometry with softer line-level blending."
+        ),
+    )
+    artifact_searchable_parser.add_argument(
+        "--chandra-blend-weight",
+        type=float,
+        default=None,
+        help=(
+            "Optional vertical blend weight for primary geometry (0..1). "
+            "Only used when blending is enabled by policy."
+        ),
+    )
+    artifact_searchable_parser.add_argument(
+        "--geometry-debug-log",
+        action="store_true",
+        help="Write per-page geometry selection logs for chandra outputs.",
+    )
 
     compare_prepare_parser = subparsers.add_parser(
         "prepare-compare-txt",
@@ -414,6 +438,9 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output,
             engines=tuple(args.engines) if args.engines else None,
             require_page_markers=bool(args.require_page_markers or args.strict),
+            chandra_geometry_policy=args.chandra_geometry_policy,
+            chandra_blend_primary_y_weight=args.chandra_blend_weight,
+            geometry_debug_log=bool(args.geometry_debug_log),
         )
         print(summarize_artifact_searchable_package(results))
         if args.strict and any(result.status != "ok" for result in results):

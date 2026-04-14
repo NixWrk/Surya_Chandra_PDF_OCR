@@ -27,6 +27,7 @@ class ArtifactSearchableResult:
     text_chars: int
     elapsed_seconds: float
     error: str | None = None
+    geometry_log_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -38,8 +39,28 @@ class CompareTxtBuildResult:
     error: str | None = None
 
 
+@dataclass(slots=True)
+class _PlacementCandidate:
+    source: str
+    strategy: str
+    placements: list[tuple[tuple[float, float, float, float], str]]
+    coverage: float
+    line_fit: float
+    token_ratio: float
+    score: float
+
+
 _PAGE_MARKER_RE = re.compile(r"^\s*\[SOURCE PAGE\s+(\d+)\]\s*$", re.IGNORECASE | re.MULTILINE)
 _TOKEN_RE = re.compile(r"\S+")
+
+_HYBRID_ALIGN_MIN_COVERAGE = 0.60
+_HYBRID_WEAK_COVERAGE = 0.45
+_HYBRID_BLEND_PRIMARY_Y_WEIGHT = 0.35
+_HYBRID_SOFT_BLEND_PRIMARY_Y_WEIGHT = 0.75
+
+_HYBRID_POLICY_AUTO = "auto"
+_HYBRID_POLICY_SURYA_ONLY = "surya_only"
+_HYBRID_POLICY_SOFTLINE = "softline"
 
 _ALIGN_CHAR_FOLD = {
     # Cyrillic -> ASCII-like fold
@@ -861,6 +882,255 @@ def _placements_from_chandra_text_aligned_to_geometry(
     return (placements, best_coverage)
 
 
+def _count_tokens_in_lines(lines: Sequence[str]) -> int:
+    return sum(len(_TOKEN_RE.findall(line)) for line in lines if line)
+
+
+def _count_tokens_in_placements(
+    placements: Sequence[tuple[tuple[float, float, float, float], str]]
+) -> int:
+    return sum(len(_TOKEN_RE.findall(text)) for _, text in placements if text)
+
+
+def _line_fit_score(*, source_line_count: int, geometry_line_count: int) -> float:
+    if source_line_count <= 0:
+        return 0.0
+    delta = abs(source_line_count - max(0, geometry_line_count))
+    return max(0.0, 1.0 - (float(delta) / float(max(1, source_line_count))))
+
+
+def _coverage_between_line_sets(
+    *,
+    source_lines: Sequence[str],
+    target_lines: Sequence[str],
+) -> float:
+    source_tokens = [_normalize_alignment_token(token) for token in _TOKEN_RE.findall(" ".join(source_lines))]
+    target_tokens = [_normalize_alignment_token(token) for token in _TOKEN_RE.findall(" ".join(target_lines))]
+    source_tokens = [token for token in source_tokens if token]
+    target_tokens = [token for token in target_tokens if token]
+    if not source_tokens or not target_tokens:
+        return 0.0
+    _aligned, coverage, _score = _align_token_indices(
+        source_tokens=source_tokens,
+        target_tokens=target_tokens,
+    )
+    return float(max(0.0, min(1.0, coverage)))
+
+
+def _candidate_score(
+    *,
+    coverage: float,
+    line_fit: float,
+    token_ratio: float,
+    source: str,
+    strategy: str,
+) -> float:
+    score = (0.62 * coverage) + (0.20 * line_fit) + (0.13 * token_ratio)
+    if source == "primary":
+        score += 0.03
+    if strategy == "align":
+        score += 0.02
+
+    if strategy == "align" and source == "primary" and coverage < _HYBRID_ALIGN_MIN_COVERAGE:
+        score -= 0.18
+    if coverage < _HYBRID_WEAK_COVERAGE:
+        score -= 0.22
+    return score
+
+
+def _normalize_hybrid_policy(raw: str | None) -> str:
+    value = (raw or "").strip().lower()
+    if value in {"", _HYBRID_POLICY_AUTO}:
+        return _HYBRID_POLICY_AUTO
+    if value in {_HYBRID_POLICY_SURYA_ONLY, "surya-only", "surya"}:
+        return _HYBRID_POLICY_SURYA_ONLY
+    if value in {_HYBRID_POLICY_SOFTLINE, "soft", "soft_line", "soft-line"}:
+        return _HYBRID_POLICY_SOFTLINE
+    raise ValueError(
+        "Unsupported hybrid geometry policy. Use one of: auto, surya_only, softline."
+    )
+
+
+def _env_truthy(name: str) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _top_candidate_logs(
+    candidates: Sequence[_PlacementCandidate],
+    *,
+    topn: int = 4,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for item in list(candidates)[: max(1, int(topn))]:
+        rows.append(
+            {
+                "source": item.source,
+                "strategy": item.strategy,
+                "score": round(float(item.score), 6),
+                "coverage": round(float(item.coverage), 6),
+                "line_fit": round(float(item.line_fit), 6),
+                "token_ratio": round(float(item.token_ratio), 6),
+                "placements": len(item.placements),
+            }
+        )
+    return rows
+
+
+def _blend_placements_vertical(
+    *,
+    placements: Sequence[tuple[tuple[float, float, float, float], str]],
+    reference_boxes: Sequence[tuple[float, float, float, float]],
+    page_height: float,
+    primary_y_weight: float = _HYBRID_BLEND_PRIMARY_Y_WEIGHT,
+) -> list[tuple[tuple[float, float, float, float], str]]:
+    if not placements or not reference_boxes:
+        return list(placements)
+
+    weight = min(max(float(primary_y_weight), 0.0), 1.0)
+    blended: list[tuple[tuple[float, float, float, float], str]] = []
+    for bbox, text in placements:
+        x0, y0, x1, y1 = bbox
+        cy = (y0 + y1) * 0.5
+        best_box = min(reference_boxes, key=lambda item: abs(((item[1] + item[3]) * 0.5) - cy))
+        ry0 = float(best_box[1])
+        ry1 = float(best_box[3])
+        ref_height = max(ry1 - ry0, 0.5)
+        if abs(((ry0 + ry1) * 0.5) - cy) > (ref_height * 2.2):
+            blended.append((bbox, text))
+            continue
+
+        by0 = (y0 * weight) + (ry0 * (1.0 - weight))
+        by1 = (y1 * weight) + (ry1 * (1.0 - weight))
+        by0 = min(max(by0, 0.0), max(page_height - 0.5, 0.0))
+        by1 = min(max(by1, by0 + 0.5), max(page_height, by0 + 0.5))
+        blended.append(((x0, by0, x1, by1), text))
+    return blended
+
+
+def _build_geometry_candidates(
+    *,
+    page_lines: Sequence[str],
+    page_width: float,
+    page_height: float,
+    line_boxes: Sequence[tuple[float, float, float, float]],
+    primary_page_data: dict[str, object] | None,
+    secondary_page_data: dict[str, object] | None,
+) -> list[_PlacementCandidate]:
+    token_count = max(1, _count_tokens_in_lines(page_lines))
+    source_line_count = len([line for line in page_lines if line.strip()])
+    candidates: list[_PlacementCandidate] = []
+
+    for source_name, page_data in (("primary", primary_page_data), ("secondary", secondary_page_data)):
+        if not isinstance(page_data, dict):
+            continue
+        geometry_boxes = _geometry_boxes_in_reading_order(
+            page_data=page_data,
+            page_width=page_width,
+            page_height=page_height,
+        )
+        geometry_lines = _geometry_lines_in_reading_order(
+            page_data=page_data,
+            page_width=page_width,
+            page_height=page_height,
+        )
+        line_fit = _line_fit_score(
+            source_line_count=source_line_count,
+            geometry_line_count=len(geometry_boxes),
+        )
+        geometry_text_coverage = _coverage_between_line_sets(
+            source_lines=page_lines,
+            target_lines=geometry_lines,
+        )
+
+        placements_align, align_coverage = _placements_from_chandra_text_aligned_to_geometry(
+            page_lines=page_lines,
+            page_data=page_data,
+            page_width=page_width,
+            page_height=page_height,
+        )
+        if placements_align:
+            token_ratio = min(1.0, float(_count_tokens_in_placements(placements_align)) / float(token_count))
+            coverage = max(align_coverage, geometry_text_coverage)
+            candidates.append(
+                _PlacementCandidate(
+                    source=source_name,
+                    strategy="align",
+                    placements=placements_align,
+                    coverage=coverage,
+                    line_fit=line_fit,
+                    token_ratio=token_ratio,
+                    score=_candidate_score(
+                        coverage=coverage,
+                        line_fit=line_fit,
+                        token_ratio=token_ratio,
+                        source=source_name,
+                        strategy="align",
+                    ),
+                )
+            )
+
+        fit_lines = list(page_lines)
+        if geometry_boxes and fit_lines:
+            min_target = max(1, int(len(geometry_boxes) * 0.85))
+            if len(fit_lines) < min_target:
+                fit_lines = _expand_lines_to_target_count(
+                    fit_lines,
+                    target_count=min_target,
+                )
+        placements_assign = _assign_lines_to_boxes(fit_lines, geometry_boxes)
+        if placements_assign:
+            token_ratio = min(1.0, float(_count_tokens_in_placements(placements_assign)) / float(token_count))
+            coverage = max(geometry_text_coverage, line_fit * 0.82)
+            candidates.append(
+                _PlacementCandidate(
+                    source=source_name,
+                    strategy="assign",
+                    placements=placements_assign,
+                    coverage=coverage,
+                    line_fit=line_fit,
+                    token_ratio=token_ratio,
+                    score=_candidate_score(
+                        coverage=coverage,
+                        line_fit=line_fit,
+                        token_ratio=token_ratio,
+                        source=source_name,
+                        strategy="assign",
+                    ),
+                )
+            )
+
+        placements_linefit = _placements_from_geometry_text_with_linefit(
+            page_data=page_data,
+            page_width=page_width,
+            page_height=page_height,
+            line_boxes=line_boxes,
+        )
+        if placements_linefit:
+            token_ratio = min(1.0, float(_count_tokens_in_placements(placements_linefit)) / float(token_count))
+            coverage = max(geometry_text_coverage, line_fit * 0.78)
+            candidates.append(
+                _PlacementCandidate(
+                    source=source_name,
+                    strategy="linefit",
+                    placements=placements_linefit,
+                    coverage=coverage,
+                    line_fit=line_fit,
+                    token_ratio=token_ratio,
+                    score=_candidate_score(
+                        coverage=coverage,
+                        line_fit=line_fit,
+                        token_ratio=token_ratio,
+                        source=source_name,
+                        strategy="linefit",
+                    ),
+                )
+            )
+
+    candidates.sort(key=lambda item: item.score, reverse=True)
+    return candidates
+
+
 def _expand_lines_to_target_count(
     lines: Sequence[str],
     *,
@@ -1501,7 +1771,11 @@ def _build_searchable_pdf_from_text(
     text: str,
     out_pdf: Path,
     surya_geometry_by_page: dict[int, dict[str, object]] | None = None,
+    fallback_geometry_by_page: dict[int, dict[str, object]] | None = None,
     geometry_linefit_prefer: bool = False,
+    hybrid_policy: str = _HYBRID_POLICY_AUTO,
+    blend_primary_y_weight: float | None = None,
+    geometry_debug_rows: list[dict[str, object]] | None = None,
 ) -> tuple[int, int]:
     from pypdf import PdfReader, PdfWriter
     import fitz  # type: ignore
@@ -1556,11 +1830,24 @@ def _build_searchable_pdf_from_text(
                 page_weights=page_weights,
             )
 
+    effective_policy = _normalize_hybrid_policy(hybrid_policy)
+    default_blend_weight = (
+        _HYBRID_SOFT_BLEND_PRIMARY_Y_WEIGHT
+        if effective_policy == _HYBRID_POLICY_SOFTLINE
+        else _HYBRID_BLEND_PRIMARY_Y_WEIGHT
+    )
+    effective_blend_weight = (
+        default_blend_weight
+        if blend_primary_y_weight is None
+        else min(max(float(blend_primary_y_weight), 0.0), 1.0)
+    )
+
     try:
         for page_idx, source_page in enumerate(reader.pages):
             page_text = page_texts[page_idx] if page_idx < len(page_texts) else ""
             surya_page = (surya_geometry_by_page or {}).get(page_idx + 1)
-            if page_text.strip() or isinstance(surya_page, dict):
+            fallback_page = (fallback_geometry_by_page or {}).get(page_idx + 1)
+            if page_text.strip() or isinstance(surya_page, dict) or isinstance(fallback_page, dict):
                 _normalize_source_page_rotation(source_page)
                 crop_box = source_page.cropbox
                 media_box = source_page.mediabox
@@ -1576,39 +1863,138 @@ def _build_searchable_pdf_from_text(
                 page_lines = _split_page_text_lines(page_text)
                 line_boxes = page_line_boxes[page_idx]
                 placements: list[tuple[tuple[float, float, float, float], str]]
-                if isinstance(surya_page, dict):
+                page_log: dict[str, object] | None = None
+                if isinstance(surya_page, dict) or isinstance(fallback_page, dict):
                     if geometry_linefit_prefer:
-                        placements, alignment_coverage = _placements_from_chandra_text_aligned_to_geometry(
-                            page_lines=page_lines,
-                            page_data=surya_page,
-                            page_width=page_width,
-                            page_height=page_height,
-                        )
-                        if not placements or alignment_coverage < 0.45:
-                            geometry_boxes = _geometry_boxes_in_reading_order(
-                                page_data=surya_page,
-                                page_width=page_width,
-                                page_height=page_height,
+                        primary_data = surya_page if isinstance(surya_page, dict) else None
+                        secondary_data = fallback_page if isinstance(fallback_page, dict) else None
+                        candidates_for_log: list[_PlacementCandidate] = []
+                        chosen: _PlacementCandidate | None = None
+                        blended = False
+                        blend_reference = "none"
+
+                        if effective_policy == _HYBRID_POLICY_SURYA_ONLY:
+                            if primary_data is not None:
+                                primary_candidates = _build_geometry_candidates(
+                                    page_lines=page_lines,
+                                    page_width=page_width,
+                                    page_height=page_height,
+                                    line_boxes=line_boxes,
+                                    primary_page_data=primary_data,
+                                    secondary_page_data=None,
+                                )
+                                candidates_for_log.extend(primary_candidates)
+                                if primary_candidates:
+                                    chosen = primary_candidates[0]
+                            if chosen is None and secondary_data is not None:
+                                secondary_candidates = _build_geometry_candidates(
+                                    page_lines=page_lines,
+                                    page_width=page_width,
+                                    page_height=page_height,
+                                    line_boxes=line_boxes,
+                                    primary_page_data=None,
+                                    secondary_page_data=secondary_data,
+                                )
+                                candidates_for_log.extend(secondary_candidates)
+                                if secondary_candidates:
+                                    chosen = secondary_candidates[0]
+                        elif effective_policy == _HYBRID_POLICY_SOFTLINE:
+                            primary_candidates: list[_PlacementCandidate] = []
+                            secondary_candidates: list[_PlacementCandidate] = []
+                            if primary_data is not None:
+                                primary_candidates = _build_geometry_candidates(
+                                    page_lines=page_lines,
+                                    page_width=page_width,
+                                    page_height=page_height,
+                                    line_boxes=line_boxes,
+                                    primary_page_data=primary_data,
+                                    secondary_page_data=None,
+                                )
+                            if secondary_data is not None:
+                                secondary_candidates = _build_geometry_candidates(
+                                    page_lines=page_lines,
+                                    page_width=page_width,
+                                    page_height=page_height,
+                                    line_boxes=line_boxes,
+                                    primary_page_data=None,
+                                    secondary_page_data=secondary_data,
+                                )
+                            candidates_for_log.extend(primary_candidates)
+                            candidates_for_log.extend(secondary_candidates)
+                            chosen = primary_candidates[0] if primary_candidates else (
+                                secondary_candidates[0] if secondary_candidates else None
                             )
-                            fit_lines = page_lines
-                            if geometry_boxes and page_lines:
-                                min_target = max(1, int(len(geometry_boxes) * 0.85))
-                                if len(page_lines) < min_target:
-                                    fit_lines = _expand_lines_to_target_count(
-                                        page_lines,
-                                        target_count=min_target,
-                                    )
-                            placements = _assign_lines_to_boxes(fit_lines, geometry_boxes)
-                        if not placements:
-                            placements = _placements_from_geometry_text_with_linefit(
-                                page_data=surya_page,
+                        else:
+                            combined_candidates = _build_geometry_candidates(
+                                page_lines=page_lines,
                                 page_width=page_width,
                                 page_height=page_height,
                                 line_boxes=line_boxes,
+                                primary_page_data=primary_data,
+                                secondary_page_data=secondary_data,
                             )
+                            candidates_for_log.extend(combined_candidates)
+                            if combined_candidates:
+                                chosen = combined_candidates[0]
+
+                        if chosen is not None:
+                            placements = list(chosen.placements)
+                            need_blend = (
+                                chosen.source == "primary"
+                                and secondary_data is not None
+                                and effective_policy in {_HYBRID_POLICY_AUTO, _HYBRID_POLICY_SOFTLINE}
+                            )
+                            if need_blend:
+                                reference_boxes = _geometry_boxes_in_reading_order(
+                                    page_data=secondary_data,
+                                    page_width=page_width,
+                                    page_height=page_height,
+                                )
+                                if not reference_boxes:
+                                    reference_boxes = line_boxes
+                                    blend_reference = "line_boxes"
+                                else:
+                                    blend_reference = "secondary_geometry"
+                                placements = _blend_placements_vertical(
+                                    placements=placements,
+                                    reference_boxes=reference_boxes,
+                                    page_height=page_height,
+                                    primary_y_weight=effective_blend_weight,
+                                )
+                                blended = True
+                        else:
+                            placements = []
+
+                        if geometry_debug_rows is not None:
+                            page_log = {
+                                "page": page_idx + 1,
+                                "policy": effective_policy,
+                                "primary_geometry": primary_data is not None,
+                                "secondary_geometry": secondary_data is not None,
+                                "line_boxes": len(line_boxes),
+                                "candidate_count": len(candidates_for_log),
+                                "candidates_top": _top_candidate_logs(candidates_for_log),
+                                "chosen_source": chosen.source if chosen is not None else "none",
+                                "chosen_strategy": chosen.strategy if chosen is not None else "none",
+                                "chosen_score": (round(float(chosen.score), 6) if chosen is not None else None),
+                                "chosen_coverage": (
+                                    round(float(chosen.coverage), 6) if chosen is not None else None
+                                ),
+                                "chosen_line_fit": (
+                                    round(float(chosen.line_fit), 6) if chosen is not None else None
+                                ),
+                                "chosen_token_ratio": (
+                                    round(float(chosen.token_ratio), 6) if chosen is not None else None
+                                ),
+                                "blended": blended,
+                                "blend_reference": blend_reference,
+                                "blend_primary_weight": (effective_blend_weight if blended else None),
+                                "placements": len(placements),
+                            }
                     else:
+                        base_page = surya_page if isinstance(surya_page, dict) else fallback_page
                         placements = _placements_from_surya_geometry(
-                            page_data=surya_page,
+                            page_data=base_page,
                             page_width=page_width,
                             page_height=page_height,
                         )
@@ -1618,6 +2004,9 @@ def _build_searchable_pdf_from_text(
                         placements = [((4.0, 4.0, page_width - 4.0, page_height - 4.0), "\n".join(page_lines))]
                 if not placements and page_lines:
                     placements = [((4.0, 4.0, page_width - 4.0, page_height - 4.0), "\n".join(page_lines))]
+                if page_log is not None:
+                    page_log["placements_after_fallback"] = len(placements)
+                    geometry_debug_rows.append(page_log)
                 overlay_page = _build_overlay_page(
                     page_width=page_width,
                     page_height=page_height,
@@ -1644,6 +2033,9 @@ def run_artifact_searchable_package(
     output_dir: Path,
     engines: Sequence[str] | None = None,
     require_page_markers: bool = False,
+    chandra_geometry_policy: str | None = None,
+    chandra_blend_primary_y_weight: float | None = None,
+    geometry_debug_log: bool = False,
 ) -> list[ArtifactSearchableResult]:
     resolved_compare = Path(compare_dir)
     resolved_pdf_root = Path(pdf_root)
@@ -1656,6 +2048,29 @@ def run_artifact_searchable_package(
     resolved_output.mkdir(parents=True, exist_ok=True)
 
     allowed_engines = None if engines is None else {engine.strip().lower() for engine in engines if engine.strip()}
+    effective_hybrid_policy = _normalize_hybrid_policy(
+        chandra_geometry_policy or os.getenv("UNISCAN_CHANDRA_GEOMETRY_POLICY")
+    )
+    blend_weight = chandra_blend_primary_y_weight
+    if blend_weight is None:
+        raw_blend_weight = os.getenv("UNISCAN_CHANDRA_BLEND_Y_WEIGHT", "").strip()
+        if raw_blend_weight:
+            try:
+                blend_weight = float(raw_blend_weight)
+            except ValueError:
+                blend_weight = None
+    if blend_weight is not None:
+        blend_weight = min(max(float(blend_weight), 0.0), 1.0)
+    effective_debug_blend_weight = (
+        blend_weight
+        if blend_weight is not None
+        else (
+            _HYBRID_SOFT_BLEND_PRIMARY_Y_WEIGHT
+            if effective_hybrid_policy == _HYBRID_POLICY_SOFTLINE
+            else _HYBRID_BLEND_PRIMARY_Y_WEIGHT
+        )
+    )
+    debug_enabled = bool(geometry_debug_log or _env_truthy("UNISCAN_GEOMETRY_DEBUG"))
 
     artifact_files = sorted(path for path in resolved_compare.glob("*.txt") if path.name.lower() != "sources_map.txt")
 
@@ -1716,6 +2131,7 @@ def run_artifact_searchable_package(
                     "Expected '[SOURCE PAGE N]' blocks or form-feed separators."
                 )
             surya_geometry_by_page = None
+            fallback_geometry_by_page = None
             if engine == "surya":
                 surya_geometry_by_page = _load_surya_page_geometry(
                     compare_dir=resolved_compare,
@@ -1736,17 +2152,47 @@ def run_artifact_searchable_package(
                     geometry_types=geometry_types,
                     engine_dir_override=geometry_override,
                 )
+                if geometry_override is not None:
+                    fallback_geometry_by_page = _load_surya_page_geometry(
+                        compare_dir=resolved_compare,
+                        document=document,
+                        engine="chandra",
+                        geometry_types=("chandra_text_lines",),
+                    )
+            geometry_debug_rows: list[dict[str, object]] | None = [] if (debug_enabled and engine == "chandra") else None
             out_pdf = resolved_output / document / f"{document}__{engine}_searchable.pdf"
             page_count, text_chars = _build_searchable_pdf_from_text(
                 source_pdf=source_pdf,
                 text=text,
                 out_pdf=out_pdf,
                 surya_geometry_by_page=surya_geometry_by_page,
+                fallback_geometry_by_page=fallback_geometry_by_page,
                 geometry_linefit_prefer=(engine == "chandra"),
+                hybrid_policy=effective_hybrid_policy,
+                blend_primary_y_weight=blend_weight,
+                geometry_debug_rows=geometry_debug_rows,
             )
             extracted = _extract_pdf_text(out_pdf)
             if not extracted.strip():
                 raise RuntimeError("Output PDF has empty extracted text layer.")
+
+            geometry_log_path: Path | None = None
+            if geometry_debug_rows:
+                geometry_log_path = resolved_output / document / f"{document}__{engine}_geometry_log.json"
+                geometry_log_path.write_text(
+                    json.dumps(
+                        {
+                            "document": document,
+                            "engine": engine,
+                            "policy": effective_hybrid_policy,
+                            "blend_primary_weight": effective_debug_blend_weight,
+                            "pages": geometry_debug_rows,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
 
             results.append(
                 ArtifactSearchableResult(
@@ -1759,6 +2205,7 @@ def run_artifact_searchable_package(
                     page_count=page_count,
                     text_chars=text_chars,
                     elapsed_seconds=perf_counter() - start,
+                    geometry_log_path=(str(geometry_log_path) if geometry_log_path is not None else None),
                 )
             )
         except Exception as exc:
@@ -1774,6 +2221,7 @@ def run_artifact_searchable_package(
                     text_chars=0,
                     elapsed_seconds=perf_counter() - start,
                     error=str(exc),
+                    geometry_log_path=None,
                 )
             )
 
@@ -1797,6 +2245,7 @@ def run_artifact_searchable_package(
                 "text_chars",
                 "elapsed_seconds",
                 "error",
+                "geometry_log_path",
             ],
         )
         writer.writeheader()
@@ -1810,9 +2259,10 @@ def summarize_artifact_searchable_package(results: Sequence[ArtifactSearchableRe
     lines: list[str] = []
     for row in results:
         if row.status == "ok":
+            geometry_part = f" geometry_log={row.geometry_log_path}" if row.geometry_log_path else ""
             lines.append(
                 f"{row.document} [{row.engine}]: ok {row.elapsed_seconds:.2f}s "
-                f"pages={row.page_count} text={row.text_chars} pdf={row.searchable_pdf_path}"
+                f"pages={row.page_count} text={row.text_chars} pdf={row.searchable_pdf_path}{geometry_part}"
             )
         else:
             lines.append(

@@ -179,6 +179,48 @@ docker run --rm -p 8000:8000 -v D:\Git_Code\Surya_Chandra_PDF_OCR\outputs:/app/o
 Подробный воспроизводимый путь зафиксирован в:
 `docs/benchmark_runs/2026-04-13_chandra_geometry_compare_path.md`
 
+### Политики гибридного позиционирования
+
+Для `build-searchable-from-artifacts` добавлены опции управления геометрией `chandra`:
+
+1. `--chandra-geometry-policy auto` — автоподбор на каждой странице.
+2. `--chandra-geometry-policy surya_only` — только surya-геометрия.
+3. `--chandra-geometry-policy softline` — мягкое построчное смешивание.
+4. `--chandra-blend-weight 0.75` — вес первичной геометрии при смешивании (0..1).
+5. `--geometry-debug-log` — записывает per-page лог выбора геометрии (`*_geometry_log.json`).
+
+Пример:
+
+```powershell
+python -m uniscan build-searchable-from-artifacts `
+  --compare-dir "D:\path\_compare_txt" `
+  --pdf-root "D:\path\pdf_root" `
+  --output "D:\path\out" `
+  --engines chandra `
+  --chandra-geometry-policy softline `
+  --chandra-blend-weight 0.75 `
+  --geometry-debug-log `
+  --strict
+```
+
+### Полный прогон (ГОСТ + книга, все варианты)
+
+Готовый скрипт запускает:
+
+1. `surya` native и `chandra` native (4 PDF на 2 документа).
+2. Гибрид A: `chandra text + surya geometry`.
+3. Гибрид B: `auto per page`.
+4. Гибрид C: `softline`.
+
+Скрипт печатает живые логи в текущем окне PowerShell и сохраняет общий `full_run.log`.
+
+```powershell
+.\scripts\full_hybrid_geometry_eval.ps1 `
+  -GostPdf "D:\Git_Code\PDFS\ГОСТ с плохим качеством скана.pdf" `
+  -BookPdf "D:\Git_Code\PDFS\Старая книга с частично рукописным текстом.pdf" `
+  -PdfRoot "D:\Git_Code\PDFS"
+```
+
 ## Что внутри
 
 - OCR benchmark matrix и артефактный pipeline
