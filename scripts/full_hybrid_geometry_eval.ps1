@@ -72,7 +72,16 @@ function Invoke-UniScan {
     Write-Host ""
     Write-Host "[step] $Step" -ForegroundColor Cyan
     Write-Host "cmd: $PythonExe $($Args -join ' ')" -ForegroundColor DarkGray
-    $output = & $PythonExe @Args 2>&1 | Tee-Object -FilePath $LogFile -Append
+    $prevEap = $ErrorActionPreference
+    try {
+        # Native tools may write warnings to stderr with exit code 0.
+        # We treat success/failure by LASTEXITCODE, not by stderr presence.
+        $ErrorActionPreference = "Continue"
+        $output = & $PythonExe @Args 2>&1 | Tee-Object -FilePath $LogFile -Append
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "Command failed ($LASTEXITCODE) at step '$Step'."
     }
