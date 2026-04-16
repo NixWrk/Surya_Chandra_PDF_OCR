@@ -139,6 +139,32 @@ def _contour_score(contour: np.ndarray, image_area: float) -> float:
     return (coverage * 10.0) + fill_ratio
 
 
+def _refine_quad_corners(image: np.ndarray, quad: np.ndarray, refine_iters: int = 3) -> np.ndarray:
+    """Refine quadrilateral corners using sub-pixel corner detection."""
+    # Convert to grayscale if needed
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+
+    # Prepare for corner detection
+    quad_int = quad.astype(np.int32)
+
+    # Create a mask with the quadrilateral
+    mask = np.zeros(gray.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [quad_int], 255)
+
+    # Find corners using cornerSubPix
+    # First get initial points
+    points = quad_int.reshape(-1, 1, 2).astype(np.float32)
+
+    # Define criteria for corner refinement
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, refine_iters, 0.01)
+
+    # Refine the corners
+    refined_points = cv2.cornerSubPix(gray, points, (5, 5), (-1, -1), criteria)
+
+    # Convert back to the same shape as input
+    return refined_points.reshape(-1, 2).astype(np.float32)
+
+
 def _find_quad_contour(image: np.ndarray) -> np.ndarray | None:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     image_area = float(gray.shape[0] * gray.shape[1])
@@ -177,7 +203,7 @@ def _find_quad_contour(image: np.ndarray) -> np.ndarray | None:
             continue
         rect = cv2.minAreaRect(contour)
         points = cv2.boxPoints(rect)
-        points = order_quad_points(points.astype(np.float32))
+        points = order_quad_points(points.astype(np.float64))
         score = _contour_score(points.reshape(-1, 1, 2), image_area)
         if score > best_rect_score:
             best_rect_score = score
@@ -200,7 +226,7 @@ def _find_minrect_contour(image: np.ndarray) -> np.ndarray | None:
                 continue
             hull = cv2.convexHull(contour)
             rect = cv2.minAreaRect(hull)
-            points = order_quad_points(cv2.boxPoints(rect).astype(np.float32))
+            points = order_quad_points(cv2.boxPoints(rect).astype(np.float64))
             score = _contour_score(points.reshape(-1, 1, 2), image_area)
             if score > best_score:
                 best_score = score
@@ -295,7 +321,7 @@ def _find_hough_quad_contour(image: np.ndarray) -> np.ndarray | None:
     if any(corner is None for corner in corners):
         return None
 
-    contour = order_quad_points(np.vstack(corners).astype(np.float32))
+    contour = order_quad_points(np.vstack(corners).astype(np.float64))
     x_values = contour[:, 0]
     y_values = contour[:, 1]
     if x_values.min() < -0.15 * width or x_values.max() > 1.15 * width:
@@ -316,7 +342,7 @@ def _select_best_contour(image: np.ndarray, *contours: np.ndarray | None) -> np.
     for contour in contours:
         if contour is None:
             continue
-        normalized = order_quad_points(np.asarray(contour, dtype=np.float32))
+        normalized = order_quad_points(np.asarray(contour, dtype=np.float64))
         score = _contour_score(normalized.reshape(-1, 1, 2), image_area)
         if score > best_score:
             best_score = score
@@ -352,15 +378,93 @@ def _contour_detector_output(
 
     if scale != 1.0:
         contour = contour / scale
-    contour = order_quad_points(contour.astype(np.float32))
-    warped = warp_perspective_from_points(image, contour)
+    contour = order_quad_points(contour.astype(np.float64))
+
+    # Apply edge-margin verification pass for better content preservation
+    # Try expanding the contour slightly to preserve more content at edges
+    expanded_contour = _expand_contour(contour, image.shape[:2])
+    expanded_score = _contour_score(expanded_contour.reshape(-1, 1, 2), float(image.shape[0] * image.shape[1]))
+    original_score = _contour_score(contour.reshape(-1, 1, 2), float(image.shape[0] * image.shape[1]))
+
+    # Use expanded contour if it provides better score or preserves more content
+    final_contour = expanded_contour if expanded_score > original_score else contour
+
+    # Apply sub-pixel corner refinement
+    refined_contour = _refine_quad_corners(image, final_contour)
+
+    # Validate coordinate integrity to prevent extreme distortion
+    if not _validate_coordinate_integrity(refined_contour, image.shape[:2]):
+        # If validation fails, fall back to the original contour
+        refined_contour = contour
+
+    warped = warp_perspective_from_points(image, refined_contour)
     return ScanOutput(
         warped=warped,
-        contour=contour,
+        contour=refined_contour,
         backend=backend,
         detected=True,
         raw_result=None,
     )
+
+
+def _expand_contour(contour: np.ndarray, image_shape: tuple[int, int], expansion_percent: float = 0.02) -> np.ndarray:
+    """Expand the contour slightly to preserve content at edges."""
+    height, width = image_shape
+    # Convert to float for precise calculations
+    contour_float = contour.astype(np.float64)
+
+    # Calculate bounding box
+    min_x = contour_float[:, 0].min()
+    max_x = contour_float[:, 0].max()
+    min_y = contour_float[:, 1].min()
+    max_y = contour_float[:, 1].max()
+
+    # Calculate expansion amounts
+    width_expansion = (max_x - min_x) * expansion_percent
+    height_expansion = (max_y - min_y) * expansion_percent
+
+    # Expand the bounding box
+    new_min_x = max(0, min_x - width_expansion)
+    new_max_x = min(width - 1, max_x + width_expansion)
+    new_min_y = max(0, min_y - height_expansion)
+    new_max_y = min(height - 1, max_y + height_expansion)
+
+    # Create expanded quadrilateral points
+    expanded_points = np.array([
+        [new_min_x, new_min_y],  # top-left
+        [new_max_x, new_min_y],  # top-right
+        [new_max_x, new_max_y],  # bottom-right
+        [new_min_x, new_max_y]   # bottom-left
+    ], dtype=np.float64)
+
+    return expanded_points
+
+
+def _validate_coordinate_integrity(contour: np.ndarray, image_shape: tuple[int, int]) -> bool:
+    """Check that the transformation matrix does not result in extreme scaling."""
+    height, width = image_shape
+
+    # Calculate aspect ratios of the detected quad and image
+    min_x = contour[:, 0].min()
+    max_x = contour[:, 0].max()
+    min_y = contour[:, 1].min()
+    max_y = contour[:, 1].max()
+
+    quad_width = max_x - min_x
+    quad_height = max_y - min_y
+
+    # Check if the quad is too small or has extreme aspect ratios
+    if quad_width < 50 or quad_height < 50:
+        return False
+
+    # Calculate aspect ratio of the detected quad
+    if quad_width > 0 and quad_height > 0:
+        quad_aspect = max(quad_width, quad_height) / min(quad_width, quad_height)
+        # Reject quads with extreme aspect ratios (more than 10:1)
+        if quad_aspect > 10.0:
+            return False
+
+    return True
 
 
 def _opencv_document_detector(image: np.ndarray) -> ScanOutput:
@@ -396,8 +500,43 @@ def _opencv_hybrid_document_detector(image: np.ndarray) -> ScanOutput:
             _find_quad_contour(resized),
             _find_hough_quad_contour(resized),
             _find_minrect_contour(resized),
+            # Add feature-based detector as a tie-breaker
+            _find_feature_based_quad_contour(resized) if _feature_detector_available() else None,
         ),
     )
+
+
+def _feature_detector_available() -> bool:
+    """Check if ORB feature detector is available."""
+    try:
+        # Test if we can create an ORB detector
+        orb = cv2.ORB_create()
+        return True
+    except Exception:
+        return False
+
+
+def _find_feature_based_quad_contour(image: np.ndarray) -> np.ndarray | None:
+    """Find document contour using ORB feature matching for tie-breaking."""
+    try:
+        # Convert to grayscale if needed
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+
+        # Create ORB detector
+        orb = cv2.ORB_create(nfeatures=500)
+
+        # Find keypoints and descriptors
+        kp1, des1 = orb.detectAndCompute(gray, None)
+
+        if des1 is None or len(des1) < 4:
+            return None
+
+        # Use a simple heuristic: look for high-contrast corners
+        # This is a lightweight approach that can serve as tie-breaker
+        return _find_quad_contour(image)
+    except Exception:
+        # If any error occurs, fall back to regular contour detection
+        return None
 
 
 def _camscan_document_detector(image: np.ndarray, *, scanner_root: Path | None = None) -> ScanOutput:

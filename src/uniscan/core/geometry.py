@@ -12,7 +12,7 @@ def order_quad_points(points: np.ndarray) -> np.ndarray:
 
     Input shape: (4, 2).
     """
-    pts = np.array(points, dtype=np.float32).reshape(4, 2)
+    pts = np.array(points, dtype=np.float64).reshape(4, 2)
     sums = pts.sum(axis=1)
     diffs = np.diff(pts, axis=1).reshape(4)
 
@@ -20,7 +20,7 @@ def order_quad_points(points: np.ndarray) -> np.ndarray:
     br = pts[np.argmax(sums)]
     tr = pts[np.argmin(diffs)]
     bl = pts[np.argmax(diffs)]
-    return np.array([tl, tr, br, bl], dtype=np.float32)
+    return np.array([tl, tr, br, bl], dtype=np.float64)
 
 
 def warp_perspective_from_points(image: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -46,7 +46,7 @@ def warp_perspective_from_points(image: np.ndarray, points: np.ndarray) -> np.nd
             [max_width - 1, max_height - 1],
             [0, max_height - 1],
         ],
-        dtype=np.float32,
+        dtype=np.float64,
     )
     matrix = cv2.getPerspectiveTransform(quad, dst)
     return cv2.warpPerspective(image, matrix, (max_width, max_height))
