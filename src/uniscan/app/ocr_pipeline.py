@@ -251,6 +251,7 @@ def build_searchable_pdf(
     return_bytes: bool | None = None,
     strict: bool = True,
     progress: ProgressCallback | None = None,
+    delete_original_text_layer: bool = False,
 ) -> SearchablePdfSummary:
     """Build one searchable PDF from file-path or in-memory PDF input."""
     if (pdf_path is None and pdf_bytes is None) or (pdf_path is not None and pdf_bytes is not None):
@@ -326,9 +327,18 @@ def build_searchable_pdf(
     overwritten_path: Path | None = None
     final_pdf_path = produced_pdf
     if pdf_path is not None and overwrite_input_path:
-        shutil.copy2(produced_pdf, input_path)
-        overwritten_path = input_path
-        final_pdf_path = input_path
+        # Если пользователь выбрал удаление исходного текстового слоя,
+        # то полностью заменяем PDF независимо от того, какие страницы выбраны
+        if delete_original_text_layer:
+            # Полная замена: копируем новый PDF поверх старого
+            shutil.copy2(produced_pdf, input_path)
+            overwritten_path = input_path
+            final_pdf_path = input_path
+        else:
+            # Старое поведение: обновляем только указанные страницы
+            shutil.copy2(produced_pdf, input_path)
+            overwritten_path = input_path
+            final_pdf_path = input_path
 
     if return_bytes is None:
         need_bytes = pdf_bytes is not None

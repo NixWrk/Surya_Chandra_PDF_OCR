@@ -42,6 +42,7 @@ class BasicOcrGui(tk.Tk):
         self.status_var = tk.StringVar(value="Готово")
         self.progress_text_var = tk.StringVar(value="0%")
         self.progress_var = tk.IntVar(value=0)
+        self.delete_original_layer_var = tk.BooleanVar(value=False)
 
         self._worker: threading.Thread | None = None
         self._build_ui()
@@ -86,6 +87,15 @@ class BasicOcrGui(tk.Tk):
         self.pages_entry = ttk.Entry(row_pages, textvariable=self.pages_var)
         self.pages_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         ttk.Label(row_pages, text="напр.: 1,3,5-8 (пусто = все)").pack(side=tk.LEFT)
+
+        row_delete_layer = ttk.Frame(root)
+        row_delete_layer.pack(fill=tk.X, pady=(0, 12))
+        self.delete_layer_check = ttk.Checkbutton(
+            row_delete_layer,
+            variable=self.delete_original_layer_var,
+            text="Удалить исходный текстовый слой"
+        )
+        self.delete_layer_check.pack(side=tk.LEFT)
 
         progress_box = ttk.LabelFrame(root, text="Прогресс")
         progress_box.pack(fill=tk.X, pady=(0, 12))
@@ -154,7 +164,7 @@ class BasicOcrGui(tk.Tk):
 
         self._worker = threading.Thread(
             target=self._run_worker,
-            args=(pdf_path, mode, page_numbers),
+            args=(pdf_path, mode, page_numbers, self.delete_original_layer_var.get()),
             daemon=True,
         )
         self._worker.start()
@@ -164,6 +174,7 @@ class BasicOcrGui(tk.Tk):
         pdf_path: Path,
         mode: str,
         page_numbers: tuple[int, ...] | None,
+        delete_original_layer: bool,
     ) -> None:
         try:
             summary = build_searchable_pdf(
@@ -175,6 +186,7 @@ class BasicOcrGui(tk.Tk):
                 overwrite_input_path=True,
                 return_bytes=False,
                 progress=self._queue_progress,
+                delete_original_text_layer=delete_original_layer,
             )
             self.after(0, self._ui_done, summary)
         except Exception as exc:
