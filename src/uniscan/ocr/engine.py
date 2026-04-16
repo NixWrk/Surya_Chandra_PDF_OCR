@@ -206,105 +206,103 @@ def detect_ocr_dependencies(
     )
 
 
-def detect_ocr_engine_status(
-    engine_name: str,
-    *,
-    import_module=importlib.import_module,
-    which_fn=shutil.which,
-) -> OcrEngineStatus:
-    engine = engine_name.strip().lower()
-    if engine not in OCR_ENGINE_VALUES:
-        raise ValueError(f"Unsupported OCR engine: {engine_name}")
+def _detect_ocr_engine_status_pytesseract(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+    deps = detect_ocr_dependencies(import_module=import_module, which_fn=which_fn)
+    return OcrEngineStatus(
+        engine_name=engine,
+        ready=deps.ready,
+        missing=deps.missing,
+        searchable_pdf=True,
+    )
 
-    if engine == OCR_ENGINE_PYTESSERACT:
-        deps = detect_ocr_dependencies(import_module=import_module, which_fn=which_fn)
-        return OcrEngineStatus(
-            engine_name=engine,
-            ready=deps.ready,
-            missing=deps.missing,
-            searchable_pdf=True,
-        )
 
-    if engine == OCR_ENGINE_OCRMYPDF:
-        missing: list[str] = []
-        if not _has_command("ocrmypdf", which_fn):
-            missing.append("ocrmypdf")
-        if not _has_module("img2pdf", import_module):
-            missing.append("img2pdf")
-        return OcrEngineStatus(
-            engine_name=engine,
-            ready=not missing,
-            missing=missing,
-            searchable_pdf=True,
-        )
+def _detect_ocr_engine_status_ocrmypdf(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+    missing: list[str] = []
+    if not _has_command("ocrmypdf", which_fn):
+        missing.append("ocrmypdf")
+    if not _has_module("img2pdf", import_module):
+        missing.append("img2pdf")
+    return OcrEngineStatus(
+        engine_name=engine,
+        ready=not missing,
+        missing=missing,
+        searchable_pdf=True,
+    )
 
-    if engine == OCR_ENGINE_PYMUPDF:
-        missing = []
-        if not _has_module("fitz", import_module):
-            missing.append("pymupdf(fitz)")
-        if not _has_module("pypdf", import_module):
-            missing.append("pypdf")
-        if not _has_command("tesseract", which_fn):
-            missing.append("tesseract")
-        return OcrEngineStatus(
-            engine_name=engine,
-            ready=not missing,
-            missing=missing,
-            searchable_pdf=True,
-        )
 
-    if engine == OCR_ENGINE_PADDLEOCR:
-        missing = [] if _has_module("paddleocr", import_module) else ["paddleocr"]
-        plugin_module = _detect_ocrmypdf_plugin_module(engine, import_module=import_module, which_fn=which_fn)
-        return OcrEngineStatus(
-            engine_name=engine,
-            ready=not missing,
-            missing=missing,
-            searchable_pdf=plugin_module is not None,
-        )
+def _detect_ocr_engine_status_pymupdf(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+    missing = []
+    if not _has_module("fitz", import_module):
+        missing.append("pymupdf(fitz)")
+    if not _has_module("pypdf", import_module):
+        missing.append("pypdf")
+    if not _has_command("tesseract", which_fn):
+        missing.append("tesseract")
+    return OcrEngineStatus(
+        engine_name=engine,
+        ready=not missing,
+        missing=missing,
+        searchable_pdf=True,
+    )
 
-    if engine == OCR_ENGINE_SURYA:
-        has_surya = _has_module("surya", import_module)
-        has_marker = _has_module("marker", import_module)
-        has_surya_cli = _has_command("surya_ocr", which_fn) or _has_command("marker_single", which_fn) or _has_command("marker", which_fn)
-        missing = [] if (has_surya or has_marker or has_surya_cli) else ["surya/marker"]
-        plugin_module = _detect_ocrmypdf_plugin_module(engine, import_module=import_module, which_fn=which_fn)
-        return OcrEngineStatus(
-            engine_name=engine,
-            ready=not missing,
-            missing=missing,
-            searchable_pdf=plugin_module is not None,
-        )
 
-    if engine == OCR_ENGINE_MINERU:
-        has_mineru = _has_module("mineru", import_module) or _has_module("magic_pdf", import_module)
-        has_mineru_cli = _has_command("mineru", which_fn) or _has_command("magic-pdf", which_fn)
-        missing: list[str] = []
-        if not (has_mineru or has_mineru_cli):
-            missing.append("mineru(magic_pdf)")
-        if has_mineru:
-            for module_name in ("ftfy", "dill", "omegaconf"):
-                if not _has_module(module_name, import_module):
-                    missing.append(module_name)
-        plugin_module = _detect_ocrmypdf_plugin_module(engine, import_module=import_module, which_fn=which_fn)
-        return OcrEngineStatus(
-            engine_name=engine,
-            ready=not missing,
-            missing=missing,
-            searchable_pdf=plugin_module is not None,
-        )
+def _detect_ocr_engine_status_paddleocr(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+    missing = [] if _has_module("paddleocr", import_module) else ["paddleocr"]
+    plugin_module = _detect_ocrmypdf_plugin_module(engine, import_module=import_module, which_fn=which_fn)
+    return OcrEngineStatus(
+        engine_name=engine,
+        ready=not missing,
+        missing=missing,
+        searchable_pdf=plugin_module is not None,
+    )
 
-    if engine == OCR_ENGINE_OLMOCR:
-        has_olmocr = _has_module("olmocr", import_module)
-        has_olmocr_cli = _has_command("olmocr", which_fn)
-        missing = [] if (has_olmocr or has_olmocr_cli) else ["olmocr"]
-        return OcrEngineStatus(
-            engine_name=engine,
-            ready=not missing,
-            missing=missing,
-            searchable_pdf=False,
-        )
 
+def _detect_ocr_engine_status_surya(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+    has_surya = _has_module("surya", import_module)
+    has_marker = _has_module("marker", import_module)
+    has_surya_cli = _has_command("surya_ocr", which_fn) or _has_command("marker_single", which_fn) or _has_command("marker", which_fn)
+    missing = [] if (has_surya or has_marker or has_surya_cli) else ["surya/marker"]
+    plugin_module = _detect_ocrmypdf_plugin_module(engine, import_module=import_module, which_fn=which_fn)
+    return OcrEngineStatus(
+        engine_name=engine,
+        ready=not missing,
+        missing=missing,
+        searchable_pdf=plugin_module is not None,
+    )
+
+
+def _detect_ocr_engine_status_mineru(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+    has_mineru = _has_module("mineru", import_module) or _has_module("magic_pdf", import_module)
+    has_mineru_cli = _has_command("mineru", which_fn) or _has_command("magic-pdf", which_fn)
+    missing: list[str] = []
+    if not (has_mineru or has_mineru_cli):
+        missing.append("mineru(magic_pdf)")
+    if has_mineru:
+        for module_name in ("ftfy", "dill", "omegaconf"):
+            if not _has_module(module_name, import_module):
+                missing.append(module_name)
+    plugin_module = _detect_ocrmypdf_plugin_module(engine, import_module=import_module, which_fn=which_fn)
+    return OcrEngineStatus(
+        engine_name=engine,
+        ready=not missing,
+        missing=missing,
+        searchable_pdf=plugin_module is not None,
+    )
+
+
+def _detect_ocr_engine_status_olmocr(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+    has_olmocr = _has_module("olmocr", import_module)
+    has_olmocr_cli = _has_command("olmocr", which_fn)
+    missing = [] if (has_olmocr or has_olmocr_cli) else ["olmocr"]
+    return OcrEngineStatus(
+        engine_name=engine,
+        ready=not missing,
+        missing=missing,
+        searchable_pdf=False,
+    )
+
+
+def _detect_ocr_engine_status_chandra(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
     has_chandra = _has_module("chandra_ocr", import_module) or _has_module("chandra", import_module)
     has_chandra_cli = _has_command("chandra", which_fn)
     missing = [] if (has_chandra or has_chandra_cli) else ["chandra-ocr(chandra)"]
@@ -315,6 +313,34 @@ def detect_ocr_engine_status(
         missing=missing,
         searchable_pdf=plugin_module is not None,
     )
+
+
+# Registry mapping engine names to their detection functions
+_ENGINE_DETECTION_FUNCTIONS = {
+    OCR_ENGINE_PYTESSERACT: _detect_ocr_engine_status_pytesseract,
+    OCR_ENGINE_OCRMYPDF: _detect_ocr_engine_status_ocrmypdf,
+    OCR_ENGINE_PYMUPDF: _detect_ocr_engine_status_pymupdf,
+    OCR_ENGINE_PADDLEOCR: _detect_ocr_engine_status_paddleocr,
+    OCR_ENGINE_SURYA: _detect_ocr_engine_status_surya,
+    OCR_ENGINE_MINERU: _detect_ocr_engine_status_mineru,
+    OCR_ENGINE_OLMOCR: _detect_ocr_engine_status_olmocr,
+    OCR_ENGINE_CHANDRA: _detect_ocr_engine_status_chandra,
+}
+
+
+def detect_ocr_engine_status(
+    engine_name: str,
+    *,
+    import_module=importlib.import_module,
+    which_fn=shutil.which,
+) -> OcrEngineStatus:
+    engine = engine_name.strip().lower()
+    if engine not in OCR_ENGINE_VALUES:
+        raise ValueError(f"Unsupported OCR engine: {engine_name}")
+
+    # Use registry pattern to avoid repetitive if/elif chains
+    detection_func = _ENGINE_DETECTION_FUNCTIONS[engine]
+    return detection_func(engine, import_module=import_module, which_fn=which_fn)
 
 
 def _ensure_engine_ready(status: OcrEngineStatus) -> None:

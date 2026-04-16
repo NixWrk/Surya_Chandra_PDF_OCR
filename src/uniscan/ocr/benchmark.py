@@ -1658,6 +1658,16 @@ def _run_olmocr_direct(
     raise RuntimeError("olmOCR failed: " + " | ".join(errors))
 
 
+# Registry mapping engine names to their extraction functions
+_ENGINE_EXTRACTION_FUNCTIONS = {
+    OCR_ENGINE_PADDLEOCR: _run_paddleocr_direct,
+    OCR_ENGINE_SURYA: _run_surya_direct,
+    OCR_ENGINE_MINERU: _run_mineru_direct,
+    OCR_ENGINE_CHANDRA: _run_chandra_direct,
+    OCR_ENGINE_OLMOCR: _run_olmocr_direct,
+}
+
+
 def _run_extraction_engine(
     engine: str,
     image_paths: Sequence[Path],
@@ -1667,41 +1677,23 @@ def _run_extraction_engine(
     which_fn,
     run_cmd,
 ) -> tuple[str, int]:
-    if engine == OCR_ENGINE_PADDLEOCR:
-        return _run_paddleocr_direct(image_paths, lang=lang)
-    if engine == OCR_ENGINE_SURYA:
-        return _run_surya_direct(
+    # Use registry pattern to avoid repetitive if/elif chains
+    extraction_func = _ENGINE_EXTRACTION_FUNCTIONS.get(engine)
+    if extraction_func is None:
+        raise ValueError(f"Unsupported extraction engine: {engine}")
+
+    # Special handling for engines that need additional parameters
+    if engine in (OCR_ENGINE_SURYA, OCR_ENGINE_MINERU, OCR_ENGINE_CHANDRA, OCR_ENGINE_OLMOCR):
+        return extraction_func(
             image_paths,
             lang=lang,
             work_dir=work_dir,
             which_fn=which_fn,
             run_cmd=run_cmd,
         )
-    if engine == OCR_ENGINE_MINERU:
-        return _run_mineru_direct(
-            image_paths,
-            lang=lang,
-            work_dir=work_dir,
-            which_fn=which_fn,
-            run_cmd=run_cmd,
-        )
-    if engine == OCR_ENGINE_CHANDRA:
-        return _run_chandra_direct(
-            image_paths,
-            lang=lang,
-            work_dir=work_dir,
-            which_fn=which_fn,
-            run_cmd=run_cmd,
-        )
-    if engine == OCR_ENGINE_OLMOCR:
-        return _run_olmocr_direct(
-            image_paths,
-            lang=lang,
-            work_dir=work_dir,
-            which_fn=which_fn,
-            run_cmd=run_cmd,
-        )
-    raise ValueError(f"Unsupported extraction engine: {engine}")
+    else:
+        # For engines like PADDLEOCR that don't need the extra parameters
+        return extraction_func(image_paths, lang=lang)
 
 
 def _make_result(
