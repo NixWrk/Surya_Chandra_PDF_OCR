@@ -90,6 +90,14 @@ python -m uniscan searchable-pdf `
    - индикатор прогресса выполнения,
    - итоговый результат: searchable PDF (входной файл перезаписывается).
 
+### Финализация режимов GUI
+
+Актуальный freeze-план по режимам `surya-surya / chandra-chandra / chandra-surya`,
+фиксированной hybrid-логике и плану чистки/рефакторинга:
+
+- `docs/gui_modes_finalization_2026-04-16.md`
+- `docs/ocr_runtime_inventory_2026-04-16.md` (минимально необходимый набор файлов/зависимостей)
+
 ## Web GUI + HTTP API
 
 Запуск локального web-сервиса:

@@ -11,11 +11,13 @@ import pytest
 from uniscan.cli import main
 from uniscan.export import export_pages_as_pdf
 from uniscan.ocr.artifact_searchable import (
+    _PlacementCandidate,
     _align_token_indices,
     _assign_lines_to_boxes,
     _blend_placements_vertical,
     _build_searchable_pdf_from_text,
     _build_geometry_candidates,
+    _choose_auto_candidate,
     _estimate_page_split_weights,
     _expand_lines_to_target_count,
     _geometry_boxes_in_reading_order,
@@ -27,6 +29,7 @@ from uniscan.ocr.artifact_searchable import (
     _placements_from_geometry_text_with_linefit,
     _placements_from_surya_geometry,
     _parse_artifact_filename,
+    _should_blend_primary_candidate,
     _split_line_to_token_boxes,
     _split_line_to_word_fragments,
     _split_lines_to_pages_by_weights,
@@ -290,6 +293,64 @@ def test_blend_placements_vertical_moves_tokens_towards_reference_lines() -> Non
     assert blended[0][0][2] == pytest.approx(60.0)
     assert blended[0][0][1] > 100.0
     assert blended[0][0][3] > 120.0
+
+
+def test_choose_auto_candidate_prefers_primary_on_near_tie() -> None:
+    secondary = _PlacementCandidate(
+        source="secondary",
+        strategy="align",
+        placements=[((0.0, 0.0, 10.0, 10.0), "A")],
+        coverage=1.0,
+        line_fit=0.0,
+        token_ratio=1.0,
+        score=0.77,
+    )
+    primary = _PlacementCandidate(
+        source="primary",
+        strategy="align",
+        placements=[((0.0, 0.0, 10.0, 10.0), "A")],
+        coverage=0.93,
+        line_fit=0.0,
+        token_ratio=1.0,
+        score=0.756,
+    )
+
+    chosen, overridden = _choose_auto_candidate([secondary, primary])
+    assert chosen is primary
+    assert overridden is True
+
+
+def test_should_blend_primary_candidate_only_for_weak_coverage() -> None:
+    secondary = _PlacementCandidate(
+        source="secondary",
+        strategy="align",
+        placements=[((0.0, 0.0, 10.0, 10.0), "A")],
+        coverage=1.0,
+        line_fit=1.0,
+        token_ratio=1.0,
+        score=0.95,
+    )
+    weak_primary = _PlacementCandidate(
+        source="primary",
+        strategy="assign",
+        placements=[((0.0, 0.0, 10.0, 10.0), "A")],
+        coverage=0.35,
+        line_fit=0.0,
+        token_ratio=1.0,
+        score=0.15,
+    )
+    strong_primary = _PlacementCandidate(
+        source="primary",
+        strategy="align",
+        placements=[((0.0, 0.0, 10.0, 10.0), "A")],
+        coverage=0.82,
+        line_fit=0.85,
+        token_ratio=1.0,
+        score=0.86,
+    )
+
+    assert _should_blend_primary_candidate(chosen=weak_primary, secondary_best=secondary) is True
+    assert _should_blend_primary_candidate(chosen=strong_primary, secondary_best=secondary) is False
 
 
 def test_expand_lines_to_target_count_splits_long_lines() -> None:

@@ -57,6 +57,8 @@ _HYBRID_ALIGN_MIN_COVERAGE = 0.60
 _HYBRID_WEAK_COVERAGE = 0.45
 _HYBRID_BLEND_PRIMARY_Y_WEIGHT = 0.35
 _HYBRID_SOFT_BLEND_PRIMARY_Y_WEIGHT = 0.75
+_HYBRID_AUTO_PRIMARY_SCORE_MARGIN = 0.025
+_HYBRID_BLEND_SECONDARY_ADVANTAGE_MIN = 0.08
 
 _HYBRID_POLICY_AUTO = "auto"
 _HYBRID_POLICY_SURYA_ONLY = "surya_only"
@@ -977,6 +979,52 @@ def _top_candidate_logs(
     return rows
 
 
+def _best_candidate_for_source(
+    candidates: Sequence[_PlacementCandidate],
+    *,
+    source: str,
+) -> _PlacementCandidate | None:
+    for item in candidates:
+        if item.source == source:
+            return item
+    return None
+
+
+def _choose_auto_candidate(
+    candidates: Sequence[_PlacementCandidate],
+) -> tuple[_PlacementCandidate | None, bool]:
+    if not candidates:
+        return (None, False)
+    chosen = candidates[0]
+    if chosen.source == "primary":
+        return (chosen, False)
+
+    best_primary = _best_candidate_for_source(candidates, source="primary")
+    if best_primary is None:
+        return (chosen, False)
+
+    score_gap = float(chosen.score) - float(best_primary.score)
+    coverage_floor = max(0.78, float(chosen.coverage) - 0.08)
+    if score_gap <= _HYBRID_AUTO_PRIMARY_SCORE_MARGIN and float(best_primary.coverage) >= coverage_floor:
+        return (best_primary, True)
+    return (chosen, False)
+
+
+def _should_blend_primary_candidate(
+    *,
+    chosen: _PlacementCandidate,
+    secondary_best: _PlacementCandidate | None,
+) -> bool:
+    if secondary_best is None:
+        return False
+    secondary_advantage = float(secondary_best.score) - float(chosen.score)
+    if secondary_advantage < _HYBRID_BLEND_SECONDARY_ADVANTAGE_MIN:
+        return False
+    # Blend only on weak primary alignments. On good pages blending to fallback
+    # geometry usually hurts Surya-level fidelity.
+    return float(chosen.coverage) < _HYBRID_ALIGN_MIN_COVERAGE
+
+
 def _blend_placements_vertical(
     *,
     placements: Sequence[tuple[tuple[float, float, float, float], str]],
@@ -1870,8 +1918,10 @@ def _build_searchable_pdf_from_text(
                         secondary_data = fallback_page if isinstance(fallback_page, dict) else None
                         candidates_for_log: list[_PlacementCandidate] = []
                         chosen: _PlacementCandidate | None = None
+                        auto_primary_override = False
                         blended = False
                         blend_reference = "none"
+                        secondary_best: _PlacementCandidate | None = None
 
                         if effective_policy == _HYBRID_POLICY_SURYA_ONLY:
                             if primary_data is not None:
@@ -1898,6 +1948,7 @@ def _build_searchable_pdf_from_text(
                                 candidates_for_log.extend(secondary_candidates)
                                 if secondary_candidates:
                                     chosen = secondary_candidates[0]
+                                    secondary_best = secondary_candidates[0]
                         elif effective_policy == _HYBRID_POLICY_SOFTLINE:
                             primary_candidates: list[_PlacementCandidate] = []
                             secondary_candidates: list[_PlacementCandidate] = []
@@ -1921,6 +1972,9 @@ def _build_searchable_pdf_from_text(
                                 )
                             candidates_for_log.extend(primary_candidates)
                             candidates_for_log.extend(secondary_candidates)
+                            secondary_best = (
+                                secondary_candidates[0] if secondary_candidates else None
+                            )
                             chosen = primary_candidates[0] if primary_candidates else (
                                 secondary_candidates[0] if secondary_candidates else None
                             )
@@ -1934,8 +1988,11 @@ def _build_searchable_pdf_from_text(
                                 secondary_page_data=secondary_data,
                             )
                             candidates_for_log.extend(combined_candidates)
-                            if combined_candidates:
-                                chosen = combined_candidates[0]
+                            secondary_best = _best_candidate_for_source(
+                                combined_candidates,
+                                source="secondary",
+                            )
+                            chosen, auto_primary_override = _choose_auto_candidate(combined_candidates)
 
                         if chosen is not None:
                             placements = list(chosen.placements)
@@ -1943,6 +2000,10 @@ def _build_searchable_pdf_from_text(
                                 chosen.source == "primary"
                                 and secondary_data is not None
                                 and effective_policy in {_HYBRID_POLICY_AUTO, _HYBRID_POLICY_SOFTLINE}
+                                and _should_blend_primary_candidate(
+                                    chosen=chosen,
+                                    secondary_best=secondary_best,
+                                )
                             )
                             if need_blend:
                                 reference_boxes = _geometry_boxes_in_reading_order(
@@ -1986,6 +2047,7 @@ def _build_searchable_pdf_from_text(
                                 "chosen_token_ratio": (
                                     round(float(chosen.token_ratio), 6) if chosen is not None else None
                                 ),
+                                "auto_primary_override": auto_primary_override,
                                 "blended": blended,
                                 "blend_reference": blend_reference,
                                 "blend_primary_weight": (effective_blend_weight if blended else None),

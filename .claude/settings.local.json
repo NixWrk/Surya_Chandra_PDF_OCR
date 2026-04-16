@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add *)",
+      "Bash(git commit -m 'feat\\(scanner\\): implement geometry alignment improvements *)",
+      "Bash(dir \"D:\\\\Git_Code\\\\Surya_Chandra_PDF_OCR\\\\outputs\\\\full_hybrid_eval_20260414_163835\" /s /b)",
+      "Bash(dir \"D:\\\\Git_Code\\\\Surya_Chandra_PDF_OCR\\\\outputs\\\\full_hybrid_eval_20260414_163835\\\\gost\" /s /b)",
+      "Bash(dir \"D:\\\\Git_Code\\\\Surya_Chandra_PDF_OCR\\\\outputs\\\\full_hybrid_eval_20260414_163835\\\\gost\\\\_compare_txt\" /s /b)",
+      "Bash(Get-ChildItem -Path \"D:\\\\Git_Code\\\\Surya_Chandra_PDF_OCR\\\\outputs\\\\full_hybrid_eval_20260414_163835\\\\gost\" -Recurse)"
+    ]
+  }
+}
