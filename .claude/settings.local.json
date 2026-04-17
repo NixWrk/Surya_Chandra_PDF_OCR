@@ -6,7 +6,13 @@
       "Bash(dir \"D:\\\\Git_Code\\\\Surya_Chandra_PDF_OCR\\\\outputs\\\\full_hybrid_eval_20260414_163835\" /s /b)",
       "Bash(dir \"D:\\\\Git_Code\\\\Surya_Chandra_PDF_OCR\\\\outputs\\\\full_hybrid_eval_20260414_163835\\\\gost\" /s /b)",
       "Bash(dir \"D:\\\\Git_Code\\\\Surya_Chandra_PDF_OCR\\\\outputs\\\\full_hybrid_eval_20260414_163835\\\\gost\\\\_compare_txt\" /s /b)",
-      "Bash(Get-ChildItem -Path \"D:\\\\Git_Code\\\\Surya_Chandra_PDF_OCR\\\\outputs\\\\full_hybrid_eval_20260414_163835\\\\gost\" -Recurse)"
+      "Bash(Get-ChildItem -Path \"D:\\\\Git_Code\\\\Surya_Chandra_PDF_OCR\\\\outputs\\\\full_hybrid_eval_20260414_163835\\\\gost\" -Recurse)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Read(//d D:/Git_Code/**)",
+      "Bash(/oh-my-claudecode:setup)",
+      "Bash(cd /d \"D:/Git_Code/Surya_Chandra_PDF_OCR\")",
+      "Bash(dir .venv\\\\Scripts)"
     ]
   }
 }
