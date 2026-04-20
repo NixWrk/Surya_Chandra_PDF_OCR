@@ -1,31 +1,49 @@
-# Surya_Chandra_PDF_OCR
+# Surya Chandra PDF OCR
 
-OCR-only репозиторий для сборки `searchable PDF` из входного PDF.
+OCR-only repository for building searchable PDF from scanned PDF input.
 
-Поддерживаемые режимы:
+Supported modes:
 
 1. `surya` (`surya-surya`)
 2. `chandra` (`chandra-chandra`)
-3. `chandra+surya` (гибрид)
+3. `chandra+surya` (hybrid: Chandra text + Surya geometry)
 
-В гибриде итоговый PDF строится как:
+## Core principles
 
-1. текст от `chandra`
-2. геометрия от `surya`
+1. OCR pipeline only (no camera/session UI legacy).
+2. Dual-venv runtime to avoid dependency conflicts between engines.
+3. Strict geometry behavior for Surya (no silent text-only degradation).
 
-## Быстрый старт (минимальный локальный GUI)
+## Repository layout
+
+1. `src/uniscan/app` - orchestration (`build_searchable_pdf`, mode routing)
+2. `src/uniscan/ocr` - OCR benchmark + artifact-based searchable build
+3. `src/uniscan/ui/basic_ocr_gui.py` - minimal local GUI
+4. `run_basic_gui.cmd` - GUI launcher with dual-venv routing
+5. `setup_dual_venv.cmd` - one-time environment setup
+6. `docs/` - cleanup plan, inventory, operational notes
+
+## Quick start (recommended)
 
 ```powershell
+cd D:\Git_Code\Surya_Chandra_PDF_OCR
+.\setup_dual_venv.cmd
 .\run_basic_gui.cmd
 ```
 
-Скрипт:
+`setup_dual_venv.cmd` creates:
 
-1. создает `.venv`
-2. ставит проект и OCR-зависимости
-3. запускает минимальный GUI `src/uniscan/ui/basic_ocr_gui.py`
+1. `.venv_surya`
+2. `.venv_chandra`
 
-## Основные CLI-команды
+`run_basic_gui.cmd` sets:
+
+1. `UNISCAN_SURYA_PYTHON=<repo>\.venv_surya\Scripts\python.exe`
+2. `UNISCAN_CHANDRA_PYTHON=<repo>\.venv_chandra\Scripts\python.exe`
+
+So each OCR engine runs in its own interpreter.
+
+## CLI entrypoints
 
 ```powershell
 python -m uniscan benchmark-ocr --help
@@ -37,7 +55,7 @@ python -m uniscan searchable-pdf --help
 python -m uniscan serve-http --help
 ```
 
-## Базовый сценарий PDF -> searchable PDF
+## Typical pipeline
 
 ```powershell
 python -m uniscan searchable-pdf `
@@ -46,63 +64,74 @@ python -m uniscan searchable-pdf `
   --strict
 ```
 
-## Артефактный режим (text/geometry из готовых прогонов)
+## Hybrid geometry behavior
+
+In hybrid mode:
+
+1. Text source: Chandra
+2. Geometry source: Surya
+
+Surya geometry sidecars are mandatory by default. If geometry sidecars are missing, run fails instead of silently falling back to low-quality text-only behavior.
+
+## Caches and local artifacts
+
+Runtime caches are local to repository root (ignored by git):
+
+1. `.hf_cache*`
+2. `.surya_cache`
+3. `.modelscope_cache`
+4. `.venv*`
+5. `.tmp*`
+6. `outputs/`
+
+## Troubleshooting
+
+### 1) Chandra fails with `CUDA unavailable`
+
+Check torch stack inside `.venv_chandra`:
 
 ```powershell
-python -m uniscan build-searchable-from-artifacts `
-  --compare-dir "D:\path\_compare_txt" `
-  --pdf-root "D:\path\pdf_root" `
-  --output "D:\path\out" `
-  --engines chandra `
-  --chandra-geometry-policy auto `
-  --geometry-debug-log `
-  --strict
+@'
+import torch
+print(torch.__version__)
+print(torch.cuda.is_available())
+'@ | .\.venv_chandra\Scripts\python.exe -
 ```
 
-Политики гибридной геометрии для `chandra`:
-
-1. `auto`
-2. `surya_only`
-3. `softline`
-
-## HTTP сервис (опционально)
+If needed, reinstall CUDA wheels:
 
 ```powershell
-python -m uniscan serve-http --host 127.0.0.1 --port 8000
+uv pip install --python .\.venv_chandra\Scripts\python.exe `
+  --index-url https://download.pytorch.org/whl/cu128 `
+  --upgrade --reinstall `
+  "torch==2.11.0+cu128" `
+  "torchvision==0.26.0+cu128" `
+  "torchaudio==2.11.0+cu128"
 ```
 
-Доступно:
+### 2) Chandra cache preflight fails
 
-1. `GET /` — web GUI
-2. `GET /health`
-3. `POST /searchable-pdf`
-4. `POST /api/jobs`
-5. `GET /api/jobs/{id}`
-6. `GET /api/jobs/{id}/result`
-
-## Dual-Venv Mode (Recommended)
-
-Use isolated environments to avoid dependency conflicts:
-
-1. `.venv_surya` for Surya OCR + geometry.
-2. `.venv_chandra` for Chandra OCR text.
-
-One-time setup:
+Set cache root explicitly before launch:
 
 ```powershell
-.\setup_dual_venv.cmd
-```
-
-Launch GUI with dual routing:
-
-```powershell
+$env:UNISCAN_CHANDRA_HF_HOME = "D:\Git_Code\Surya_Chandra_PDF_OCR\.hf_cache"
 .\run_basic_gui.cmd
 ```
 
-Runtime routing is controlled by:
+### 3) Surya fallback must stay disabled
 
-1. `UNISCAN_SURYA_PYTHON`
-2. `UNISCAN_CHANDRA_PYTHON`
+Default behavior enforces geometry quality:
 
-When these variables are set, each OCR engine is executed in its own interpreter,
-while the main orchestrator remains in the GUI process.
+1. `UNISCAN_SURYA_ALLOW_TEXT_FALLBACK=0`
+2. `UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON=1`
+
+## Cleanup and refactor docs
+
+1. `docs/CLEANUP_REFACTOR_PLAN.md`
+2. `docs/REPO_INVENTORY_KEEP_REMOVE.md`
+
+## Rollback checkpoint
+
+Stable checkpoint tag before the large cleanup/refactor pass:
+
+`checkpoint/dual-venv-stable-20260420`
