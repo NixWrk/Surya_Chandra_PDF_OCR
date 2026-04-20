@@ -72,6 +72,25 @@ def _extract_pdf_text(pdf_path: Path) -> str:
         doc.close()
 
 
+def _normalize_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _build_text_pdf(tmp_path: Path, name: str, page_texts: list[str]) -> Path:
+    import fitz  # type: ignore
+
+    pdf_path = tmp_path / f"{name}.pdf"
+    doc = fitz.open()
+    try:
+        for text in page_texts:
+            page = doc.new_page(width=300, height=200)
+            page.insert_text((20, 100), text, fontsize=12)
+        doc.save(str(pdf_path))
+    finally:
+        doc.close()
+    return pdf_path
+
+
 def test_parse_artifact_filename() -> None:
     document, engine = _parse_artifact_filename(Path("ГОСТ__chandra.txt"))
     assert document == "ГОСТ"
@@ -930,6 +949,56 @@ def test_run_artifact_searchable_package_require_markers(tmp_path: Path) -> None
     assert "no explicit page markers" in (results[0].error or "").lower()
 
 
+def test_run_artifact_searchable_package_delete_original_text_layer(tmp_path: Path) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    out_keep = tmp_path / "out_keep"
+    out_delete = tmp_path / "out_delete"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+
+    doc_name = "fixture_doc"
+    _build_text_pdf(
+        pdf_root,
+        doc_name,
+        ["BASE PAGE ONE", "BASE PAGE TWO SHOULD DISAPPEAR"],
+    )
+    (compare_dir / f"{doc_name}__chandra.txt").write_text(
+        "[SOURCE PAGE 1]\nNEW PAGE ONE OCR\n",
+        encoding="utf-8",
+    )
+
+    keep_rows = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=out_keep,
+        engines=("chandra",),
+        require_page_markers=True,
+        delete_original_text_layer=False,
+    )
+    assert len(keep_rows) == 1
+    assert keep_rows[0].status == "ok"
+    assert keep_rows[0].searchable_pdf_path is not None
+    keep_text = _normalize_ws(_extract_pdf_text(Path(keep_rows[0].searchable_pdf_path)))
+    assert "NEW PAGE ONE OCR" in keep_text
+    assert "BASE PAGE TWO SHOULD DISAPPEAR" in keep_text
+
+    delete_rows = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=out_delete,
+        engines=("chandra",),
+        require_page_markers=True,
+        delete_original_text_layer=True,
+    )
+    assert len(delete_rows) == 1
+    assert delete_rows[0].status == "ok"
+    assert delete_rows[0].searchable_pdf_path is not None
+    delete_text = _normalize_ws(_extract_pdf_text(Path(delete_rows[0].searchable_pdf_path)))
+    assert "NEW PAGE ONE OCR" in delete_text
+    assert "BASE PAGE TWO SHOULD DISAPPEAR" not in delete_text
+
+
 def test_build_compare_txt_from_benchmark(tmp_path: Path) -> None:
     benchmark_root = tmp_path / "bench"
     output_dir = tmp_path / "compare_txt"
@@ -1023,6 +1092,7 @@ def test_cli_build_searchable_from_artifacts_success(monkeypatch, tmp_path: Path
         assert kwargs["output_dir"] == output_dir
         assert kwargs["engines"] == ("chandra", "surya")
         assert kwargs["require_page_markers"] is False
+        assert kwargs["delete_original_text_layer"] is False
         return [
             SimpleNamespace(
                 document="ГОСТ",
@@ -1070,6 +1140,7 @@ def test_cli_build_searchable_from_artifacts_strict_fails(monkeypatch, tmp_path:
 
     def fake_run(**_kwargs):
         assert _kwargs["require_page_markers"] is True
+        assert _kwargs["delete_original_text_layer"] is False
         return [
             SimpleNamespace(
                 document="ГОСТ",
@@ -1115,6 +1186,51 @@ def test_cli_build_searchable_from_artifacts_strict_fails(monkeypatch, tmp_path:
     stdout = capsys.readouterr().out
     assert exit_code == 1
     assert "summary" in stdout
+
+
+def test_cli_build_searchable_from_artifacts_delete_text_layer_flag(monkeypatch, tmp_path: Path, capsys) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+    output_dir.mkdir()
+
+    def fake_run(**kwargs):
+        assert kwargs["delete_original_text_layer"] is True
+        return [
+            SimpleNamespace(
+                document="fixture",
+                engine="chandra",
+                status="ok",
+                source_pdf_path="x.pdf",
+                text_artifact_path="x.txt",
+                searchable_pdf_path="ok.pdf",
+                page_count=1,
+                text_chars=10,
+                elapsed_seconds=0.1,
+                error=None,
+            )
+        ]
+
+    monkeypatch.setattr("uniscan.cli.run_artifact_searchable_package", fake_run)
+    monkeypatch.setattr("uniscan.cli.summarize_artifact_searchable_package", lambda rows: f"rows={len(rows)}")
+
+    exit_code = main(
+        [
+            "build-searchable-from-artifacts",
+            "--compare-dir",
+            str(compare_dir),
+            "--pdf-root",
+            str(pdf_root),
+            "--output",
+            str(output_dir),
+            "--delete-original-text-layer",
+        ]
+    )
+    stdout = capsys.readouterr().out
+    assert exit_code == 0
+    assert "rows=1" in stdout
 
 
 def test_cli_prepare_compare_txt_strict_fails(tmp_path: Path, capsys) -> None:

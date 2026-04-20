@@ -1892,13 +1892,19 @@ def _build_searchable_pdf_from_text(
 
     try:
         for page_idx, source_page in enumerate(reader.pages):
+            # Important: first clone page into writer, then mutate the clone.
+            # Mutating reader page objects in-place can leak resource changes
+            # into sibling pages that share inherited resource dictionaries.
+            writer.add_page(source_page)
+            target_page = writer.pages[-1]
+
             page_text = page_texts[page_idx] if page_idx < len(page_texts) else ""
             surya_page = (surya_geometry_by_page or {}).get(page_idx + 1)
             fallback_page = (fallback_geometry_by_page or {}).get(page_idx + 1)
             if page_text.strip() or isinstance(surya_page, dict) or isinstance(fallback_page, dict):
-                _normalize_source_page_rotation(source_page)
-                crop_box = source_page.cropbox
-                media_box = source_page.mediabox
+                _normalize_source_page_rotation(target_page)
+                crop_box = target_page.cropbox
+                media_box = target_page.mediabox
                 crop_x0 = float(crop_box.left)
                 crop_y0 = float(crop_box.bottom)
                 crop_width = float(crop_box.width)
@@ -2076,16 +2082,52 @@ def _build_searchable_pdf_from_text(
                     font_name=font_name,
                 )
                 if abs(crop_x0) > 1e-6 or abs(crop_y0) > 1e-6:
-                    source_page.merge_translated_page(overlay_page, crop_x0, crop_y0)
+                    target_page.merge_translated_page(overlay_page, crop_x0, crop_y0)
                 else:
-                    source_page.merge_page(overlay_page)
-            writer.add_page(source_page)
+                    target_page.merge_page(overlay_page)
     finally:
         layout_doc.close()
 
     with out_pdf.open("wb") as fh:
         writer.write(fh)
     return page_count, len(text)
+
+
+def _build_textless_source_pdf(*, source_pdf: Path, out_pdf: Path, dpi: int = 300) -> Path:
+    """Render pages into an image-only PDF, stripping any existing text layer."""
+    import fitz  # type: ignore
+
+    scale = max(float(dpi), 72.0) / 72.0
+    matrix = fitz.Matrix(scale, scale)
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+
+    src_doc = fitz.open(str(source_pdf))
+    dst_doc = fitz.open()
+    try:
+        for src_page in src_doc:
+            pix = src_page.get_pixmap(matrix=matrix, alpha=False)
+            dst_page = dst_doc.new_page(
+                width=float(src_page.rect.width),
+                height=float(src_page.rect.height),
+            )
+            dst_page.insert_image(dst_page.rect, pixmap=pix, keep_proportion=False)
+        dst_doc.save(str(out_pdf), garbage=4, deflate=True)
+    finally:
+        src_doc.close()
+        dst_doc.close()
+
+    return out_pdf
+
+
+def _resolve_textless_dpi() -> int:
+    raw = os.getenv("UNISCAN_TEXTLESS_DPI", "").strip()
+    if not raw:
+        return 300
+    try:
+        value = int(raw)
+    except ValueError:
+        return 300
+    return max(72, min(400, value))
 
 
 def run_artifact_searchable_package(
@@ -2095,6 +2137,7 @@ def run_artifact_searchable_package(
     output_dir: Path,
     engines: Sequence[str] | None = None,
     require_page_markers: bool = False,
+    delete_original_text_layer: bool = False,
     chandra_geometry_policy: str | None = None,
     chandra_blend_primary_y_weight: float | None = None,
     geometry_debug_log: bool = False,
@@ -2135,6 +2178,7 @@ def run_artifact_searchable_package(
     debug_enabled = bool(geometry_debug_log or _env_truthy("UNISCAN_GEOMETRY_DEBUG"))
 
     artifact_files = sorted(path for path in resolved_compare.glob("*.txt") if path.name.lower() != "sources_map.txt")
+    textless_cache: dict[Path, Path] = {}
 
     pdf_index: dict[str, Path] = {}
     for pdf_path in resolved_pdf_root.rglob("*.pdf"):
@@ -2185,6 +2229,23 @@ def run_artifact_searchable_package(
             )
             continue
 
+        source_pdf_for_build = source_pdf
+        if delete_original_text_layer:
+            source_key = source_pdf.resolve()
+            source_pdf_for_build = textless_cache.get(source_key, source_pdf)
+            if source_pdf_for_build == source_pdf:
+                try:
+                    relative_path = source_key.relative_to(resolved_pdf_root.resolve())
+                except ValueError:
+                    relative_path = Path(source_pdf.name)
+                textless_pdf = (resolved_output / "_source_pdf_without_text" / relative_path).with_suffix(".pdf")
+                source_pdf_for_build = _build_textless_source_pdf(
+                    source_pdf=source_pdf,
+                    out_pdf=textless_pdf,
+                    dpi=_resolve_textless_dpi(),
+                )
+                textless_cache[source_key] = source_pdf_for_build
+
         try:
             text = artifact_path.read_text(encoding="utf-8", errors="ignore")
             if require_page_markers and not _has_explicit_page_markers(text):
@@ -2224,7 +2285,7 @@ def run_artifact_searchable_package(
             geometry_debug_rows: list[dict[str, object]] | None = [] if (debug_enabled and engine == "chandra") else None
             out_pdf = resolved_output / document / f"{document}__{engine}_searchable.pdf"
             page_count, text_chars = _build_searchable_pdf_from_text(
-                source_pdf=source_pdf,
+                source_pdf=source_pdf_for_build,
                 text=text,
                 out_pdf=out_pdf,
                 surya_geometry_by_page=surya_geometry_by_page,
@@ -2261,7 +2322,7 @@ def run_artifact_searchable_package(
                     document=document,
                     engine=engine,
                     status="ok",
-                    source_pdf_path=str(source_pdf),
+                    source_pdf_path=str(source_pdf_for_build),
                     text_artifact_path=str(artifact_path),
                     searchable_pdf_path=str(out_pdf),
                     page_count=page_count,
@@ -2276,7 +2337,7 @@ def run_artifact_searchable_package(
                     document=document,
                     engine=engine,
                     status="error",
-                    source_pdf_path=str(source_pdf),
+                    source_pdf_path=str(source_pdf_for_build),
                     text_artifact_path=str(artifact_path),
                     searchable_pdf_path=None,
                     page_count=0,
