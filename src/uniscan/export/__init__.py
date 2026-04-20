@@ -1,17 +1,5 @@
-"""Export helpers for session pages."""
+"""Minimal export helpers used by OCR tests and fixtures."""
 
-from .exporters import (
-    export_image_paths_as_files,
-    export_image_paths_as_pdf,
-    export_image_paths_as_searchable_pdf,
-    export_pages_as_files,
-    export_pages_as_pdf,
-)
+from .exporters import export_pages_as_pdf
 
-__all__ = [
-    "export_pages_as_pdf",
-    "export_pages_as_files",
-    "export_image_paths_as_pdf",
-    "export_image_paths_as_searchable_pdf",
-    "export_image_paths_as_files",
-]
+__all__ = ["export_pages_as_pdf"]

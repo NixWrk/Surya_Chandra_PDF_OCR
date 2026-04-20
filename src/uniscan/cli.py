@@ -24,8 +24,6 @@ from uniscan.ocr import (
     summarize_ocr_canonical_package,
 )
 from uniscan.ocr.preprocessing import PREPROCESSING_MODES
-from uniscan.tools import run_crop_benchmark, summarize_benchmark_results
-from uniscan.ui import run_app
 from uniscan.web import run_http_server
 
 
@@ -38,39 +36,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Print package version and exit.",
     )
     subparsers = parser.add_subparsers(dest="command")
-
-    benchmark_parser = subparsers.add_parser(
-        "benchmark-crop",
-        help="Compare crop backends on one input folder and write one PDF per backend.",
-    )
-    benchmark_parser.add_argument("--input", required=True, type=Path, help="Input folder path.")
-    benchmark_parser.add_argument("--output", required=True, type=Path, help="Output folder path.")
-    benchmark_parser.add_argument(
-        "--pdf-dpi",
-        type=int,
-        default=300,
-        help="Target DPI for generated PDFs.",
-    )
-    benchmark_parser.add_argument(
-        "--backends",
-        nargs="+",
-        default=None,
-        help=(
-            "Backend names to run. Defaults to paddleocr_uvdoc."
-        ),
-    )
-    benchmark_parser.add_argument(
-        "--scanner-root",
-        type=Path,
-        default=None,
-        help="Optional root directory for vendored camscan backend.",
-    )
-    benchmark_parser.add_argument(
-        "--uvdoc-cache",
-        type=Path,
-        default=None,
-        help="Optional cache directory for PaddleOCR UVDoc weights.",
-    )
 
     ocr_benchmark_parser = subparsers.add_parser(
         "benchmark-ocr",
@@ -224,6 +189,14 @@ def main(argv: list[str] | None = None) -> int:
         "--require-page-markers",
         action="store_true",
         help="Require explicit page markers in TXT artifacts ([SOURCE PAGE N] or form-feed).",
+    )
+    artifact_searchable_parser.add_argument(
+        "--delete-original-text-layer",
+        action="store_true",
+        help=(
+            "Build searchable PDF over image-only source (strip existing text layer first). "
+            "Recommended when source PDF already has OCR text."
+        ),
     )
     artifact_searchable_parser.add_argument(
         "--chandra-geometry-policy",
@@ -381,17 +354,6 @@ def main(argv: list[str] | None = None) -> int:
 
         print(__version__)
         return 0
-    if args.command == "benchmark-crop":
-        results = run_crop_benchmark(
-            input_dir=args.input,
-            output_dir=args.output,
-            backends=tuple(args.backends) if args.backends else None,
-            pdf_dpi=args.pdf_dpi,
-            scanner_root=args.scanner_root,
-            uvdoc_cache_home=args.uvdoc_cache,
-        )
-        print(summarize_benchmark_results(results))
-        return 0 if any(result.output_pdf is not None for result in results) else 1
     if args.command == "benchmark-ocr":
         try:
             page_numbers = parse_page_numbers(args.pages)
@@ -438,6 +400,7 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output,
             engines=tuple(args.engines) if args.engines else None,
             require_page_markers=bool(args.require_page_markers or args.strict),
+            delete_original_text_layer=bool(args.delete_original_text_layer),
             chandra_geometry_policy=args.chandra_geometry_policy,
             chandra_blend_primary_y_weight=args.chandra_blend_weight,
             geometry_debug_log=bool(args.geometry_debug_log),
@@ -498,7 +461,8 @@ def main(argv: list[str] | None = None) -> int:
             lang=args.lang,
         )
         return 0
-    return run_app()
+    parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":

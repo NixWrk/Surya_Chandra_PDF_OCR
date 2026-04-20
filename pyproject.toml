@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "uniscan"
 version = "0.1.0"
-description = "Unified document scanner (camera + files/folder + PDF) toolkit."
+description = "OCR pipeline for building searchable PDF with Surya/Chandra/hybrid modes."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -17,8 +17,7 @@ dependencies = [
   "numpy>=1.26",
   "pillow>=10.0",
   "img2pdf>=0.5",
-  "pymupdf>=1.24",
-  "customtkinter>=5.2"
+  "pymupdf>=1.24"
 ]
 
 [project.optional-dependencies]
