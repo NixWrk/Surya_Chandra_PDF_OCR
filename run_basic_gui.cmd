@@ -3,99 +3,80 @@ setlocal EnableExtensions
 
 cd /d "%~dp0"
 
-set "VENV_PY=.venv\Scripts\python.exe"
-set "LOCAL_TMP=%CD%\.tmp_bootstrap"
+set "VENV_CHANDRA=%CD%\.venv_chandra"
+set "VENV_SURYA=%CD%\.venv_surya"
+set "PY_MAIN=%VENV_CHANDRA%\Scripts\python.exe"
+set "PY_SURYA=%VENV_SURYA%\Scripts\python.exe"
+
+if not exist "%PY_MAIN%" (
+  echo [OCR GUI] Missing %PY_MAIN%
+  echo [OCR GUI] Run setup_dual_venv.cmd first.
+  exit /b 1
+)
+if not exist "%PY_SURYA%" (
+  echo [OCR GUI] Missing %PY_SURYA%
+  echo [OCR GUI] Run setup_dual_venv.cmd first.
+  exit /b 1
+)
+
 set "UV_CACHE_DIR=%CD%\.uv_cache"
-
-if not exist "%LOCAL_TMP%" mkdir "%LOCAL_TMP%"
+set "TEMP=%CD%\.tmp_bootstrap"
+set "TMP=%TEMP%"
 if not exist "%UV_CACHE_DIR%" mkdir "%UV_CACHE_DIR%"
-set "TEMP=%LOCAL_TMP%"
-set "TMP=%LOCAL_TMP%"
+if not exist "%TEMP%" mkdir "%TEMP%"
 
-if not exist "%VENV_PY%" (
-  echo [UniScan Basic GUI] Creating virtual environment in .venv ...
-  set "VENV_CREATED=0"
+set "UNISCAN_CHANDRA_PYTHON=%PY_MAIN%"
+set "UNISCAN_SURYA_PYTHON=%PY_SURYA%"
 
-  where py >nul 2>nul
-  if "%ERRORLEVEL%"=="0" (
-    py -3.11 -m venv .venv
-    if "%ERRORLEVEL%"=="0" set "VENV_CREATED=1"
+if not defined UNISCAN_CHANDRA_HF_HOME set "UNISCAN_CHANDRA_HF_HOME=%CD%\.hf_cache_chandra"
+set "LEGACY_HF_HOME=%CD%\.hf_cache"
+set "CHANDRA_CACHE_READY=0"
+if exist "%UNISCAN_CHANDRA_HF_HOME%\models--datalab-to--chandra\snapshots\*\model.safetensors.index.json" set "CHANDRA_CACHE_READY=1"
+if exist "%UNISCAN_CHANDRA_HF_HOME%\hub\models--datalab-to--chandra\snapshots\*\model.safetensors.index.json" set "CHANDRA_CACHE_READY=1"
+if "%CHANDRA_CACHE_READY%"=="0" (
+  if exist "%LEGACY_HF_HOME%\models--datalab-to--chandra\snapshots\*\model.safetensors.index.json" (
+    echo [OCR GUI] Using legacy Chandra cache from .hf_cache
+    set "UNISCAN_CHANDRA_HF_HOME=%LEGACY_HF_HOME%"
+    set "CHANDRA_CACHE_READY=1"
   )
-
-  if "%VENV_CREATED%"=="0" (
-    where python >nul 2>nul
-    if "%ERRORLEVEL%"=="0" (
-      python -m venv .venv
-      if "%ERRORLEVEL%"=="0" set "VENV_CREATED=1"
-    )
-  )
-
-  if "%VENV_CREATED%"=="0" (
-    where python >nul 2>nul
-    if "%ERRORLEVEL%"=="0" (
-      python -m virtualenv .venv
-      if "%ERRORLEVEL%"=="0" set "VENV_CREATED=1"
-    )
-  )
-
-  if "%VENV_CREATED%"=="0" (
-    where uv >nul 2>nul
-    if "%ERRORLEVEL%"=="0" (
-      uv venv .venv
-      if "%ERRORLEVEL%"=="0" set "VENV_CREATED=1"
-    )
-  )
-
-  if "%VENV_CREATED%"=="0" goto :error
 )
-
-if not exist "%VENV_PY%" (
-  echo [UniScan Basic GUI] Python in .venv was not created.
-  goto :error
-)
-
-echo [UniScan Basic GUI] Installing/updating dependencies ...
-"%VENV_PY%" -m pip --version >nul 2>nul
-if "%ERRORLEVEL%"=="0" (
-  "%VENV_PY%" -m pip install -U pip
-  if errorlevel 1 goto :error
-
-  "%VENV_PY%" -m pip install -e ".[ocr]"
-  if errorlevel 1 goto :error
-
-  "%VENV_PY%" -m pip install -U ^
-    "surya-ocr" ^
-    "chandra-ocr[hf]" ^
-    "requests" ^
-    "transformers==4.57.1" ^
-    "tokenizers==0.22.1" ^
-    "huggingface-hub==0.34.4"
-  if errorlevel 1 goto :error
-) else (
-  where uv >nul 2>nul
-  if errorlevel 1 (
-    echo [UniScan Basic GUI] pip is missing in .venv and uv is not available.
-    goto :error
+if "%CHANDRA_CACHE_READY%"=="0" (
+  if exist "%LEGACY_HF_HOME%\hub\models--datalab-to--chandra\snapshots\*\model.safetensors.index.json" (
+    echo [OCR GUI] Using legacy Chandra hub cache from .hf_cache\hub
+    set "UNISCAN_CHANDRA_HF_HOME=%LEGACY_HF_HOME%"
+    set "CHANDRA_CACHE_READY=1"
   )
-  uv pip install --python "%VENV_PY%" -e ".[ocr]"
-  if errorlevel 1 goto :error
-  uv pip install --python "%VENV_PY%" -U ^
-    "surya-ocr" ^
-    "chandra-ocr[hf]" ^
-    "requests" ^
-    "transformers==4.57.1" ^
-    "tokenizers==0.22.1" ^
-    "huggingface-hub==0.34.4"
-  if errorlevel 1 goto :error
 )
+set "UNISCAN_CHANDRA_HUGGINGFACE_HUB_CACHE=%UNISCAN_CHANDRA_HF_HOME%\hub"
+set "UNISCAN_CHANDRA_HF_HUB_CACHE=%UNISCAN_CHANDRA_HF_HOME%\hub"
 
-set "PATH=%CD%\.venv\Scripts;%PATH%"
+set "UNISCAN_SURYA_HF_HOME=%CD%\.hf_cache_surya"
+set "UNISCAN_SURYA_HUGGINGFACE_HUB_CACHE=%UNISCAN_SURYA_HF_HOME%\hub"
+set "UNISCAN_SURYA_HF_HUB_CACHE=%UNISCAN_SURYA_HF_HOME%\hub"
+set "UNISCAN_SURYA_MODEL_CACHE_DIR=%CD%\.surya_cache"
+set "UNISCAN_SURYA_MODELSCOPE_CACHE=%CD%\.modelscope_cache"
 
-echo [UniScan Basic GUI] Launching ...
-"%VENV_PY%" -m uniscan.ui.basic_ocr_gui
+set "HF_HOME=%UNISCAN_CHANDRA_HF_HOME%"
+set "HUGGINGFACE_HUB_CACHE=%UNISCAN_CHANDRA_HUGGINGFACE_HUB_CACHE%"
+set "HF_HUB_CACHE=%UNISCAN_CHANDRA_HF_HUB_CACHE%"
+set "TRANSFORMERS_CACHE="
+set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
+set "TORCH_DEVICE=cuda:0"
+set "UNISCAN_CHANDRA_PREFER_GPU=1"
+set "UNISCAN_CHANDRA_REQUIRE_GPU=1"
+set "UNISCAN_SURYA_ALLOW_TEXT_FALLBACK=0"
+set "UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON=1"
+
+if not exist "%UNISCAN_CHANDRA_HF_HOME%" mkdir "%UNISCAN_CHANDRA_HF_HOME%"
+if not exist "%UNISCAN_CHANDRA_HUGGINGFACE_HUB_CACHE%" mkdir "%UNISCAN_CHANDRA_HUGGINGFACE_HUB_CACHE%"
+if not exist "%UNISCAN_SURYA_HF_HOME%" mkdir "%UNISCAN_SURYA_HF_HOME%"
+if not exist "%UNISCAN_SURYA_HUGGINGFACE_HUB_CACHE%" mkdir "%UNISCAN_SURYA_HUGGINGFACE_HUB_CACHE%"
+if not exist "%UNISCAN_SURYA_MODEL_CACHE_DIR%" mkdir "%UNISCAN_SURYA_MODEL_CACHE_DIR%"
+if not exist "%UNISCAN_SURYA_MODELSCOPE_CACHE%" mkdir "%UNISCAN_SURYA_MODELSCOPE_CACHE%"
+
+set "PATH=%VENV_CHANDRA%\Scripts;%PATH%"
+
+echo [OCR GUI] Launching with dual-venv engine routing ...
+"%PY_MAIN%" -m uniscan.ui.basic_ocr_gui
 set "APP_EXIT=%ERRORLEVEL%"
 exit /b %APP_EXIT%
-
-:error
-echo [UniScan Basic GUI] Startup failed.
-exit /b 1

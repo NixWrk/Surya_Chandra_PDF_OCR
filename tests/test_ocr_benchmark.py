@@ -117,10 +117,28 @@ def test_run_ocr_benchmark_writes_report_and_artifacts(tmp_path, monkeypatch) ->
         assert len(image_paths) == 1
         return f"mineru:{lang}:{len(image_paths)}", 14
 
-    def fake_chandra(image_paths, *, lang, work_dir, which_fn, run_cmd):
+    def fake_chandra(image_paths, *, lang, work_dir, which_fn, run_cmd, page_progress_cb=None):
         assert "chandra_work" in str(work_dir)
-        assert len(image_paths) == 1
-        return f"chandra:{lang}:{len(image_paths)}", 15
+        assert len(image_paths) == 2
+        if page_progress_cb is not None:
+            page_progress_cb(1, 2)
+            page_progress_cb(2, 2)
+        sidecar = work_dir / "chandra_page_lines.json"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar_payload = {
+            "images": [
+                {
+                    "image_name": image_paths[0].name,
+                    "pages": [{"text_lines": [{"text": "x" * 15, "bbox": [0, 0, 1, 1]}]}],
+                },
+                {
+                    "image_name": image_paths[1].name,
+                    "pages": [{"text_lines": [{"text": "x" * 15, "bbox": [0, 0, 1, 1]}]}],
+                },
+            ]
+        }
+        sidecar.write_text(json.dumps(sidecar_payload, ensure_ascii=False), encoding="utf-8")
+        return f"chandra:{lang}:{len(image_paths)}", 30
 
     def fake_olmocr(image_paths, *, lang, work_dir, which_fn, run_cmd):
         assert "olmocr_work" in str(work_dir)
@@ -439,35 +457,91 @@ def test_run_extraction_engine_pagewise_collects_surya_sidecar(tmp_path, monkeyp
     assert Path(page_metadata[0]["surya_page_lines_path"]).exists()
 
 
-def test_run_extraction_engine_pagewise_collects_chandra_sidecar(tmp_path, monkeypatch) -> None:
+def test_run_extraction_engine_pagewise_requires_surya_sidecar_by_default(tmp_path, monkeypatch) -> None:
     image_paths = [tmp_path / "p1.png"]
     image_paths[0].write_bytes(b"img")
 
     def fake_extract(engine, _image_paths, *, lang, work_dir, which_fn, run_cmd):
-        assert engine == OCR_ENGINE_CHANDRA
-        sidecar = work_dir / "chandra_page_lines.json"
-        sidecar.parent.mkdir(parents=True, exist_ok=True)
-        sidecar.write_text('{"images":[]}', encoding="utf-8")
-        return "ok-chandra", 9
+        assert engine == OCR_ENGINE_SURYA
+        return "ok-surya", 8
 
     monkeypatch.setattr(ocr_benchmark_mod, "_run_extraction_engine", fake_extract)
+    monkeypatch.delenv("UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON", raising=False)
+
+    with pytest.raises(RuntimeError, match="surya geometry sidecar is required"):
+        ocr_benchmark_mod._run_extraction_engine_pagewise(
+            OCR_ENGINE_SURYA,
+            image_paths,
+            source_pages_1based=[1],
+            lang="rus",
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: None,
+            run_cmd=lambda *_args, **_kwargs: None,
+        )
+
+
+def test_run_extraction_engine_pagewise_collects_chandra_sidecar(tmp_path, monkeypatch) -> None:
+    image_paths = [tmp_path / "p1.png", tmp_path / "p2.png"]
+    for image_path in image_paths:
+        image_path.write_bytes(b"img")
+    call_count = {"count": 0}
+
+    progress_steps: list[tuple[int, int, int]] = []
+
+    def fake_chandra_direct(
+        _image_paths,
+        *,
+        lang,
+        work_dir,
+        which_fn,
+        run_cmd,
+        page_progress_cb=None,
+    ):
+        call_count["count"] += 1
+        assert len(_image_paths) == 2
+        if page_progress_cb is not None:
+            page_progress_cb(1, 2)
+            page_progress_cb(2, 2)
+        sidecar = work_dir / "chandra_page_lines.json"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar_payload = {
+            "images": [
+                {
+                    "image_name": _image_paths[0].name,
+                    "pages": [{"text_lines": [{"text": "ok-chandra-1", "bbox": [0, 0, 1, 1]}]}],
+                },
+                {
+                    "image_name": _image_paths[1].name,
+                    "pages": [{"text_lines": [{"text": "ok-chandra-2", "bbox": [0, 0, 1, 1]}]}],
+                },
+            ]
+        }
+        sidecar.write_text(json.dumps(sidecar_payload, ensure_ascii=False), encoding="utf-8")
+        return "ok-chandra", 22
+
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_chandra_direct", fake_chandra_direct)
 
     page_texts, chars, page_errors, page_metadata = ocr_benchmark_mod._run_extraction_engine_pagewise(
         OCR_ENGINE_CHANDRA,
         image_paths,
-        source_pages_1based=[1],
+        source_pages_1based=[1, 2],
         lang="rus",
         work_dir=tmp_path / "work",
         which_fn=lambda _name: None,
         run_cmd=lambda *_args, **_kwargs: None,
+        progress_cb=lambda done, total, source_page: progress_steps.append((done, total, source_page)),
     )
 
-    assert page_texts == ["ok-chandra"]
-    assert chars == 9
+    assert call_count["count"] == 1
+    assert page_texts == ["ok-chandra-1", "ok-chandra-2"]
+    assert chars == len("ok-chandra-1") + len("ok-chandra-2")
     assert page_errors == []
-    assert len(page_metadata) == 1
+    assert len(page_metadata) == 2
     assert page_metadata[0]["source_page"] == 1
+    assert page_metadata[1]["source_page"] == 2
     assert Path(page_metadata[0]["chandra_page_lines_path"]).exists()
+    assert Path(page_metadata[1]["chandra_page_lines_path"]).exists()
+    assert progress_steps == [(1, 2, 1), (2, 2, 2)]
 
 
 def test_write_pagewise_text_artifacts_copies_chandra_geometry(tmp_path: Path) -> None:
@@ -596,6 +670,58 @@ def test_run_chandra_direct_allows_cli_fallback_when_enabled(monkeypatch, tmp_pa
     monkeypatch.setenv("UNISCAN_CHANDRA_ALLOW_CLI_FALLBACK", "1")
 
     text, chars = ocr_benchmark_mod._run_chandra_direct(
+        [image_path],
+        lang="rus",
+        work_dir=tmp_path / "work",
+        which_fn=lambda _name: None,
+        run_cmd=lambda *_args, **_kwargs: None,
+    )
+    assert text == "cli-ok"
+    assert chars == 6
+
+
+def test_run_surya_direct_disables_text_fallback_by_default(monkeypatch, tmp_path: Path) -> None:
+    image_path = tmp_path / "p1.png"
+    image_path.write_bytes(b"img")
+
+    def fail_module(*_args, **_kwargs):
+        raise RuntimeError("module failed")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("Text-only fallback must stay disabled by default")
+
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_surya_module_cli", fail_module)
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_text_engine_from_cli", fail_if_called)
+    monkeypatch.setattr(ocr_benchmark_mod, "_ensure_surya_cache_ready", lambda: None)
+    monkeypatch.delenv("UNISCAN_SURYA_ALLOW_TEXT_FALLBACK", raising=False)
+
+    with pytest.raises(RuntimeError, match="Text-only fallback is disabled"):
+        ocr_benchmark_mod._run_surya_direct(
+            [image_path],
+            lang="rus",
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: None,
+            run_cmd=lambda *_args, **_kwargs: None,
+        )
+
+
+def test_run_surya_direct_allows_text_fallback_when_enabled(monkeypatch, tmp_path: Path) -> None:
+    image_path = tmp_path / "p1.png"
+    image_path.write_bytes(b"img")
+
+    def fail_module(*_args, **_kwargs):
+        raise RuntimeError("module failed")
+
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_surya_module_cli", fail_module)
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_run_text_engine_from_cli",
+        lambda *_args, **_kwargs: ("cli-ok", 6),
+    )
+    monkeypatch.setattr(ocr_benchmark_mod, "_ensure_surya_cache_ready", lambda: None)
+    monkeypatch.setenv("UNISCAN_SURYA_ALLOW_TEXT_FALLBACK", "1")
+
+    text, chars = ocr_benchmark_mod._run_surya_direct(
         [image_path],
         lang="rus",
         work_dir=tmp_path / "work",

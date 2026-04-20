@@ -1,9 +1,11 @@
-"""Reusable OCR workflow orchestration for desktop/web frontends."""
+﻿"""Reusable OCR workflow orchestration for desktop/web frontends."""
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +38,24 @@ MODE_TO_ENGINES: dict[str, tuple[str, ...]] = {
     MODE_HYBRID: ("chandra",),
     MODE_BOTH: ("surya", "chandra"),
 }
+
+_ENGINE_TO_PYTHON_ENV: dict[str, str] = {
+    "surya": "UNISCAN_SURYA_PYTHON",
+    "chandra": "UNISCAN_CHANDRA_PYTHON",
+}
+
+_ENGINE_SUBPROCESS_ENV_SUFFIXES: tuple[str, ...] = (
+    "HF_HOME",
+    "HUGGINGFACE_HUB_CACHE",
+    "HF_HUB_CACHE",
+    "MODEL_CACHE_DIR",
+    "MODELSCOPE_CACHE",
+    "TRANSFORMERS_CACHE",
+    "TEMP",
+    "TMP",
+    "TORCH_DEVICE",
+    "UNISCAN_RUNTIME_TMP",
+)
 
 ProgressCallback = Callable[[int, str], None]
 
@@ -77,6 +97,113 @@ def _emit_progress(cb: ProgressCallback | None, percent: int, status: str) -> No
         return
     bounded = max(0, min(100, int(percent)))
     cb(bounded, status)
+
+
+def _resolve_engine_python(engine: str) -> Path | None:
+    env_name = _ENGINE_TO_PYTHON_ENV.get(engine)
+    if env_name is None:
+        return None
+    raw = (os.environ.get(env_name) or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve()
+    if not path.exists() or not path.is_file():
+        raise RuntimeError(f"{env_name} points to missing python executable: {path}")
+    return path
+
+
+def _build_engine_subprocess_env(*, engine: str, repo_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    engine_prefix = f"UNISCAN_{engine.upper()}_"
+    for suffix in _ENGINE_SUBPROCESS_ENV_SUFFIXES:
+        override_key = f"{engine_prefix}{suffix}"
+        if override_key not in os.environ:
+            continue
+        value = os.environ.get(override_key, "")
+        if value:
+            env[suffix] = value
+        else:
+            env.pop(suffix, None)
+
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    src_root = str((repo_root / "src").resolve())
+    env["PYTHONPATH"] = src_root if not existing_pythonpath else f"{src_root}{os.pathsep}{existing_pythonpath}"
+    return env
+
+
+def _load_engine_result_from_report(*, report_path: Path, expected_engine: str) -> OcrBenchmarkResult:
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read benchmark report: {report_path}: {exc}") from exc
+
+    rows = payload.get("results")
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"Benchmark report has no results: {report_path}")
+
+    row = rows[0]
+    if not isinstance(row, dict):
+        raise RuntimeError(f"Benchmark report result is malformed: {report_path}")
+    row = dict(row)
+    row.setdefault("engine", expected_engine)
+    return OcrBenchmarkResult(**row)
+
+
+def _run_engine_benchmark_subprocess(
+    *,
+    python_exe: Path,
+    engine: str,
+    pdf_path: Path,
+    output_dir: Path,
+    sample_size: int,
+    page_numbers: tuple[int, ...] | None,
+    lang: str,
+) -> OcrBenchmarkResult:
+    repo_root = Path(__file__).resolve().parents[3]
+    cmd = [
+        str(python_exe),
+        "-m",
+        "uniscan",
+        "benchmark-ocr",
+        "--pdf",
+        str(pdf_path),
+        "--output",
+        str(output_dir),
+        "--engines",
+        engine,
+        "--sample-size",
+        str(int(sample_size)),
+        "--lang",
+        lang,
+    ]
+    if page_numbers:
+        page_arg = ",".join(str(int(page)) for page in page_numbers)
+        cmd.extend(["--pages", page_arg])
+
+    env = _build_engine_subprocess_env(engine=engine, repo_root=repo_root)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    report_path = output_dir / f"{pdf_path.stem}_ocr_benchmark.json"
+    if not report_path.exists():
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        details = stderr or stdout or f"exit code {proc.returncode}"
+        raise RuntimeError(f"Engine '{engine}' subprocess did not produce report: {details}")
+
+    result = _load_engine_result_from_report(report_path=report_path, expected_engine=engine)
+    if int(proc.returncode) != 0 and result.status == "ok":
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        details = stderr or stdout or f"exit code {proc.returncode}"
+        raise RuntimeError(f"Engine '{engine}' subprocess failed: {details}")
+    return result
 
 
 def _result_error_text(result: OcrBenchmarkResult) -> str:
@@ -147,6 +274,48 @@ def _pick_ok_pdf(results: tuple[ArtifactSearchableResult, ...]) -> Path:
     raise RuntimeError("No successful searchable PDF output was produced.")
 
 
+def _build_textless_source_pdf(*, source_pdf: Path, out_pdf: Path, dpi: int = 300) -> Path:
+    """Render PDF pages into an image-only PDF to remove existing text layer."""
+    try:
+        import fitz  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "Removing original text layer requires PyMuPDF. Install with: pip install pymupdf"
+        ) from exc
+
+    scale = max(float(dpi), 72.0) / 72.0
+    matrix = fitz.Matrix(scale, scale)
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+
+    src_doc = fitz.open(str(source_pdf))
+    dst_doc = fitz.open()
+    try:
+        for src_page in src_doc:
+            pix = src_page.get_pixmap(matrix=matrix, alpha=False)
+            dst_page = dst_doc.new_page(
+                width=float(src_page.rect.width),
+                height=float(src_page.rect.height),
+            )
+            dst_page.insert_image(dst_page.rect, pixmap=pix, keep_proportion=False)
+        dst_doc.save(str(out_pdf), garbage=4, deflate=True)
+    finally:
+        src_doc.close()
+        dst_doc.close()
+
+    return out_pdf
+
+
+def _resolve_textless_dpi() -> int:
+    raw = os.getenv("UNISCAN_TEXTLESS_DPI", "").strip()
+    if not raw:
+        return 300
+    try:
+        value = int(raw)
+    except ValueError:
+        return 300
+    return max(72, min(400, value))
+
+
 def run_basic_ocr_benchmark(
     *,
     pdf_path: Path,
@@ -169,8 +338,19 @@ def run_basic_ocr_benchmark(
         raise RuntimeError(f"Unknown mode '{mode_key}'. Supported: {known}.")
 
     ready_engines: list[str] = []
+    engine_python_overrides: dict[str, Path] = {}
     skipped_engines: list[str] = []
     for engine in requested_engines:
+        try:
+            engine_python = _resolve_engine_python(engine)
+        except Exception as exc:
+            skipped_engines.append(f"{engine}: {exc}")
+            continue
+        if engine_python is not None:
+            ready_engines.append(engine)
+            engine_python_overrides[engine] = engine_python
+            continue
+
         status = detect_ocr_engine_status(engine)
         if status.ready:
             ready_engines.append(engine)
@@ -201,20 +381,53 @@ def run_basic_ocr_benchmark(
 
             engine_output = run_dir / engine
             engine_output.mkdir(parents=True, exist_ok=True)
-            engine_results = run_ocr_benchmark(
-                pdf_path=resolved_pdf,
-                output_dir=engine_output,
-                engines=(engine,),
-                sample_size=sample_size,
-                page_numbers=page_numbers,
-                lang=lang,
-            )
-            if not engine_results:
+
+            def _engine_progress(local_percent: int, status: str) -> None:
+                bounded_local = max(0, min(100, int(local_percent)))
+                span = max(0, end_percent - start_percent)
+                mapped = start_percent + int((bounded_local / 100.0) * span)
+                _emit_progress(progress, mapped, status)
+
+            result: OcrBenchmarkResult | None = None
+            engine_python = engine_python_overrides.get(engine)
+            if engine_python is not None:
+                _engine_progress(5, f"Running: {engine} ({engine_python})")
+                try:
+                    result = _run_engine_benchmark_subprocess(
+                        python_exe=engine_python,
+                        engine=engine,
+                        pdf_path=resolved_pdf,
+                        output_dir=engine_output,
+                        sample_size=sample_size,
+                        page_numbers=page_numbers,
+                        lang=lang,
+                    )
+                except Exception as exc:
+                    failed_engines.append(f"{engine}: {exc}")
+                    _emit_progress(progress, end_percent, f"Error: {engine}")
+                    continue
+                _engine_progress(95, f"Finished: {engine}")
+            else:
+                engine_results = run_ocr_benchmark(
+                    pdf_path=resolved_pdf,
+                    output_dir=engine_output,
+                    engines=(engine,),
+                    sample_size=sample_size,
+                    page_numbers=page_numbers,
+                    lang=lang,
+                    progress=_engine_progress,
+                )
+                if not engine_results:
+                    failed_engines.append(f"{engine}: benchmark returned no result")
+                    _emit_progress(progress, end_percent, f"Error: {engine}")
+                    continue
+                result = engine_results[0]
+
+            if result is None:
                 failed_engines.append(f"{engine}: benchmark returned no result")
                 _emit_progress(progress, end_percent, f"Error: {engine}")
                 continue
 
-            result = engine_results[0]
             results.append(result)
             report_path = engine_output / f"{resolved_pdf.stem}_ocr_benchmark.json"
             if report_path.exists():
@@ -306,6 +519,17 @@ def build_searchable_pdf(
         geometry_override_dir = benchmark.run_dir / "surya"
     else:
         geometry_override_dir = None
+    source_pdf_root = input_path.parent
+    if delete_original_text_layer:
+        _emit_progress(progress, 84, "Removing original text layer...")
+        textless_root = benchmark.run_dir / "_source_pdf_without_text"
+        textless_pdf = textless_root / input_path.name
+        _build_textless_source_pdf(
+            source_pdf=input_path,
+            out_pdf=textless_pdf,
+            dpi=_resolve_textless_dpi(),
+        )
+        source_pdf_root = textless_root
 
     with _temporary_env(
         "UNISCAN_CHANDRA_GEOMETRY_DIR",
@@ -314,7 +538,7 @@ def build_searchable_pdf(
         artifact_results = tuple(
             run_artifact_searchable_package(
                 compare_dir=compare_dir,
-                pdf_root=input_path.parent,
+                pdf_root=source_pdf_root,
                 output_dir=output_root,
                 engines=build_engines,
                 require_page_markers=True,
@@ -327,18 +551,9 @@ def build_searchable_pdf(
     overwritten_path: Path | None = None
     final_pdf_path = produced_pdf
     if pdf_path is not None and overwrite_input_path:
-        # Если пользователь выбрал удаление исходного текстового слоя,
-        # то полностью заменяем PDF независимо от того, какие страницы выбраны
-        if delete_original_text_layer:
-            # Полная замена: копируем новый PDF поверх старого
-            shutil.copy2(produced_pdf, input_path)
-            overwritten_path = input_path
-            final_pdf_path = input_path
-        else:
-            # Старое поведение: обновляем только указанные страницы
-            shutil.copy2(produced_pdf, input_path)
-            overwritten_path = input_path
-            final_pdf_path = input_path
+        shutil.copy2(produced_pdf, input_path)
+        overwritten_path = input_path
+        final_pdf_path = input_path
 
     if return_bytes is None:
         need_bytes = pdf_bytes is not None

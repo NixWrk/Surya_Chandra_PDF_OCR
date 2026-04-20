@@ -14,7 +14,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from uniscan.io import imwrite_unicode, render_pdf_page_indices
 
@@ -39,6 +39,8 @@ _DEFAULT_MODELSCOPE_CACHE_HOME = _REPO_ROOT / ".modelscope_cache"
 _DEFAULT_SURYA_MODEL_CACHE_HOME = _REPO_ROOT / ".surya_cache"
 _DEFAULT_YOLO_CONFIG_HOME = _REPO_ROOT / ".ultralytics"
 _DEFAULT_RUNTIME_TMP_HOME = _REPO_ROOT / ".tmp_runtime"
+_CHANDRA_MODEL_REPO_ID = "datalab-to/chandra"
+_MODEL_CACHE_CHECK_MEMO: dict[str, str] = {}
 
 
 @dataclass(slots=True)
@@ -56,6 +58,10 @@ class OcrBenchmarkResult:
     @property
     def label(self) -> str:
         return OCR_ENGINE_LABELS.get(self.engine, self.engine)
+
+
+BenchmarkProgressCallback = Callable[[int, str], None]
+PageProgressCallback = Callable[[int, int, int], None]
 
 
 def sample_pdf_page_indices(page_count: int, *, sample_size: int = 5) -> list[int]:
@@ -251,6 +257,19 @@ def _memory_delta_mb(before: float | None, after: float | None) -> float | None:
     return round(after - before, 3)
 
 
+def _emit_benchmark_progress(
+    cb: BenchmarkProgressCallback | None,
+    percent: int,
+    status: str,
+) -> None:
+    if cb is None:
+        return
+    try:
+        cb(max(0, min(100, int(percent))), status)
+    except Exception:
+        return
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -261,6 +280,158 @@ def _env_bool(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _has_any_files(root: Path, patterns: Sequence[str]) -> bool:
+    for pattern in patterns:
+        try:
+            next(root.rglob(pattern))
+            return True
+        except StopIteration:
+            continue
+    return False
+
+
+def _preview_paths(paths: Sequence[Path], *, limit: int = 3) -> str:
+    if not paths:
+        return ""
+    shown = [str(path) for path in paths[:limit]]
+    suffix = f" (+{len(paths) - limit} more)" if len(paths) > limit else ""
+    return "; ".join(shown) + suffix
+
+
+def _resolve_hf_home() -> Path:
+    raw = (os.environ.get("HF_HOME") or "").strip()
+    if raw:
+        return Path(raw)
+    return _DEFAULT_HF_CACHE_HOME
+
+
+def _chandra_model_cache_candidates() -> tuple[Path, ...]:
+    model_key = _CHANDRA_MODEL_REPO_ID.replace("/", "--")
+    hf_home = _resolve_hf_home()
+    return (
+        hf_home / f"models--{model_key}",
+        hf_home / "hub" / f"models--{model_key}",
+    )
+
+
+def _candidate_snapshot_dirs(candidate_root: Path) -> list[Path]:
+    snapshots_dir = candidate_root / "snapshots"
+    if not snapshots_dir.exists():
+        return []
+    return [path for path in snapshots_dir.iterdir() if path.is_dir()]
+
+
+def _snapshot_has_chandra_weights(snapshot_dir: Path) -> bool:
+    if not (snapshot_dir / "model.safetensors.index.json").is_file():
+        return False
+    try:
+        next(snapshot_dir.rglob("*.safetensors"))
+        return True
+    except StopIteration:
+        return False
+
+
+def _ensure_chandra_cache_ready() -> None:
+    hf_home = _resolve_hf_home().resolve()
+    cache_key = f"chandra::{hf_home}"
+    if cache_key in _MODEL_CACHE_CHECK_MEMO:
+        return
+
+    missing_candidates: list[str] = []
+    candidate_issues: list[str] = []
+    for candidate in _chandra_model_cache_candidates():
+        candidate = candidate.resolve()
+        if not candidate.exists():
+            missing_candidates.append(str(candidate))
+            continue
+
+        blobs_dir = candidate / "blobs"
+        incomplete_files = sorted(blobs_dir.glob("*.incomplete")) if blobs_dir.exists() else []
+        if incomplete_files:
+            preview = _preview_paths(incomplete_files)
+            candidate_issues.append(
+                f"{candidate}: found incomplete weight downloads: {preview}"
+            )
+            continue
+
+        snapshots = _candidate_snapshot_dirs(candidate)
+        if not snapshots:
+            candidate_issues.append(f"{candidate}: snapshots directory is empty or missing")
+            continue
+
+        if not any(_snapshot_has_chandra_weights(snapshot) for snapshot in snapshots):
+            snapshot_preview = _preview_paths(snapshots)
+            candidate_issues.append(
+                f"{candidate}: no '*.safetensors' weights found in snapshots ({snapshot_preview})"
+            )
+            continue
+
+        _MODEL_CACHE_CHECK_MEMO[cache_key] = str(candidate)
+        return
+
+    details: list[str] = []
+    if missing_candidates:
+        details.append("missing cache dirs: " + "; ".join(missing_candidates))
+    if candidate_issues:
+        details.extend(candidate_issues)
+    detail_text = " | ".join(details) if details else "model cache is unavailable"
+    raise RuntimeError(
+        "Chandra cache/weights preflight failed. "
+        f"Expected local model '{_CHANDRA_MODEL_REPO_ID}' in HF cache ({hf_home}). {detail_text}"
+    )
+
+
+def _iter_surya_version_dirs(component_root: Path) -> list[Path]:
+    if not component_root.exists():
+        return []
+    return [path for path in component_root.iterdir() if path.is_dir()]
+
+
+def _surya_version_ready(version_dir: Path) -> bool:
+    manifest = version_dir / "manifest.json"
+    if not manifest.is_file():
+        return False
+    return _has_any_files(version_dir, ("*.safetensors", "*.onnx", "*.pt", "*.bin"))
+
+
+def _ensure_surya_cache_ready() -> None:
+    model_cache_raw = (os.environ.get("MODEL_CACHE_DIR") or "").strip()
+    model_cache_root = Path(model_cache_raw) if model_cache_raw else _DEFAULT_SURYA_MODEL_CACHE_HOME
+    model_cache_root = model_cache_root.resolve()
+
+    cache_key = f"surya::{model_cache_root}"
+    if cache_key in _MODEL_CACHE_CHECK_MEMO:
+        return
+
+    # OCR text path requires text detection + recognition. Layout weights are
+    # used by other Surya tasks and can be absent in minimal OCR-only setups.
+    required_components = ("text_detection", "text_recognition")
+    problems: list[str] = []
+    for component in required_components:
+        component_root = model_cache_root / component
+        versions = _iter_surya_version_dirs(component_root)
+        if not versions:
+            problems.append(f"{component_root}: missing component cache directory")
+            continue
+        if not any(_surya_version_ready(version) for version in versions):
+            version_preview = _preview_paths(versions)
+            problems.append(
+                f"{component_root}: no ready version with manifest + weights ({version_preview})"
+            )
+
+    incomplete_files = sorted(model_cache_root.rglob("*.incomplete")) if model_cache_root.exists() else []
+    if incomplete_files:
+        problems.append(f"{model_cache_root}: incomplete files present: {_preview_paths(incomplete_files)}")
+
+    if problems:
+        raise RuntimeError(
+            "Surya cache/weights preflight failed. "
+            + " | ".join(problems)
+        )
+
+    _MODEL_CACHE_CHECK_MEMO[cache_key] = str(model_cache_root)
 
 
 def _configure_chandra_runtime_device() -> str:
@@ -431,6 +602,16 @@ def _chandra_allow_cli_fallback() -> bool:
     return _env_bool("UNISCAN_CHANDRA_ALLOW_CLI_FALLBACK", default=False)
 
 
+def _surya_allow_text_fallback() -> bool:
+    # By default, require geometry-producing Surya path.
+    return _env_bool("UNISCAN_SURYA_ALLOW_TEXT_FALLBACK", default=False)
+
+
+def _surya_require_geometry_sidecar() -> bool:
+    # Geometry sidecar is mandatory for accurate searchable PDF alignment.
+    return _env_bool("UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON", default=True)
+
+
 def _markerized_pages_text(
     *,
     page_texts: Sequence[str],
@@ -527,6 +708,74 @@ def _write_pagewise_text_artifacts(
     return total_chars, pages_json_path
 
 
+def _collect_chandra_batch_outputs(
+    *,
+    sidecar_path: Path,
+    image_paths: Sequence[Path],
+    source_pages_1based: Sequence[int],
+    work_dir: Path,
+) -> tuple[list[str], int, list[dict[str, Any]]]:
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Chandra sidecar payload has unexpected format.")
+
+    images_payload = payload.get("images")
+    if not isinstance(images_payload, list):
+        raise RuntimeError("Chandra sidecar payload has no 'images' list.")
+
+    by_name: dict[str, dict[str, Any]] = {}
+    for item in images_payload:
+        if not isinstance(item, dict):
+            continue
+        image_name = str(item.get("image_name") or "").strip()
+        if not image_name:
+            continue
+        by_name[image_name] = item
+        by_name[Path(image_name).stem] = item
+
+    page_texts: list[str] = []
+    total_chars = 0
+    page_metadata: list[dict[str, Any]] = []
+    for image_path, source_page in zip(image_paths, source_pages_1based, strict=True):
+        image_payload = by_name.get(image_path.name) or by_name.get(image_path.stem)
+        text_lines: list[str] = []
+        if image_payload is not None:
+            pages = image_payload.get("pages")
+            if isinstance(pages, list):
+                for page in pages:
+                    if not isinstance(page, dict):
+                        continue
+                    lines = page.get("text_lines")
+                    if not isinstance(lines, list):
+                        continue
+                    for line in lines:
+                        if not isinstance(line, dict):
+                            continue
+                        text = str(line.get("text") or "").strip()
+                        if text:
+                            text_lines.append(text)
+
+            page_dir = work_dir / f"page_{source_page:04d}"
+            page_dir.mkdir(parents=True, exist_ok=True)
+            page_sidecar_path = page_dir / "chandra_page_lines.json"
+            page_sidecar_path.write_text(
+                json.dumps({"images": [image_payload]}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            page_metadata.append(
+                {
+                    "source_page": source_page,
+                    "chandra_page_lines_path": str(page_sidecar_path),
+                }
+            )
+
+        page_text = "\n".join(text_lines)
+        page_texts.append(page_text)
+        total_chars += len(page_text)
+
+    return page_texts, total_chars, page_metadata
+
+
 def _run_extraction_engine_pagewise(
     engine: str,
     image_paths: Sequence[Path],
@@ -536,15 +785,56 @@ def _run_extraction_engine_pagewise(
     work_dir: Path,
     which_fn,
     run_cmd,
+    progress_cb: PageProgressCallback | None = None,
 ) -> tuple[list[str], int, list[dict[str, Any]], list[dict[str, Any]]]:
     if len(image_paths) != len(source_pages_1based):
         raise ValueError("image_paths and source_pages_1based lengths must match.")
+
+    if engine == OCR_ENGINE_CHANDRA and len(image_paths) > 0:
+        batch_work_dir = work_dir / "batch"
+        total_pages = len(source_pages_1based)
+
+        def _on_chandra_page_progress(done: int, total: int) -> None:
+            if progress_cb is None:
+                return
+            bounded_total = max(total, 1)
+            bounded_done = max(0, min(done, bounded_total))
+            page_index = min(max(bounded_done - 1, 0), max(total_pages - 1, 0))
+            source_page = source_pages_1based[page_index]
+            progress_cb(bounded_done, bounded_total, source_page)
+
+        text, chars = _run_chandra_direct(
+            image_paths,
+            lang=lang,
+            work_dir=batch_work_dir,
+            which_fn=which_fn,
+            run_cmd=run_cmd,
+            page_progress_cb=_on_chandra_page_progress,
+        )
+        sidecar = batch_work_dir / "chandra_page_lines.json"
+        if sidecar.exists():
+            page_texts, total_chars, page_metadata = _collect_chandra_batch_outputs(
+                sidecar_path=sidecar,
+                image_paths=image_paths,
+                source_pages_1based=source_pages_1based,
+                work_dir=work_dir,
+            )
+            if any(page.strip() for page in page_texts):
+                return page_texts, total_chars, [], page_metadata
+        # Sidecar is unexpectedly missing or empty. Keep output usable by
+        # preserving aggregate text in the first page and leaving geometry empty.
+        fallback_page_texts = [text] + [""] * (len(image_paths) - 1)
+        return fallback_page_texts, int(chars), [], []
 
     page_texts: list[str] = []
     total_chars = 0
     page_errors: list[dict[str, Any]] = []
     page_metadata: list[dict[str, Any]] = []
-    for image_path, source_page in zip(image_paths, source_pages_1based, strict=True):
+    total_pages = len(source_pages_1based)
+    for page_idx, (image_path, source_page) in enumerate(
+        zip(image_paths, source_pages_1based, strict=True),
+        start=1,
+    ):
         page_work_dir = work_dir / f"page_{source_page:04d}"
         try:
             text, chars = _run_extraction_engine(
@@ -566,6 +856,11 @@ def _run_extraction_engine_pagewise(
                             "surya_page_lines_path": str(sidecar),
                         }
                     )
+                elif _surya_require_geometry_sidecar():
+                    raise RuntimeError(
+                        "Surya geometry sidecar is missing for "
+                        f"source page {source_page}: {sidecar}"
+                    )
             if engine == OCR_ENGINE_CHANDRA:
                 sidecar = page_work_dir / "chandra_page_lines.json"
                 if sidecar.exists():
@@ -575,6 +870,8 @@ def _run_extraction_engine_pagewise(
                             "chandra_page_lines_path": str(sidecar),
                         }
                     )
+            if progress_cb is not None:
+                progress_cb(page_idx, total_pages, source_page)
         except Exception as exc:
             page_texts.append("")
             page_errors.append(
@@ -584,10 +881,15 @@ def _run_extraction_engine_pagewise(
                     "error": str(exc),
                 }
             )
+            if progress_cb is not None:
+                progress_cb(page_idx, total_pages, source_page)
 
     if page_errors and not any(text.strip() for text in page_texts):
         preview = "; ".join(f"p{item['source_page']}: {item['error']}" for item in page_errors[:3])
         raise RuntimeError(f"all sampled pages failed for {engine}: {preview}")
+    if engine == OCR_ENGINE_SURYA and _surya_require_geometry_sidecar() and page_errors:
+        preview = "; ".join(f"p{item['source_page']}: {item['error']}" for item in page_errors[:3])
+        raise RuntimeError(f"surya geometry sidecar is required for each page: {preview}")
     return page_texts, total_chars, page_errors, page_metadata
 
 
@@ -834,7 +1136,7 @@ def _run_surya_module_cli(
                 ordered_names=ordered_names,
                 output_root=output_root,
             )
-    except Exception as exc:
+    except Exception:
         return _run_cli_with_geometry(
             input_dir=input_dir,
             ordered_names=ordered_names,
@@ -1034,6 +1336,11 @@ def _run_surya_direct(
     which_fn=shutil.which,
     run_cmd=subprocess.run,
 ) -> tuple[str, int]:
+    os.environ.setdefault("MODEL_CACHE_DIR", str(_DEFAULT_SURYA_MODEL_CACHE_HOME))
+    os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
+    os.environ.setdefault("MODELSCOPE_CACHE", str(_DEFAULT_MODELSCOPE_CACHE_HOME))
+    _ensure_surya_cache_ready()
+
     module_error: Exception | None = None
     try:
         return _run_surya_module_cli(
@@ -1045,6 +1352,12 @@ def _run_surya_direct(
         )
     except Exception as exc:
         module_error = exc
+
+    if not _surya_allow_text_fallback():
+        raise RuntimeError(
+            "Surya module path failed. Text-only fallback is disabled to keep "
+            f"geometry JSON mandatory: {module_error}"
+        ) from module_error
 
     candidates = (
         ("surya_ocr", "{image}", "--lang", "{lang}"),
@@ -1108,6 +1421,7 @@ def _run_chandra_module(
     *,
     lang: str,
     work_dir: Path,
+    page_progress_cb: Callable[[int, int], None] | None = None,
 ) -> tuple[str, int]:
     """Run Chandra OCR via direct Python module import (preferred path)."""
     if len(image_paths) == 0:
@@ -1115,6 +1429,7 @@ def _run_chandra_module(
 
     work_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
+    _ensure_chandra_cache_ready()
     selected_device = _configure_chandra_runtime_device()
     # Chandra uses PIL internally — lift the decompression-bomb guard.
     try:
@@ -1157,7 +1472,8 @@ def _run_chandra_module(
 
     collected: list[str] = []
     sidecar_images: list[dict[str, Any]] = []
-    for image_path in image_paths:
+    total_pages = len(image_paths)
+    for page_idx, image_path in enumerate(image_paths, start=1):
         pil_image = load_image(str(image_path))
         width, height = pil_image.size
         batch = [BatchInputItem(image=pil_image, prompt_type="ocr_layout")]
@@ -1223,6 +1539,11 @@ def _run_chandra_module(
                     ],
                 }
             )
+        if page_progress_cb is not None:
+            try:
+                page_progress_cb(page_idx, total_pages)
+            except Exception:
+                pass
 
     if sidecar_images:
         sidecar_path = work_dir / "chandra_page_lines.json"
@@ -1300,11 +1621,17 @@ def _run_chandra_direct(
     work_dir: Path,
     which_fn=shutil.which,
     run_cmd=subprocess.run,
+    page_progress_cb: Callable[[int, int], None] | None = None,
 ) -> tuple[str, int]:
     # Primary: direct Python module import (no CLI binary needed).
     module_error: Exception | None = None
     try:
-        return _run_chandra_module(image_paths, lang=lang, work_dir=work_dir)
+        return _run_chandra_module(
+            image_paths,
+            lang=lang,
+            work_dir=work_dir,
+            page_progress_cb=page_progress_cb,
+        )
     except Exception as exc:
         module_error = exc
 
@@ -1733,6 +2060,7 @@ def run_ocr_benchmark(
     import_module=None,
     which_fn=shutil.which,
     run_cmd=subprocess.run,
+    progress: BenchmarkProgressCallback | None = None,
 ) -> list[OcrBenchmarkResult]:
     """Run a sampled OCR benchmark against a PDF fixture."""
     resolved_pdf = Path(pdf_path)
@@ -1762,8 +2090,12 @@ def run_ocr_benchmark(
             tmp_dir=tmp_dir,
         )
 
-        for engine_name in selected_engines:
+        engine_total = max(1, len(selected_engines))
+        for engine_index, engine_name in enumerate(selected_engines, start=1):
             engine = engine_name.strip().lower()
+            engine_start_percent = int(((engine_index - 1) / engine_total) * 100)
+            engine_end_percent = int((engine_index / engine_total) * 100)
+            _emit_benchmark_progress(progress, engine_start_percent, f"Running: {engine}")
             start = perf_counter()
             rss_before = _memory_rss_mb()
             artifact_path = _artifact_path_for_engine(resolved_output, resolved_pdf.stem, engine)
@@ -1788,6 +2120,7 @@ def run_ocr_benchmark(
                         note="status detection failed",
                     )
                 )
+                _emit_benchmark_progress(progress, engine_end_percent, f"Error: {engine}")
                 continue
 
             if not engine_status.ready:
@@ -1805,6 +2138,7 @@ def run_ocr_benchmark(
                         note=f"missing: {missing}",
                     )
                 )
+                _emit_benchmark_progress(progress, engine_end_percent, f"Error: {engine}")
                 continue
 
             try:
@@ -1832,10 +2166,21 @@ def run_ocr_benchmark(
                             memory_delta_mb=_memory_delta_mb(rss_before, _memory_rss_mb()),
                         )
                     )
+                    _emit_benchmark_progress(progress, engine_end_percent, f"Done: {engine}")
                     continue
 
                 # Keep extraction engines page-aware: persist per-page files and
                 # write markerized aggregate text that preserves source page ids.
+                def _page_progress(done: int, total: int, source_page: int) -> None:
+                    span = max(0, engine_end_percent - engine_start_percent)
+                    ratio = 0 if total <= 0 else (max(0, min(done, total)) / float(total))
+                    mapped = engine_start_percent + int(ratio * span)
+                    _emit_benchmark_progress(
+                        progress,
+                        mapped,
+                        f"{engine}: page {done}/{total} (source {source_page})",
+                    )
+
                 page_texts, text_chars, page_errors, page_metadata = _run_extraction_engine_pagewise(
                     engine,
                     sampled_image_paths,
@@ -1844,6 +2189,7 @@ def run_ocr_benchmark(
                     work_dir=tmp_dir / f"{engine}_work",
                     which_fn=which_fn,
                     run_cmd=run_cmd,
+                    progress_cb=_page_progress,
                 )
                 _write_pagewise_text_artifacts(
                     output_dir=resolved_output,
@@ -1871,6 +2217,7 @@ def run_ocr_benchmark(
                         ),
                     )
                 )
+                _emit_benchmark_progress(progress, engine_end_percent, f"Done: {engine}")
             except Exception as exc:
                 elapsed = perf_counter() - start
                 results.append(
@@ -1885,6 +2232,7 @@ def run_ocr_benchmark(
                         error=str(exc),
                     )
                 )
+                _emit_benchmark_progress(progress, engine_end_percent, f"Error: {engine}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
