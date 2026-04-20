@@ -5,6 +5,8 @@ __pycache__/
 .ruff_cache/
 .paddlex_cache/
 .hf_cache/
+.hf_cache_chandra/
+.hf_cache_surya/
 .modelscope_cache/
 .surya_cache/
 .ultralytics/
@@ -12,10 +14,15 @@ __pycache__/
 .tmp_bootstrap/
 .tmp_runtime/
 .tmp_pytest/
+.tmp_pytest_local/
+.tmp_test_searchable_*/
+.codex_pytest_tmp_*/
 pytest-cache-files-*/
 .uv_cache/
 .uv_python/
 .venv/
+.venv_surya/
+.venv_chandra/
 .venv_latest_*/
 venv/
 build/
@@ -23,6 +30,8 @@ dist/
 *.egg-info/
 artifacts/
 outputs/
+PDFs/
+_run_exec/
 OCRmypdf_plugins.rar
 OCRmypdf_plugins/*_NIX/
 camscan_suhren/
