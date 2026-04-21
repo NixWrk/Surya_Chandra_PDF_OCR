@@ -41,6 +41,8 @@ if errorlevel 1 goto :error
 
 call :install_gpu_torch "%PY_SURYA%" "SURYA"
 if errorlevel 1 goto :error
+"%PY_SURYA%" -m pip install --upgrade "pillow>=10.2,<11.0"
+if errorlevel 1 goto :error
 
 echo [dual-venv] Installing project into CHANDRA venv ...
 "%PY_CHANDRA%" -m ensurepip --upgrade >nul 2>nul
@@ -89,15 +91,9 @@ set "GPU_NAME=%~2"
 echo [dual-venv] Installing torch GPU stack into %GPU_NAME% venv (cu128) ...
 where uv >nul 2>nul
 if not errorlevel 1 (
-  uv pip install --python "%GPU_PY%" --index-url https://download.pytorch.org/whl/cu128 --upgrade --reinstall ^
-    "torch==2.11.0+cu128" ^
-    "torchvision==0.26.0+cu128" ^
-    "torchaudio==2.11.0+cu128"
+  uv pip install --python "%GPU_PY%" --index-url https://download.pytorch.org/whl/cu128 --upgrade --reinstall "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128"
 ) else (
-  "%GPU_PY%" -m pip install --index-url https://download.pytorch.org/whl/cu128 --upgrade --force-reinstall ^
-    "torch==2.11.0+cu128" ^
-    "torchvision==0.26.0+cu128" ^
-    "torchaudio==2.11.0+cu128"
+  "%GPU_PY%" -m pip install --index-url https://download.pytorch.org/whl/cu128 --upgrade --force-reinstall "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128"
 )
 if errorlevel 1 (
   echo [dual-venv] ERROR: CUDA torch install failed for %GPU_NAME% venv.
@@ -110,7 +106,7 @@ exit /b 0
 :verify_gpu_torch
 set "GPU_PY=%~1"
 set "GPU_NAME=%~2"
-"%GPU_PY%" -c "import sys, torch; v=getattr(torch, '__version__', ''); print('[dual-venv] %GPU_NAME% torch=' + v); sys.exit(0 if '+cu' in v else 1)"
+"%GPU_PY%" -c "import sys, torch; v=getattr(torch, '__version__', ''); print(v); sys.exit(0 if '+cu' in v else 1)"
 if errorlevel 1 (
   echo [dual-venv] ERROR: %GPU_NAME% torch is not a CUDA build.
   exit /b 1

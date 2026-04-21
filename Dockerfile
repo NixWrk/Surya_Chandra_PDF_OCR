@@ -40,7 +40,8 @@ RUN python -m venv /opt/venvs/surya && \
       --upgrade --force-reinstall \
       "torch==2.11.0+cu128" \
       "torchvision==0.26.0+cu128" \
-      "torchaudio==2.11.0+cu128"
+      "torchaudio==2.11.0+cu128" && \
+    /opt/venvs/surya/bin/python -m pip install --upgrade "pillow>=10.2,<11.0"
 
 # Chandra runtime venv
 RUN python -m venv /opt/venvs/chandra && \
