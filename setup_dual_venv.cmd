@@ -15,10 +15,6 @@ set "SURYA_MODEL_CACHE_DIR=%CD%\.surya_cache"
 set "SURYA_MODELSCOPE_CACHE=%CD%\.modelscope_cache"
 set "SETUPTOOLS_VERSION=70.2.0"
 
-call :select_torch_cuda_flavor
-if errorlevel 1 goto :error
-echo [dual-venv] Selected PyTorch CUDA wheel: %TORCH_CUDA_FLAVOR% for GPU compute capability %GPU_COMPUTE_CAP%
-
 if not exist "%UV_CACHE_DIR%" mkdir "%UV_CACHE_DIR%"
 if not exist "%TMP_BOOT%" mkdir "%TMP_BOOT%"
 if not exist "%CHANDRA_HF_HOME%" mkdir "%CHANDRA_HF_HOME%"
@@ -32,6 +28,10 @@ set "TEMP=%TMP_BOOT%"
 set "TMP=%TMP_BOOT%"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
 set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
+
+call :select_torch_cuda_flavor
+if errorlevel 1 goto :error
+echo [dual-venv] Selected PyTorch CUDA wheel: %TORCH_CUDA_FLAVOR% for GPU compute capability %GPU_COMPUTE_CAP%
 
 call :ensure_venv "%VENV_SURYA%"
 if errorlevel 1 goto :error
@@ -99,6 +99,7 @@ exit /b 0
 
 :select_torch_cuda_flavor
 set "GPU_COMPUTE_CAP=unknown"
+set "TORCH_CUDA_FLAVOR=cu126"
 set "GPU_CC_MAJOR="
 set "GPU_CC_MINOR="
 if defined UNISCAN_TORCH_CUDA_FLAVOR (
@@ -106,19 +107,16 @@ if defined UNISCAN_TORCH_CUDA_FLAVOR (
   set "GPU_COMPUTE_CAP=override"
   goto :set_torch_cuda_vars
 )
-
-set "TORCH_CUDA_FLAVOR=cu126"
 where nvidia-smi >nul 2>nul
 if errorlevel 1 goto :set_torch_cuda_vars
-
-for /f "tokens=1,2 delims=." %%A in ('nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2^>nul') do (
+set "GPU_CC_FILE=%TMP_BOOT%\gpu_compute_cap.txt"
+nvidia-smi --query-gpu=compute_cap --format=csv,noheader > "%GPU_CC_FILE%" 2>nul
+if errorlevel 1 goto :set_torch_cuda_vars
+set /p GPU_COMPUTE_CAP=<"%GPU_CC_FILE%"
+for /f "tokens=1,2 delims=." %%A in ("%GPU_COMPUTE_CAP%") do (
   set "GPU_CC_MAJOR=%%A"
   set "GPU_CC_MINOR=%%B"
-  set "GPU_COMPUTE_CAP=%%A.%%B"
-  goto :after_gpu_compute_cap
 )
-
-:after_gpu_compute_cap
 if "%GPU_CC_MAJOR%"=="" goto :set_torch_cuda_vars
 if %GPU_CC_MAJOR% GEQ 8 (
   set "TORCH_CUDA_FLAVOR=cu128"
@@ -128,7 +126,6 @@ if "%GPU_CC_MAJOR%"=="7" (
   if "%GPU_CC_MINOR%"=="" goto :set_torch_cuda_vars
   if %GPU_CC_MINOR% GEQ 5 set "TORCH_CUDA_FLAVOR=cu128"
 )
-goto :set_torch_cuda_vars
 
 :set_torch_cuda_vars
 if /I "%TORCH_CUDA_FLAVOR%"=="cu128" (
