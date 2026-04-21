@@ -111,6 +111,8 @@ cd Surya_Chandra_PDF_OCR
 
 The first setup can take a while. The script installs both environments, installs CUDA builds of PyTorch, downloads the OCR model weights, and verifies that the required caches are ready before it exits successfully.
 
+The setup script is safe to re-run. If the expected CUDA torch stack is already installed, it skips the forced torch reinstall and only verifies the environment and caches.
+
 After setup, the GUI lets you:
 
 1. Choose a PDF.
@@ -288,6 +290,8 @@ Check `nvidia-smi` first. If the driver cannot see the GPU, PyTorch cannot use i
 
 `pip's dependency resolver does not currently take into account all the packages that are installed`:
 This can appear during the forced CUDA PyTorch reinstall. In the Surya venv, PyTorch may temporarily pull `pillow 12.x`, which conflicts with `surya-ocr==0.17.1`; the setup script immediately pins Surya back to `pillow>=10.2,<11.0` after the torch install. Treat the final verification as authoritative: Surya should end on `pillow 10.4.0` or another `<11.0` build, while Chandra can stay on `pillow 12.x`.
+
+Repeated setup runs should not reinstall CUDA torch when the exact verified `cu128` stack is already present. If the script does reinstall torch, it means one of `torch`, `torchvision`, or `torchaudio` was missing or had a different version.
 
 `Warning: You are sending unauthenticated requests to the HF Hub`:
 This is a Hugging Face rate-limit warning, not a project failure. Chandra weights are large, about 10.6 GB for `datalab-to/chandra-ocr-2`, so unauthenticated downloads can be slow. If needed, set `HF_TOKEN` before running setup to use authenticated Hugging Face requests.
