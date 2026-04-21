@@ -55,6 +55,153 @@ python -m uniscan searchable-pdf --help
 python -m uniscan serve-http --help
 ```
 
+## Container quick start (Docker + GPU)
+
+Repository already contains:
+
+1. `Dockerfile` (dual-venv image: Surya + Chandra)
+2. `docker-compose.yml` (API service with GPU and cache volumes)
+3. `scripts/docker-entrypoint.sh` (runtime env routing)
+
+Build and run:
+
+```powershell
+cd D:\Git_Code\Surya_Chandra_PDF_OCR
+docker compose build
+docker compose up -d
+```
+
+Service endpoint:
+
+`http://localhost:8000`
+
+Stop:
+
+```powershell
+docker compose down
+```
+
+## Container runtime model
+
+Inside container:
+
+1. `/opt/venvs/surya` -> Surya runtime
+2. `/opt/venvs/chandra` -> Chandra runtime
+3. default API process runs from Chandra venv
+4. Surya calls are routed through `UNISCAN_SURYA_PYTHON`
+5. Chandra calls are routed through `UNISCAN_CHANDRA_PYTHON`
+
+Mounted persistent volumes (host -> container):
+
+1. `./.hf_cache_chandra` -> `/cache/hf_chandra`
+2. `./.hf_cache_surya` -> `/cache/hf_surya`
+3. `./.surya_cache` -> `/cache/surya_models`
+4. `./.modelscope_cache` -> `/cache/modelscope`
+5. `./outputs` -> `/data/work`
+6. `./PDFs` -> `/data/in`
+
+This keeps model weights and OCR outputs between container restarts.
+
+## Ways to interact with container
+
+### 1) Built-in web UI
+
+Open:
+
+`http://localhost:8000`
+
+Web page supports:
+
+1. PDF upload
+2. mode selection (`surya`, `chandra`, `chandra+surya`)
+3. language (`rus+eng` by default)
+4. optional pages list
+5. strict toggle
+
+### 2) Sync HTTP API
+
+Endpoint:
+
+`POST /searchable-pdf`
+
+Query params:
+
+1. `mode=surya|chandra|chandra+surya`
+2. `lang=rus+eng` (or any supported value)
+3. `pages=1,3,5-8` (optional)
+4. `strict=1|0`
+
+Request body:
+
+`application/pdf` raw bytes
+
+Example:
+
+```bash
+curl -X POST "http://localhost:8000/searchable-pdf?mode=chandra+surya&lang=rus+eng&strict=1" \
+  -H "Content-Type: application/pdf" \
+  --data-binary "@input.pdf" \
+  -o output.searchable.pdf
+```
+
+### 3) Async HTTP API
+
+Endpoints:
+
+1. `POST /api/jobs` - create job
+2. `GET /api/jobs/{job_id}` - status/progress
+3. `GET /api/jobs/{job_id}/result` - downloadable PDF
+
+Example:
+
+```bash
+# Create async job
+curl -X POST "http://localhost:8000/api/jobs?mode=chandra+surya&lang=rus+eng&strict=1&filename=input.pdf" \
+  -H "Content-Type: application/pdf" \
+  --data-binary "@input.pdf"
+
+# Poll status
+curl "http://localhost:8000/api/jobs/<job_id>"
+
+# Download result
+curl -L "http://localhost:8000/api/jobs/<job_id>/result" -o output.searchable.pdf
+```
+
+### 4) CLI inside running container
+
+```bash
+# Check CLI help
+docker compose exec ocr-api /opt/venvs/chandra/bin/python -m uniscan --help
+
+# Process PDF from mounted /data/in
+docker compose exec ocr-api /opt/venvs/chandra/bin/python -m uniscan searchable-pdf \
+  --pdf /data/in/input.pdf \
+  --mode chandra+surya \
+  --work-root /data/work \
+  --strict
+```
+
+Result appears in:
+
+`./outputs` (host) and `input.pdf` can be overwritten by command semantics.
+
+## GPU requirements for container
+
+1. NVIDIA driver on host
+2. Docker with GPU runtime (`--gpus all`)
+3. Docker Compose plugin with GPU support
+
+Quick validation:
+
+```powershell
+docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu22.04 nvidia-smi
+```
+
+If you need CPU-only debug mode, override:
+
+1. `UNISCAN_CHANDRA_REQUIRE_GPU=0`
+2. `UNISCAN_CHANDRA_TORCH_DEVICE=cpu`
+
 ## Typical pipeline
 
 ```powershell

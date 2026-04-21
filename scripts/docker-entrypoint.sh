@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p \
+  "${UNISCAN_CHANDRA_HF_HOME:-/cache/hf_chandra}" \
+  "${UNISCAN_CHANDRA_HUGGINGFACE_HUB_CACHE:-/cache/hf_chandra/hub}" \
+  "${UNISCAN_SURYA_HF_HOME:-/cache/hf_surya}" \
+  "${UNISCAN_SURYA_HUGGINGFACE_HUB_CACHE:-/cache/hf_surya/hub}" \
+  "${UNISCAN_SURYA_MODEL_CACHE_DIR:-/cache/surya_models}" \
+  "${UNISCAN_SURYA_MODELSCOPE_CACHE:-/cache/modelscope}" \
+  "${UNISCAN_WORK_ROOT:-/data/work}" \
+  /data/in \
+  /data/out
+
+export UNISCAN_CHANDRA_PYTHON="${UNISCAN_CHANDRA_PYTHON:-/opt/venvs/chandra/bin/python}"
+export UNISCAN_SURYA_PYTHON="${UNISCAN_SURYA_PYTHON:-/opt/venvs/surya/bin/python}"
+
+export UNISCAN_CHANDRA_HF_HOME="${UNISCAN_CHANDRA_HF_HOME:-/cache/hf_chandra}"
+export UNISCAN_CHANDRA_HUGGINGFACE_HUB_CACHE="${UNISCAN_CHANDRA_HUGGINGFACE_HUB_CACHE:-/cache/hf_chandra/hub}"
+export UNISCAN_CHANDRA_HF_HUB_CACHE="${UNISCAN_CHANDRA_HF_HUB_CACHE:-/cache/hf_chandra/hub}"
+
+export UNISCAN_SURYA_HF_HOME="${UNISCAN_SURYA_HF_HOME:-/cache/hf_surya}"
+export UNISCAN_SURYA_HUGGINGFACE_HUB_CACHE="${UNISCAN_SURYA_HUGGINGFACE_HUB_CACHE:-/cache/hf_surya/hub}"
+export UNISCAN_SURYA_HF_HUB_CACHE="${UNISCAN_SURYA_HF_HUB_CACHE:-/cache/hf_surya/hub}"
+export UNISCAN_SURYA_MODEL_CACHE_DIR="${UNISCAN_SURYA_MODEL_CACHE_DIR:-/cache/surya_models}"
+export UNISCAN_SURYA_MODELSCOPE_CACHE="${UNISCAN_SURYA_MODELSCOPE_CACHE:-/cache/modelscope}"
+
+export UNISCAN_CHANDRA_TORCH_DEVICE="${UNISCAN_CHANDRA_TORCH_DEVICE:-cuda:0}"
+export UNISCAN_CHANDRA_PREFER_GPU="${UNISCAN_CHANDRA_PREFER_GPU:-1}"
+export UNISCAN_CHANDRA_REQUIRE_GPU="${UNISCAN_CHANDRA_REQUIRE_GPU:-1}"
+export UNISCAN_SURYA_ALLOW_TEXT_FALLBACK="${UNISCAN_SURYA_ALLOW_TEXT_FALLBACK:-0}"
+export UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON="${UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON:-1}"
+export HF_HUB_DISABLE_SYMLINKS_WARNING="${HF_HUB_DISABLE_SYMLINKS_WARNING:-1}"
+
+if [[ "$#" -gt 0 ]]; then
+  exec "$@"
+fi
+
+exec /opt/venvs/chandra/bin/python -m uniscan serve-http \
+  --host 0.0.0.0 \
+  --port "${UNISCAN_HTTP_PORT:-8000}" \
+  --work-root "${UNISCAN_WORK_ROOT:-/data/work}" \
+  --lang "${UNISCAN_DEFAULT_LANG:-rus+eng}"

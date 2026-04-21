@@ -1,5 +1,6 @@
 .git
 .venv
+.venv*
 __pycache__
 *.pyc
 *.pyo
@@ -9,6 +10,10 @@ __pycache__
 *.cache
 outputs
 .hf_cache
+.hf_cache*
+.surya_cache
+.modelscope_cache
 .tmp*
 .uv_cache
 OCRmypdf_plugins
+PDFs
