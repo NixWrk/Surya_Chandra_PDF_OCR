@@ -25,7 +25,7 @@ set "PY_CHANDRA=%CD%\%VENV_CHANDRA%\Scripts\python.exe"
 
 echo [dual-venv] Installing project into SURYA venv ...
 "%PY_SURYA%" -m ensurepip --upgrade >nul 2>nul
-"%PY_SURYA%" -m pip install --upgrade pip setuptools wheel
+"%PY_SURYA%" -m pip install --upgrade pip "setuptools<82" wheel
 if errorlevel 1 goto :error
 "%PY_SURYA%" -m pip install -e "."
 if errorlevel 1 goto :error
@@ -44,7 +44,7 @@ if errorlevel 1 goto :error
 
 echo [dual-venv] Installing project into CHANDRA venv ...
 "%PY_CHANDRA%" -m ensurepip --upgrade >nul 2>nul
-"%PY_CHANDRA%" -m pip install --upgrade pip setuptools wheel
+"%PY_CHANDRA%" -m pip install --upgrade pip "setuptools<82" wheel
 if errorlevel 1 goto :error
 "%PY_CHANDRA%" -m pip install -e "."
 if errorlevel 1 goto :error
