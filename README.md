@@ -35,10 +35,17 @@ Recommended local setup:
 4. Internet access on first setup to download Python packages and model weights.
 5. `uv` is recommended but not required; the setup script falls back to `pip`.
 
-The bootstrap script creates two virtual environments because Surya and Chandra have different dependency stacks:
+The bootstrap script intentionally creates two separate virtual environments because Surya and Chandra have different dependency stacks. Keeping them isolated prevents one engine from upgrading packages in a way that breaks the other engine.
 
 1. `.venv_surya`
 2. `.venv_chandra`
+
+Expected versions after a healthy setup:
+
+1. `.venv_surya`: `torch==2.11.0+cu128`, `torchvision==0.26.0+cu128`, `torchaudio==2.11.0+cu128`, `pillow>=10.2,<11.0`.
+2. `.venv_chandra`: `torch==2.11.0+cu128`, `torchvision==0.26.0+cu128`, `torchaudio==2.11.0+cu128`.
+
+`pillow` is pinned below 11 only where Surya needs it. `surya-ocr==0.17.1` requires `pillow>=10.2,<11.0`, while Chandra can currently run with a newer Pillow version. This is one of the reasons the project does not use one shared venv for both engines.
 
 ## Quick Start: Local GUI
 
@@ -86,7 +93,7 @@ print("cuda_device_0:", torch.cuda.get_device_name(0) if torch.cuda.is_available
 '@ | .\.venv_surya\Scripts\python.exe -
 ```
 
-A healthy GPU install should show a `torch` version containing `+cu` and `cuda_available: True`.
+A healthy GPU install should show a `torch` version containing `+cu` and `cuda_available: True`. For Surya, `pillow` should stay below `11.0` because `surya-ocr==0.17.1` depends on that range. For Chandra, `pillow 12.x` is acceptable unless Chandra changes its own dependency constraints.
 
 ## CLI Usage
 
