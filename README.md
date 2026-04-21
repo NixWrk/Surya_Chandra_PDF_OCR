@@ -1,79 +1,169 @@
 # Surya Chandra PDF OCR
 
-OCR-only repository for building searchable PDF from scanned PDF input.
+Surya Chandra PDF OCR is a small OCR pipeline for turning scanned PDFs into searchable PDFs.
+It is built around two OCR engines:
 
-Supported modes:
+1. **Chandra** extracts text.
+2. **Surya** provides page geometry for accurate invisible text placement.
+3. **Hybrid mode** (`chandra+surya`) combines Chandra text with Surya geometry and is the default mode.
 
-1. `surya` (`surya-surya`)
-2. `chandra` (`chandra-chandra`)
-3. `chandra+surya` (hybrid: Chandra text + Surya geometry)
+The project is meant for people who have scanned documents and want a local, reproducible workflow that produces PDFs with selectable and searchable text. It is especially useful when text-only OCR output is not enough and the text layer needs to align with the scanned page.
 
-## Core principles
+## Should You Use This?
 
-1. OCR pipeline only (no camera/session UI legacy).
-2. Dual-venv runtime to avoid dependency conflicts between engines.
-3. Strict geometry behavior for Surya (no silent text-only degradation).
+Use this project if you need:
 
-## Repository layout
+1. Searchable PDFs from scanned PDF files.
+2. Local processing with Python, Docker, or a simple desktop GUI.
+3. Russian/English OCR by default (`rus+eng`), with other language codes passed through where supported.
+4. Strict geometry behavior: hybrid output should fail loudly if the geometry sidecar is missing instead of silently producing a low-quality text layer.
 
-1. `src/uniscan/app` - orchestration (`build_searchable_pdf`, mode routing)
-2. `src/uniscan/ocr` - OCR benchmark + artifact-based searchable build
-3. `src/uniscan/ui/basic_ocr_gui.py` - minimal local GUI
-4. `run_basic_gui.cmd` - GUI launcher with dual-venv routing
-5. `setup_dual_venv.cmd` - one-time environment setup
-6. `docs/` - cleanup plan, inventory, operational notes
+This project is probably not the right fit if you need:
 
-## Quick start (recommended)
+1. A general document management system.
+2. A camera/scanner capture UI.
+3. CPU-only performance on large batches.
+4. A polished end-user desktop application with installers and automatic updates.
 
-```powershell
-cd D:\Git_Code\Surya_Chandra_PDF_OCR
-.\setup_dual_venv.cmd
-.\run_basic_gui.cmd
-```
+## Requirements
 
-`setup_dual_venv.cmd` creates:
+Recommended local setup:
+
+1. Windows with PowerShell or `cmd.exe`.
+2. Python 3.11 available through `py -3.11` or `python`.
+3. NVIDIA GPU and current NVIDIA driver.
+4. Internet access on first setup to download Python packages and model weights.
+5. `uv` is recommended but not required; the setup script falls back to `pip`.
+
+The bootstrap script creates two virtual environments because Surya and Chandra have different dependency stacks:
 
 1. `.venv_surya`
 2. `.venv_chandra`
 
-`run_basic_gui.cmd` sets:
-
-1. `UNISCAN_SURYA_PYTHON=<repo>\.venv_surya\Scripts\python.exe`
-2. `UNISCAN_CHANDRA_PYTHON=<repo>\.venv_chandra\Scripts\python.exe`
-
-So each OCR engine runs in its own interpreter.
-
-## CLI entrypoints
+## Quick Start: Local GUI
 
 ```powershell
-python -m uniscan benchmark-ocr --help
-python -m uniscan benchmark-ocr-canonical --help
-python -m uniscan prepare-compare-txt --help
-python -m uniscan build-searchable-from-artifacts --help
-python -m uniscan compare-chandra-geometry --help
-python -m uniscan searchable-pdf --help
-python -m uniscan serve-http --help
+git clone https://github.com/NixWrk/Surya_Chandra_PDF_OCR.git
+cd Surya_Chandra_PDF_OCR
+.\setup_dual_venv.cmd
+.\run_basic_gui.cmd
 ```
 
-## Container quick start (Docker + GPU)
+The first run can take a while. The script installs both environments, installs CUDA builds of PyTorch, and later the OCR engines may download model weights into local cache folders.
 
-Repository already contains:
+After setup, the GUI lets you:
 
-1. `Dockerfile` (dual-venv image: Surya + Chandra)
-2. `docker-compose.yml` (API service with GPU and cache volumes)
-3. `scripts/docker-entrypoint.sh` (runtime env routing)
+1. Choose a PDF.
+2. Pick `chandra+surya`, `chandra`, or `surya`.
+3. Optionally limit OCR to pages such as `1,3,5-8`.
+4. Optionally remove an existing text layer before building the new searchable PDF.
 
-Build and run:
+By default, the GUI overwrites the selected input PDF with the searchable version. Intermediate artifacts are written under `outputs/`.
+
+## Verify GPU PyTorch
+
+Run this after setup if OCR is slow or if Chandra reports that CUDA is unavailable:
 
 ```powershell
-cd D:\Git_Code\Surya_Chandra_PDF_OCR
+@'
+import torch
+print("torch:", torch.__version__)
+print("cuda_available:", torch.cuda.is_available())
+print("cuda_device_count:", torch.cuda.device_count())
+print("cuda_device_0:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A")
+'@ | .\.venv_chandra\Scripts\python.exe -
+```
+
+Repeat for Surya:
+
+```powershell
+@'
+import torch
+print("torch:", torch.__version__)
+print("cuda_available:", torch.cuda.is_available())
+print("cuda_device_count:", torch.cuda.device_count())
+print("cuda_device_0:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A")
+'@ | .\.venv_surya\Scripts\python.exe -
+```
+
+A healthy GPU install should show a `torch` version containing `+cu` and `cuda_available: True`.
+
+## CLI Usage
+
+Use the Chandra environment for the main CLI:
+
+```powershell
+.\.venv_chandra\Scripts\python.exe -m uniscan --help
+```
+
+Build a searchable PDF in the default hybrid mode:
+
+```powershell
+.\.venv_chandra\Scripts\python.exe -m uniscan searchable-pdf `
+  --pdf "D:\path\input.pdf" `
+  --mode chandra+surya `
+  --lang rus+eng `
+  --strict
+```
+
+Useful commands:
+
+```powershell
+.\.venv_chandra\Scripts\python.exe -m uniscan searchable-pdf --help
+.\.venv_chandra\Scripts\python.exe -m uniscan benchmark-ocr --help
+.\.venv_chandra\Scripts\python.exe -m uniscan prepare-compare-txt --help
+.\.venv_chandra\Scripts\python.exe -m uniscan build-searchable-from-artifacts --help
+.\.venv_chandra\Scripts\python.exe -m uniscan serve-http --help
+```
+
+## HTTP Service
+
+Start the local web/API service:
+
+```powershell
+.\.venv_chandra\Scripts\python.exe -m uniscan serve-http --host 127.0.0.1 --port 8000
+```
+
+Open:
+
+```text
+http://127.0.0.1:8000
+```
+
+Synchronous API:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/searchable-pdf?mode=chandra+surya&lang=rus+eng&strict=1" \
+  -H "Content-Type: application/pdf" \
+  --data-binary "@input.pdf" \
+  -o output.searchable.pdf
+```
+
+Asynchronous API:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/jobs?mode=chandra+surya&lang=rus+eng&strict=1&filename=input.pdf" \
+  -H "Content-Type: application/pdf" \
+  --data-binary "@input.pdf"
+
+curl "http://127.0.0.1:8000/api/jobs/<job_id>"
+curl -L "http://127.0.0.1:8000/api/jobs/<job_id>/result" -o output.searchable.pdf
+```
+
+## Docker
+
+Docker is useful when you want a repeatable GPU runtime with persistent model caches.
+
+```powershell
 docker compose build
 docker compose up -d
 ```
 
-Service endpoint:
+Open:
 
-`http://localhost:8000`
+```text
+http://localhost:8000
+```
 
 Stop:
 
@@ -81,204 +171,98 @@ Stop:
 docker compose down
 ```
 
-## Container runtime model
+The compose file mounts these local folders:
 
-Inside container:
+1. `.hf_cache_chandra` for Chandra Hugging Face weights.
+2. `.hf_cache_surya` for Surya Hugging Face weights.
+3. `.surya_cache` for Surya model cache.
+4. `.modelscope_cache` for ModelScope cache.
+5. `outputs` for work artifacts.
+6. `PDFs` for optional input files.
 
-1. `/opt/venvs/surya` -> Surya runtime
-2. `/opt/venvs/chandra` -> Chandra runtime
-3. default API process runs from Chandra venv
-4. Surya calls are routed through `UNISCAN_SURYA_PYTHON`
-5. Chandra calls are routed through `UNISCAN_CHANDRA_PYTHON`
+Docker GPU requirements:
 
-Mounted persistent volumes (host -> container):
+1. NVIDIA driver on the host.
+2. Docker with GPU support.
+3. Docker Compose with `gpus: all` support.
 
-1. `./.hf_cache_chandra` -> `/cache/hf_chandra`
-2. `./.hf_cache_surya` -> `/cache/hf_surya`
-3. `./.surya_cache` -> `/cache/surya_models`
-4. `./.modelscope_cache` -> `/cache/modelscope`
-5. `./outputs` -> `/data/work`
-6. `./PDFs` -> `/data/in`
-
-This keeps model weights and OCR outputs between container restarts.
-
-## Ways to interact with container
-
-### 1) Built-in web UI
-
-Open:
-
-`http://localhost:8000`
-
-Web page supports:
-
-1. PDF upload
-2. mode selection (`surya`, `chandra`, `chandra+surya`)
-3. language (`rus+eng` by default)
-4. optional pages list
-5. strict toggle
-
-### 2) Sync HTTP API
-
-Endpoint:
-
-`POST /searchable-pdf`
-
-Query params:
-
-1. `mode=surya|chandra|chandra+surya`
-2. `lang=rus+eng` (or any supported value)
-3. `pages=1,3,5-8` (optional)
-4. `strict=1|0`
-
-Request body:
-
-`application/pdf` raw bytes
-
-Example:
-
-```bash
-curl -X POST "http://localhost:8000/searchable-pdf?mode=chandra+surya&lang=rus+eng&strict=1" \
-  -H "Content-Type: application/pdf" \
-  --data-binary "@input.pdf" \
-  -o output.searchable.pdf
-```
-
-### 3) Async HTTP API
-
-Endpoints:
-
-1. `POST /api/jobs` - create job
-2. `GET /api/jobs/{job_id}` - status/progress
-3. `GET /api/jobs/{job_id}/result` - downloadable PDF
-
-Example:
-
-```bash
-# Create async job
-curl -X POST "http://localhost:8000/api/jobs?mode=chandra+surya&lang=rus+eng&strict=1&filename=input.pdf" \
-  -H "Content-Type: application/pdf" \
-  --data-binary "@input.pdf"
-
-# Poll status
-curl "http://localhost:8000/api/jobs/<job_id>"
-
-# Download result
-curl -L "http://localhost:8000/api/jobs/<job_id>/result" -o output.searchable.pdf
-```
-
-### 4) CLI inside running container
-
-```bash
-# Check CLI help
-docker compose exec ocr-api /opt/venvs/chandra/bin/python -m uniscan --help
-
-# Process PDF from mounted /data/in
-docker compose exec ocr-api /opt/venvs/chandra/bin/python -m uniscan searchable-pdf \
-  --pdf /data/in/input.pdf \
-  --mode chandra+surya \
-  --work-root /data/work \
-  --strict
-```
-
-Result appears in:
-
-`./outputs` (host) and `input.pdf` can be overwritten by command semantics.
-
-## GPU requirements for container
-
-1. NVIDIA driver on host
-2. Docker with GPU runtime (`--gpus all`)
-3. Docker Compose plugin with GPU support
-
-Quick validation:
+Quick GPU check:
 
 ```powershell
 docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu22.04 nvidia-smi
 ```
 
-If you need CPU-only debug mode, override:
+## Runtime Caches
 
-1. `UNISCAN_CHANDRA_REQUIRE_GPU=0`
-2. `UNISCAN_CHANDRA_TORCH_DEVICE=cpu`
+The project keeps heavyweight runtime files out of git. These folders are expected to be local:
 
-## Typical pipeline
+1. `.venv_surya`
+2. `.venv_chandra`
+3. `.hf_cache*`
+4. `.surya_cache`
+5. `.modelscope_cache`
+6. `.uv_cache`
+7. `.tmp_*`
+8. `outputs`
 
-```powershell
-python -m uniscan searchable-pdf `
-  --pdf "D:\path\input.pdf" `
-  --mode chandra+surya `
-  --strict
-```
+If a model download is interrupted, deleting the incomplete cache for that engine and rerunning setup or OCR is often enough.
 
-## Hybrid geometry behavior
+## Modes
 
-In hybrid mode:
+`chandra+surya`:
+The default. Chandra provides text, Surya provides geometry. Best target for searchable PDFs when both engines are available.
 
-1. Text source: Chandra
-2. Geometry source: Surya
+`chandra`:
+Uses Chandra text and Chandra geometry. Useful when Surya is unavailable or for comparison.
 
-Surya geometry sidecars are mandatory by default. If geometry sidecars are missing, run fails instead of silently falling back to low-quality text-only behavior.
-
-## Caches and local artifacts
-
-Runtime caches are local to repository root (ignored by git):
-
-1. `.hf_cache*`
-2. `.surya_cache`
-3. `.modelscope_cache`
-4. `.venv*`
-5. `.tmp*`
-6. `outputs/`
+`surya`:
+Uses Surya OCR and Surya geometry.
 
 ## Troubleshooting
 
-### 1) Chandra fails with `CUDA unavailable`
+`torch` shows `+cpu`:
+Run `.\setup_dual_venv.cmd` again. The current setup script requires CUDA PyTorch and fails if a CUDA build cannot be installed.
 
-Check torch stack inside `.venv_chandra`:
+`cuda_available: False`:
+Check `nvidia-smi` first. If the driver cannot see the GPU, PyTorch cannot use it either.
+
+`No module named uniscan`:
+Install the package into both venvs:
 
 ```powershell
-@'
-import torch
-print(torch.__version__)
-print(torch.cuda.is_available())
-'@ | .\.venv_chandra\Scripts\python.exe -
+.\.venv_surya\Scripts\python.exe -m pip install -e .
+.\.venv_chandra\Scripts\python.exe -m pip install -e .
 ```
 
-If needed, reinstall CUDA wheels:
+`Chandra cache/weights preflight failed` or `Surya cache/weights preflight failed`:
+By default, local cache preflight is not required so first-run downloads can happen. For offline runs, pre-seed the caches and enable strict cache checks:
 
 ```powershell
-uv pip install --python .\.venv_chandra\Scripts\python.exe `
-  --index-url https://download.pytorch.org/whl/cu128 `
-  --upgrade --reinstall `
-  "torch==2.11.0+cu128" `
-  "torchvision==0.26.0+cu128" `
-  "torchaudio==2.11.0+cu128"
-```
-
-### 2) Chandra cache preflight fails
-
-Set cache root explicitly before launch:
-
-```powershell
-$env:UNISCAN_CHANDRA_HF_HOME = "D:\Git_Code\Surya_Chandra_PDF_OCR\.hf_cache"
+$env:UNISCAN_CHANDRA_REQUIRE_LOCAL_CACHE = "1"
+$env:UNISCAN_SURYA_REQUIRE_LOCAL_CACHE = "1"
 .\run_basic_gui.cmd
 ```
 
-### 3) Surya fallback must stay disabled
+`setup_dual_venv.cmd` cannot find labels such as `ensure_venv`:
+Make sure the file has Windows CRLF line endings. A normal git checkout on Windows should handle this.
 
-Default behavior enforces geometry quality:
+## Project Layout
 
-1. `UNISCAN_SURYA_ALLOW_TEXT_FALLBACK=0`
-2. `UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON=1`
+1. `src/uniscan/app` - high-level OCR orchestration.
+2. `src/uniscan/ocr` - OCR engine adapters, benchmarks, geometry, and searchable PDF assembly.
+3. `src/uniscan/ui/basic_ocr_gui.py` - local Tkinter GUI.
+4. `src/uniscan/web/service.py` - local HTTP API and web UI.
+5. `setup_dual_venv.cmd` - Windows dual-venv bootstrap.
+6. `run_basic_gui.cmd` - Windows GUI launcher.
+7. `Dockerfile` and `docker-compose.yml` - GPU container runtime.
 
-## Cleanup and refactor docs
+## Development
 
-1. `docs/CLEANUP_REFACTOR_PLAN.md`
-2. `docs/REPO_INVENTORY_KEEP_REMOVE.md`
+Install dev dependencies into a venv and run tests:
 
-## Rollback checkpoint
+```powershell
+python -m pip install -e ".[dev]"
+python -m pytest -q
+```
 
-Stable checkpoint tag before the large cleanup/refactor pass:
-
-`checkpoint/dual-venv-stable-20260420`
+The test suite contains Russian OCR fixture text on purpose. That text is part of OCR behavior coverage, not UI copy.

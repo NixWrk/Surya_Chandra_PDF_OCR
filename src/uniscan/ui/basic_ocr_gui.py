@@ -39,7 +39,7 @@ class BasicOcrGui(tk.Tk):
         self.pdf_path_var = tk.StringVar()
         self.mode_label_var = tk.StringVar(value=MODE_OPTIONS[0][0])
         self.pages_var = tk.StringVar(value="")
-        self.status_var = tk.StringVar(value="Готово")
+        self.status_var = tk.StringVar(value="Ready")
         self.progress_text_var = tk.StringVar(value="0%")
         self.progress_var = tk.IntVar(value=0)
         self.delete_original_layer_var = tk.BooleanVar(value=False)
@@ -53,19 +53,19 @@ class BasicOcrGui(tk.Tk):
 
         row_file = ttk.Frame(root)
         row_file.pack(fill=tk.X, pady=(0, 12))
-        ttk.Label(row_file, text="PDF файл:", width=12).pack(side=tk.LEFT)
+        ttk.Label(row_file, text="PDF file:", width=12).pack(side=tk.LEFT)
         ttk.Entry(row_file, textvariable=self.pdf_path_var).pack(
             side=tk.LEFT,
             fill=tk.X,
             expand=True,
             padx=(0, 8),
         )
-        self.file_btn = ttk.Button(row_file, text="Выбрать", command=self._choose_pdf)
+        self.file_btn = ttk.Button(row_file, text="Browse", command=self._choose_pdf)
         self.file_btn.pack(side=tk.LEFT)
 
         row_mode = ttk.Frame(root)
         row_mode.pack(fill=tk.X, pady=(0, 12))
-        ttk.Label(row_mode, text="Режим:", width=12).pack(side=tk.LEFT)
+        ttk.Label(row_mode, text="Mode:", width=12).pack(side=tk.LEFT)
         mode_labels = [label for label, _value in MODE_OPTIONS]
         self.mode_combo = ttk.Combobox(
             row_mode,
@@ -78,26 +78,26 @@ class BasicOcrGui(tk.Tk):
         self.mode_combo.current(0)
         ttk.Label(
             row_mode,
-            text="По умолчанию: Chandra text + Surya geometry.",
+            text="Default: Chandra text + Surya geometry.",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         row_pages = ttk.Frame(root)
         row_pages.pack(fill=tk.X, pady=(0, 12))
-        ttk.Label(row_pages, text="Страницы:", width=12).pack(side=tk.LEFT)
+        ttk.Label(row_pages, text="Pages:", width=12).pack(side=tk.LEFT)
         self.pages_entry = ttk.Entry(row_pages, textvariable=self.pages_var)
         self.pages_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        ttk.Label(row_pages, text="напр.: 1,3,5-8 (пусто = все)").pack(side=tk.LEFT)
+        ttk.Label(row_pages, text="for example: 1,3,5-8 (blank = all)").pack(side=tk.LEFT)
 
         row_delete_layer = ttk.Frame(root)
         row_delete_layer.pack(fill=tk.X, pady=(0, 12))
         self.delete_layer_check = ttk.Checkbutton(
             row_delete_layer,
             variable=self.delete_original_layer_var,
-            text="Удалить исходный текстовый слой"
+            text="Remove existing text layer"
         )
         self.delete_layer_check.pack(side=tk.LEFT)
 
-        progress_box = ttk.LabelFrame(root, text="Прогресс")
+        progress_box = ttk.LabelFrame(root, text="Progress")
         progress_box.pack(fill=tk.X, pady=(0, 12))
         self.progress_bar = ttk.Progressbar(
             progress_box,
@@ -115,12 +115,12 @@ class BasicOcrGui(tk.Tk):
 
         row_actions = ttk.Frame(root)
         row_actions.pack(fill=tk.X)
-        self.start_btn = ttk.Button(row_actions, text="Запустить", command=self._start_run)
+        self.start_btn = ttk.Button(row_actions, text="Run", command=self._start_run)
         self.start_btn.pack(side=tk.LEFT)
 
     def _choose_pdf(self) -> None:
         path = filedialog.askopenfilename(
-            title="Выбери PDF",
+            title="Choose PDF",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
         )
         if path:
@@ -147,19 +147,19 @@ class BasicOcrGui(tk.Tk):
         try:
             pdf_path = Path(self.pdf_path_var.get().strip())
             if not pdf_path.exists() or not pdf_path.is_file():
-                raise RuntimeError("Выберите существующий PDF файл.")
+                raise RuntimeError("Choose an existing PDF file.")
             if pdf_path.suffix.lower() != ".pdf":
-                raise RuntimeError("Поддерживается только PDF.")
+                raise RuntimeError("Only PDF input is supported.")
 
             mode = self._selected_mode()
             page_numbers = parse_page_numbers(self.pages_var.get())
         except Exception as exc:
-            messagebox.showerror("Ошибка", str(exc))
+            messagebox.showerror("Error", str(exc))
             return
 
         self.progress_var.set(0)
         self.progress_text_var.set("0%")
-        self.status_var.set("Подготовка...")
+        self.status_var.set("Preparing...")
         self._set_running(True)
 
         self._worker = threading.Thread(
@@ -203,33 +203,33 @@ class BasicOcrGui(tk.Tk):
 
     def _ui_done(self, summary: SearchablePdfSummary) -> None:
         self._set_running(False)
-        self._ui_set_progress(100, "Завершено")
+        self._ui_set_progress(100, "Completed")
 
         extra_lines: list[str] = []
         if summary.benchmark.skipped_engines:
-            extra_lines.append("Пропущены (нет зависимостей):")
+            extra_lines.append("Skipped (missing dependencies):")
             extra_lines.extend(summary.benchmark.skipped_engines)
             extra_lines.append("")
         if summary.benchmark.failed_engines:
-            extra_lines.append("С ошибкой:")
+            extra_lines.append("Failed:")
             extra_lines.extend(summary.benchmark.failed_engines)
             extra_lines.append("")
         extra = ("\n".join(extra_lines)).strip()
         details_block = f"\n\n{extra}" if extra else ""
 
         messagebox.showinfo(
-            "Готово",
-            "Searchable PDF собран.\n\n"
-            f"Режим: {summary.mode}\n"
-            f"Итоговый PDF:\n{summary.output_pdf_path}\n\n"
-            f"Папка run-артефактов:\n{summary.run_dir}"
+            "Done",
+            "Searchable PDF has been built.\n\n"
+            f"Mode: {summary.mode}\n"
+            f"Output PDF:\n{summary.output_pdf_path}\n\n"
+            f"Run artifacts:\n{summary.run_dir}"
             f"{details_block}",
         )
 
     def _ui_error(self, message: str) -> None:
         self._set_running(False)
-        self.status_var.set("Ошибка")
-        messagebox.showerror("Ошибка", message)
+        self.status_var.set("Error")
+        messagebox.showerror("Error", message)
 
 
 def main() -> int:

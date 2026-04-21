@@ -99,7 +99,7 @@ _ALIGN_CHAR_FOLD = {
     "ю": "io",
     "я": "ya",
     # Latin OCR confusions
-    "f": "g",  # FOCT -> ГОСТ (common OCR confusion)
+    "f": "g",  # FOCT is a common Latin OCR rendering of GOST.
 }
 
 

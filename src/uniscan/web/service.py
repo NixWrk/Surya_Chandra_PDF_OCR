@@ -190,15 +190,15 @@ def _html_ui() -> bytes:
   <div class="wrap">
     <div class="head">
       <h1>UniScan Web GUI</h1>
-      <div class="sub">PDF in -> searchable PDF out. По умолчанию: <b>chandra+surya</b>.</div>
+      <div class="sub">PDF in -> searchable PDF out. Default: <b>chandra+surya</b>.</div>
     </div>
     <div class="grid">
       <div class="field full">
-        <label>PDF файл</label>
+        <label>PDF file</label>
         <input id="pdfFile" type="file" accept=".pdf,application/pdf">
       </div>
       <div class="field">
-        <label>Режим</label>
+        <label>Mode</label>
         <select id="mode">
           <option value="chandra+surya" selected>chandra+surya (default)</option>
           <option value="chandra">chandra</option>
@@ -206,11 +206,11 @@ def _html_ui() -> bytes:
         </select>
       </div>
       <div class="field">
-        <label>Язык OCR</label>
+        <label>OCR language</label>
         <input id="lang" value="rus+eng">
       </div>
       <div class="field">
-        <label>Страницы (опционально)</label>
+        <label>Pages (optional)</label>
         <input id="pages" placeholder="1,3,5-8">
       </div>
       <div class="field">
@@ -222,13 +222,13 @@ def _html_ui() -> bytes:
       </div>
     </div>
     <div class="actions">
-      <button id="runBtn">Запустить OCR</button>
-      <button id="downloadBtn" class="secondary" disabled>Скачать результат</button>
+      <button id="runBtn">Run OCR</button>
+      <button id="downloadBtn" class="secondary" disabled>Download result</button>
       <span id="jobId"></span>
     </div>
     <div class="status">
       <progress id="bar" max="100" value="0"></progress>
-      <div id="line" class="line">Готово.</div>
+      <div id="line" class="line">Ready.</div>
     </div>
     <div class="foot">
       API: <code>POST /api/jobs</code>, <code>GET /api/jobs/{id}</code>, <code>GET /api/jobs/{id}/result</code>
@@ -276,7 +276,7 @@ def _html_ui() -> bytes:
         const res = await fetch(`/api/jobs/${lastJobId}`);
         const data = await res.json();
         if (!res.ok) {
-          setLine(`Ошибка статуса: ${data.error || res.statusText}`, true);
+          setLine(`Status error: ${data.error || res.statusText}`, true);
           setRunning(false);
           return;
         }
@@ -295,7 +295,7 @@ def _html_ui() -> bytes:
         }
         pollTimer = setTimeout(pollJob, 900);
       } catch (err) {
-        setLine("Потеряна связь с сервером: " + err, true);
+        setLine("Lost connection to the server: " + err, true);
         setRunning(false);
       }
     };
@@ -304,7 +304,7 @@ def _html_ui() -> bytes:
       stopPolling();
       const file = fileEl.files[0];
       if (!file) {
-        setLine("Сначала выберите PDF файл.", true);
+        setLine("Choose a PDF file first.", true);
         return;
       }
       setRunning(true);
@@ -312,7 +312,7 @@ def _html_ui() -> bytes:
       downloadBtn.disabled = true;
       lastResultUrl = null;
       lastFilename = file.name.replace(/\\.pdf$/i, "") + ".searchable.pdf";
-      setLine("Отправка файла...");
+      setLine("Uploading file...");
       const params = new URLSearchParams({
         mode: modeEl.value,
         lang: langEl.value.trim() || "rus+eng",
@@ -336,10 +336,10 @@ def _html_ui() -> bytes:
         }
         lastJobId = data.job_id;
         jobIdEl.textContent = `job: ${lastJobId}`;
-        setLine("Задача создана, OCR выполняется...");
+        setLine("Job created, OCR is running...");
         pollTimer = setTimeout(pollJob, 300);
       } catch (err) {
-        setLine("Ошибка запроса: " + err, true);
+        setLine("Request error: " + err, true);
         setRunning(false);
       }
     });
@@ -350,7 +350,7 @@ def _html_ui() -> bytes:
         const res = await fetch(lastResultUrl);
         if (!res.ok) {
           const txt = await res.text();
-          setLine(`Ошибка скачивания: ${txt}`, true);
+          setLine(`Download error: ${txt}`, true);
           return;
         }
         const blob = await res.blob();
@@ -360,9 +360,9 @@ def _html_ui() -> bytes:
         a.download = lastFilename;
         a.click();
         URL.revokeObjectURL(href);
-        setLine("Результат скачан.");
+        setLine("Result downloaded.");
       } catch (err) {
-        setLine("Ошибка скачивания: " + err, true);
+        setLine("Download error: " + err, true);
       }
     });
   </script>

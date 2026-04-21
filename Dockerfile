@@ -21,11 +21,11 @@ COPY pyproject.toml README.md /app/
 COPY src /app/src
 COPY scripts/docker-entrypoint.sh /app/scripts/docker-entrypoint.sh
 
-RUN python -m pip install --upgrade pip setuptools wheel
+RUN python -m pip install --upgrade pip "setuptools<82" wheel
 
 # Surya runtime venv
 RUN python -m venv /opt/venvs/surya && \
-    /opt/venvs/surya/bin/python -m pip install --upgrade pip setuptools wheel && \
+    /opt/venvs/surya/bin/python -m pip install --upgrade pip "setuptools<82" wheel && \
     /opt/venvs/surya/bin/python -m pip install /app && \
     /opt/venvs/surya/bin/python -m pip install \
       "pypdf>=4.0" \
@@ -37,14 +37,14 @@ RUN python -m venv /opt/venvs/surya && \
       "pypdfium2==4.30.0" && \
     /opt/venvs/surya/bin/python -m pip install \
       --index-url https://download.pytorch.org/whl/cu128 \
-      --upgrade --reinstall \
+      --upgrade --force-reinstall \
       "torch==2.11.0+cu128" \
       "torchvision==0.26.0+cu128" \
       "torchaudio==2.11.0+cu128"
 
 # Chandra runtime venv
 RUN python -m venv /opt/venvs/chandra && \
-    /opt/venvs/chandra/bin/python -m pip install --upgrade pip setuptools wheel && \
+    /opt/venvs/chandra/bin/python -m pip install --upgrade pip "setuptools<82" wheel && \
     /opt/venvs/chandra/bin/python -m pip install /app && \
     /opt/venvs/chandra/bin/python -m pip install \
       "pypdf>=4.0" \
@@ -53,7 +53,7 @@ RUN python -m venv /opt/venvs/chandra && \
       "pypdfium2==4.30.0" && \
     /opt/venvs/chandra/bin/python -m pip install \
       --index-url https://download.pytorch.org/whl/cu128 \
-      --upgrade --reinstall \
+      --upgrade --force-reinstall \
       "torch==2.11.0+cu128" \
       "torchvision==0.26.0+cu128" \
       "torchaudio==2.11.0+cu128"
