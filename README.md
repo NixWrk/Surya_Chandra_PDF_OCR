@@ -322,7 +322,9 @@ Check `nvidia-smi` first. If the driver cannot see the GPU, PyTorch cannot use i
 The installed PyTorch CUDA wheel does not support your GPU architecture. For example, GTX 1070 is `sm_61`, while PyTorch `cu128` wheels support `sm_75+`. Re-run `setup_dual_venv.cmd`; it auto-selects `cu126` for older GPUs and verifies compatibility by running a tiny CUDA tensor before setup succeeds.
 
 `CUDA out of memory` while loading Chandra:
-The CUDA wheel is compatible, but Chandra's model does not fit into available VRAM. GTX 1070 has 8 GB VRAM, and Chandra may need more depending on driver, fragmentation, and page size. Use the runtime policy you want:
+The CUDA wheel is compatible, but Chandra's model does not fit into available VRAM. GTX 1070 has 8 GB VRAM, and Chandra may need more depending on driver, fragmentation, and page size. In the GUI, UniScan shows a question asking whether to install CPU PyTorch into the Chandra venv and restart in Chandra CPU mode. If you click Yes, this happens automatically.
+
+Manual runtime policies are also available:
 
 ```powershell
 $env:UNISCAN_CHANDRA_DEVICE_POLICY = "auto"
