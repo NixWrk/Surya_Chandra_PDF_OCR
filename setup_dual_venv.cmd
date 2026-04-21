@@ -37,6 +37,11 @@ if errorlevel 1 goto :error
 set "PY_SURYA=%CD%\%VENV_SURYA%\Scripts\python.exe"
 set "PY_CHANDRA=%CD%\%VENV_CHANDRA%\Scripts\python.exe"
 
+call :clean_invalid_distributions "%PY_SURYA%" "SURYA"
+if errorlevel 1 goto :error
+call :clean_invalid_distributions "%PY_CHANDRA%" "CHANDRA"
+if errorlevel 1 goto :error
+
 echo [dual-venv] Installing project into SURYA venv ...
 "%PY_SURYA%" -m ensurepip --upgrade >nul 2>nul
 "%PY_SURYA%" -m pip install --upgrade pip wheel
@@ -105,6 +110,17 @@ if errorlevel 1 (
 )
 python -m venv "%~1"
 if errorlevel 1 exit /b 1
+exit /b 0
+
+:clean_invalid_distributions
+set "CLEAN_PY=%~1"
+set "CLEAN_NAME=%~2"
+echo [dual-venv] Cleaning invalid pip leftovers in %CLEAN_NAME% venv ...
+"%CLEAN_PY%" -c "import shutil, site; from pathlib import Path; roots=[Path(p) for p in site.getsitepackages()]; leftovers=[p for r in roots for p in r.glob('~*')]; [shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True) for p in leftovers]; print('removed invalid distribution leftovers:', len(leftovers))"
+if errorlevel 1 (
+  echo [dual-venv] ERROR: Failed to clean invalid pip leftovers in %CLEAN_NAME% venv.
+  exit /b 1
+)
 exit /b 0
 
 :install_gpu_torch

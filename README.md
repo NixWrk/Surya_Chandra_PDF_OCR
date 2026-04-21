@@ -293,6 +293,9 @@ This can appear during the forced CUDA PyTorch reinstall. In the Surya venv, PyT
 
 Repeated setup runs should not reinstall CUDA torch when the exact verified `cu128` stack is already present. If the script does reinstall torch, it means one of `torch`, `torchvision`, or `torchaudio` was missing or had a different version.
 
+`WARNING: Ignoring invalid distribution ~orch`:
+This means a previous interrupted PyTorch uninstall left temporary `~*` directories in the venv `site-packages`. The setup script removes these invalid pip leftovers at the start of each run before checking torch versions. If this warning appears during an already-running old setup attempt, let that run finish or stop it, then re-run the updated `setup_dual_venv.cmd`.
+
 `Warning: You are sending unauthenticated requests to the HF Hub`:
 This is a Hugging Face rate-limit warning, not a project failure. Chandra weights are large, about 10.6 GB for `datalab-to/chandra-ocr-2`, so unauthenticated downloads can be slow. If needed, set `HF_TOKEN` before running setup to use authenticated Hugging Face requests.
 
