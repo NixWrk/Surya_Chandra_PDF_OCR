@@ -42,8 +42,15 @@ The bootstrap script intentionally creates two separate virtual environments bec
 
 Expected versions after a healthy setup:
 
-1. `.venv_surya`: `torch==2.11.0+cu128`, `torchvision==0.26.0+cu128`, `torchaudio==2.11.0+cu128`, `pillow>=10.2,<11.0`.
-2. `.venv_chandra`: `torch==2.11.0+cu128`, `torchvision==0.26.0+cu128`, `torchaudio==2.11.0+cu128`.
+1. `.venv_surya`: `torch==2.11.0+<selected CUDA wheel>`, `torchvision==0.26.0+<selected CUDA wheel>`, `torchaudio==2.11.0+<selected CUDA wheel>`, `pillow>=10.2,<11.0`.
+2. `.venv_chandra`: `torch==2.11.0+<selected CUDA wheel>`, `torchvision==0.26.0+<selected CUDA wheel>`, `torchaudio==2.11.0+<selected CUDA wheel>`.
+
+`setup_dual_venv.cmd` selects the PyTorch CUDA wheel from the first NVIDIA GPU reported by `nvidia-smi`:
+
+1. `cu126` for GPUs below compute capability `7.5`, for example GTX 1070 / Pascal `sm_61`.
+2. `cu128` for GPUs with compute capability `7.5` or newer.
+
+You can override this manually with `UNISCAN_TORCH_CUDA_FLAVOR=cu126` or `UNISCAN_TORCH_CUDA_FLAVOR=cu128`, but the automatic selection is the recommended path.
 
 `pillow` is pinned below 11 only where Surya needs it. `surya-ocr==0.17.1` requires `pillow>=10.2,<11.0`, while Chandra can currently run with a newer Pillow version. This is one of the reasons the project does not use one shared venv for both engines. The base `uniscan` package allows newer Pillow builds; the Surya venv is pinned separately by `setup_dual_venv.cmd`.
 
@@ -70,13 +77,13 @@ Completed baseline:
 
 ## Last Verified Versions
 
-Last checked on 2026-04-21 with Python 3.11 on Windows and CUDA PyTorch `cu128`.
+Last checked on 2026-04-21 with Python 3.11 on Windows. The setup script now auto-selects the PyTorch CUDA wheel from GPU compute capability. GTX 1070 / `sm_61` requires `cu126`; `cu128` is not compatible with that card because current PyTorch `cu128` wheels start at `sm_75`.
 
 Surya venv:
 
-1. `torch==2.11.0+cu128`
-2. `torchvision==0.26.0+cu128`
-3. `torchaudio==2.11.0+cu128`
+1. `torch==2.11.0+cu126` on GTX 1070 / `sm_61`, or `torch==2.11.0+cu128` on `sm_75+`.
+2. `torchvision==0.26.0+cu126` on GTX 1070 / `sm_61`, or `torchvision==0.26.0+cu128` on `sm_75+`.
+3. `torchaudio==2.11.0+cu126` on GTX 1070 / `sm_61`, or `torchaudio==2.11.0+cu128` on `sm_75+`.
 4. `surya-ocr==0.17.1`
 5. `pillow==10.4.0`
 6. `transformers==4.57.1`
@@ -88,9 +95,9 @@ Surya venv:
 
 Chandra venv:
 
-1. `torch==2.11.0+cu128`
-2. `torchvision==0.26.0+cu128`
-3. `torchaudio==2.11.0+cu128`
+1. `torch==2.11.0+cu126` on GTX 1070 / `sm_61`, or `torch==2.11.0+cu128` on `sm_75+`.
+2. `torchvision==0.26.0+cu126` on GTX 1070 / `sm_61`, or `torchvision==0.26.0+cu128` on `sm_75+`.
+3. `torchaudio==2.11.0+cu126` on GTX 1070 / `sm_61`, or `torchaudio==2.11.0+cu128` on `sm_75+`.
 4. `chandra-ocr==0.2.0`
 5. `pillow==12.1.1`
 6. `transformers==5.5.4`
@@ -221,6 +228,12 @@ docker compose build
 docker compose up -d
 ```
 
+The Dockerfile defaults to `TORCH_CUDA_FLAVOR=cu126` because that is the safer wheel for older GPUs such as GTX 1070. For newer `sm_75+` GPUs, you can build with `cu128`:
+
+```powershell
+docker compose build --build-arg TORCH_CUDA_FLAVOR=cu128
+```
+
 Open:
 
 ```text
@@ -288,10 +301,13 @@ Run `.\setup_dual_venv.cmd` again. The current setup script requires CUDA PyTorc
 `cuda_available: False`:
 Check `nvidia-smi` first. If the driver cannot see the GPU, PyTorch cannot use it either.
 
+`no kernel image is available for execution on the device`:
+The installed PyTorch CUDA wheel does not support your GPU architecture. For example, GTX 1070 is `sm_61`, while PyTorch `cu128` wheels support `sm_75+`. Re-run `setup_dual_venv.cmd`; it auto-selects `cu126` for older GPUs and verifies compatibility by running a tiny CUDA tensor before setup succeeds.
+
 `pip's dependency resolver does not currently take into account all the packages that are installed`:
 This can appear during the forced CUDA PyTorch reinstall. In the Surya venv, PyTorch may temporarily pull `pillow 12.x`, which conflicts with `surya-ocr==0.17.1`; the setup script immediately pins Surya back to `pillow>=10.2,<11.0` after the torch install. Treat the final verification as authoritative: Surya should end on `pillow 10.4.0` or another `<11.0` build, while Chandra can stay on `pillow 12.x`.
 
-Repeated setup runs should not reinstall CUDA torch when the exact verified `cu128` stack is already present. If the script does reinstall torch, it means one of `torch`, `torchvision`, or `torchaudio` was missing or had a different version.
+Repeated setup runs should not reinstall CUDA torch when the exact selected and verified CUDA stack is already present. If the script does reinstall torch, it means one of `torch`, `torchvision`, or `torchaudio` was missing, had a different version, or failed the CUDA tensor smoke-test.
 
 `WARNING: Ignoring invalid distribution ~orch`:
 This means a previous interrupted PyTorch uninstall left temporary `~*` directories in the venv `site-packages`. The setup script removes these invalid pip leftovers at the start of each run before checking torch versions. If this warning appears during an already-running old setup attempt, let that run finish or stop it, then re-run the updated `setup_dual_venv.cmd`.

@@ -8,6 +8,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /app
 
+ARG TORCH_CUDA_FLAVOR=cu126
+ARG TORCH_VERSION=2.11.0
+ARG TORCHVISION_VERSION=0.26.0
+ARG TORCHAUDIO_VERSION=2.11.0
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     ca-certificates \
@@ -36,11 +41,11 @@ RUN python -m venv /opt/venvs/surya && \
       "tokenizers>=0.22,<0.23" \
       "pypdfium2==4.30.0" && \
     /opt/venvs/surya/bin/python -m pip install \
-      --index-url https://download.pytorch.org/whl/cu128 \
+      --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_FLAVOR}" \
       --upgrade --force-reinstall \
-      "torch==2.11.0+cu128" \
-      "torchvision==0.26.0+cu128" \
-      "torchaudio==2.11.0+cu128" && \
+      "torch==${TORCH_VERSION}+${TORCH_CUDA_FLAVOR}" \
+      "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA_FLAVOR}" \
+      "torchaudio==${TORCHAUDIO_VERSION}+${TORCH_CUDA_FLAVOR}" && \
     /opt/venvs/surya/bin/python -m pip install --upgrade "pillow>=10.2,<11.0"
 
 # Chandra runtime venv
@@ -53,11 +58,11 @@ RUN python -m venv /opt/venvs/chandra && \
       "chandra-ocr[hf]==0.2.0" \
       "pypdfium2==4.30.0" && \
     /opt/venvs/chandra/bin/python -m pip install \
-      --index-url https://download.pytorch.org/whl/cu128 \
+      --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_FLAVOR}" \
       --upgrade --force-reinstall \
-      "torch==2.11.0+cu128" \
-      "torchvision==0.26.0+cu128" \
-      "torchaudio==2.11.0+cu128"
+      "torch==${TORCH_VERSION}+${TORCH_CUDA_FLAVOR}" \
+      "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA_FLAVOR}" \
+      "torchaudio==${TORCHAUDIO_VERSION}+${TORCH_CUDA_FLAVOR}"
 
 RUN chmod +x /app/scripts/docker-entrypoint.sh && \
     mkdir -p /cache/hf_chandra /cache/hf_surya /cache/surya_models /cache/modelscope /data/work /data/in /data/out
