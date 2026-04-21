@@ -7,13 +7,26 @@ set "VENV_SURYA=.venv_surya"
 set "VENV_CHANDRA=.venv_chandra"
 set "UV_CACHE_DIR=%CD%\.uv_cache"
 set "TMP_BOOT=%CD%\.tmp_bootstrap"
+set "CHANDRA_HF_HOME=%CD%\.hf_cache_chandra"
+set "CHANDRA_HF_HUB_CACHE=%CHANDRA_HF_HOME%\hub"
+set "SURYA_HF_HOME=%CD%\.hf_cache_surya"
+set "SURYA_HF_HUB_CACHE=%SURYA_HF_HOME%\hub"
+set "SURYA_MODEL_CACHE_DIR=%CD%\.surya_cache"
+set "SURYA_MODELSCOPE_CACHE=%CD%\.modelscope_cache"
 
 if not exist "%UV_CACHE_DIR%" mkdir "%UV_CACHE_DIR%"
 if not exist "%TMP_BOOT%" mkdir "%TMP_BOOT%"
+if not exist "%CHANDRA_HF_HOME%" mkdir "%CHANDRA_HF_HOME%"
+if not exist "%CHANDRA_HF_HUB_CACHE%" mkdir "%CHANDRA_HF_HUB_CACHE%"
+if not exist "%SURYA_HF_HOME%" mkdir "%SURYA_HF_HOME%"
+if not exist "%SURYA_HF_HUB_CACHE%" mkdir "%SURYA_HF_HUB_CACHE%"
+if not exist "%SURYA_MODEL_CACHE_DIR%" mkdir "%SURYA_MODEL_CACHE_DIR%"
+if not exist "%SURYA_MODELSCOPE_CACHE%" mkdir "%SURYA_MODELSCOPE_CACHE%"
 set "UV_CACHE_DIR=%UV_CACHE_DIR%"
 set "TEMP=%TMP_BOOT%"
 set "TMP=%TMP_BOOT%"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
+set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
 
 call :ensure_venv "%VENV_SURYA%"
 if errorlevel 1 goto :error
@@ -43,6 +56,8 @@ call :install_gpu_torch "%PY_SURYA%" "SURYA"
 if errorlevel 1 goto :error
 "%PY_SURYA%" -m pip install --upgrade "pillow>=10.2,<11.0"
 if errorlevel 1 goto :error
+call :warm_surya_cache
+if errorlevel 1 goto :error
 
 echo [dual-venv] Installing project into CHANDRA venv ...
 "%PY_CHANDRA%" -m ensurepip --upgrade >nul 2>nul
@@ -58,6 +73,8 @@ if errorlevel 1 goto :error
 if errorlevel 1 goto :error
 
 call :install_gpu_torch "%PY_CHANDRA%" "CHANDRA"
+if errorlevel 1 goto :error
+call :warm_chandra_cache
 if errorlevel 1 goto :error
 
 echo [dual-venv] Done.
@@ -109,6 +126,43 @@ set "GPU_NAME=%~2"
 "%GPU_PY%" -c "import sys, torch; v=getattr(torch, '__version__', ''); print(v); sys.exit(0 if '+cu' in v else 1)"
 if errorlevel 1 (
   echo [dual-venv] ERROR: %GPU_NAME% torch is not a CUDA build.
+  exit /b 1
+)
+exit /b 0
+
+:warm_surya_cache
+echo [dual-venv] Downloading and verifying Surya model caches ...
+set "MODEL_CACHE_DIR=%SURYA_MODEL_CACHE_DIR%"
+set "HF_HOME=%SURYA_HF_HOME%"
+set "HUGGINGFACE_HUB_CACHE=%SURYA_HF_HUB_CACHE%"
+set "HF_HUB_CACHE=%SURYA_HF_HUB_CACHE%"
+set "MODELSCOPE_CACHE=%SURYA_MODELSCOPE_CACHE%"
+"%PY_SURYA%" -c "from surya.settings import settings; from surya.common.s3 import S3DownloaderMixin, download_directory; checkpoints=(settings.DETECTOR_MODEL_CHECKPOINT, settings.RECOGNITION_MODEL_CHECKPOINT); [download_directory(cp.replace('s3://', ''), S3DownloaderMixin.get_local_path(cp)) for cp in checkpoints]"
+if errorlevel 1 (
+  echo [dual-venv] ERROR: Surya model cache download failed.
+  exit /b 1
+)
+"%PY_SURYA%" -c "from uniscan.ocr.benchmark import _ensure_surya_cache_ready; _ensure_surya_cache_ready(); print('Surya cache ready')"
+if errorlevel 1 (
+  echo [dual-venv] ERROR: Surya model cache verification failed.
+  exit /b 1
+)
+exit /b 0
+
+:warm_chandra_cache
+echo [dual-venv] Downloading and verifying Chandra model cache ...
+set "HF_HOME=%CHANDRA_HF_HOME%"
+set "HUGGINGFACE_HUB_CACHE=%CHANDRA_HF_HUB_CACHE%"
+set "HF_HUB_CACHE=%CHANDRA_HF_HUB_CACHE%"
+set "TRANSFORMERS_CACHE="
+"%PY_CHANDRA%" -c "from huggingface_hub import snapshot_download; snapshot_download('datalab-to/chandra-ocr-2')"
+if errorlevel 1 (
+  echo [dual-venv] ERROR: Chandra model cache download failed.
+  exit /b 1
+)
+"%PY_CHANDRA%" -c "from uniscan.ocr.benchmark import _ensure_chandra_cache_ready; _ensure_chandra_cache_ready(); print('Chandra cache ready')"
+if errorlevel 1 (
+  echo [dual-venv] ERROR: Chandra model cache verification failed.
   exit /b 1
 )
 exit /b 0

@@ -1016,6 +1016,7 @@ def test_build_compare_txt_from_benchmark(tmp_path: Path) -> None:
             "engine": "surya",
             "status": "error",
             "artifact_path": "",
+            "error": "Surya cache/weights preflight failed",
         },
     ]
     (benchmark_root / "summary.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -1030,6 +1031,7 @@ def test_build_compare_txt_from_benchmark(tmp_path: Path) -> None:
     err_rows = [row for row in rows if row.status == "error"]
     assert len(ok_rows) == 1
     assert len(err_rows) == 1
+    assert err_rows[0].error == "engine status is 'error': Surya cache/weights preflight failed"
     assert (output_dir / "fixture_doc__chandra.txt").exists()
     assert (output_dir / "sources_map.txt").exists()
 

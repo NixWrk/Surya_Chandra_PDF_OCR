@@ -39,7 +39,7 @@ _DEFAULT_MODELSCOPE_CACHE_HOME = _REPO_ROOT / ".modelscope_cache"
 _DEFAULT_SURYA_MODEL_CACHE_HOME = _REPO_ROOT / ".surya_cache"
 _DEFAULT_YOLO_CONFIG_HOME = _REPO_ROOT / ".ultralytics"
 _DEFAULT_RUNTIME_TMP_HOME = _REPO_ROOT / ".tmp_runtime"
-_CHANDRA_MODEL_REPO_ID = "datalab-to/chandra"
+_CHANDRA_MODEL_REPO_ID = "datalab-to/chandra-ocr-2"
 _MODEL_CACHE_CHECK_MEMO: dict[str, str] = {}
 
 
@@ -1431,7 +1431,7 @@ def _run_chandra_module(
     os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
     _ensure_chandra_cache_ready()
     selected_device = _configure_chandra_runtime_device()
-    # Chandra uses PIL internally — lift the decompression-bomb guard.
+    # Chandra uses PIL internally; lift the decompression-bomb guard.
     try:
         from PIL import Image as _PIL_Image  # type: ignore
         _PIL_Image.MAX_IMAGE_PIXELS = None

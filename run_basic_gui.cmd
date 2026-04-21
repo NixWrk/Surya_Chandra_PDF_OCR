@@ -31,17 +31,17 @@ set "UNISCAN_SURYA_PYTHON=%PY_SURYA%"
 if not defined UNISCAN_CHANDRA_HF_HOME set "UNISCAN_CHANDRA_HF_HOME=%CD%\.hf_cache_chandra"
 set "LEGACY_HF_HOME=%CD%\.hf_cache"
 set "CHANDRA_CACHE_READY=0"
-if exist "%UNISCAN_CHANDRA_HF_HOME%\models--datalab-to--chandra\snapshots\*\model.safetensors.index.json" set "CHANDRA_CACHE_READY=1"
-if exist "%UNISCAN_CHANDRA_HF_HOME%\hub\models--datalab-to--chandra\snapshots\*\model.safetensors.index.json" set "CHANDRA_CACHE_READY=1"
+if exist "%UNISCAN_CHANDRA_HF_HOME%\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors.index.json" set "CHANDRA_CACHE_READY=1"
+if exist "%UNISCAN_CHANDRA_HF_HOME%\hub\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors.index.json" set "CHANDRA_CACHE_READY=1"
 if "%CHANDRA_CACHE_READY%"=="0" (
-  if exist "%LEGACY_HF_HOME%\models--datalab-to--chandra\snapshots\*\model.safetensors.index.json" (
+  if exist "%LEGACY_HF_HOME%\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors.index.json" (
     echo [OCR GUI] Using legacy Chandra cache from .hf_cache
     set "UNISCAN_CHANDRA_HF_HOME=%LEGACY_HF_HOME%"
     set "CHANDRA_CACHE_READY=1"
   )
 )
 if "%CHANDRA_CACHE_READY%"=="0" (
-  if exist "%LEGACY_HF_HOME%\hub\models--datalab-to--chandra\snapshots\*\model.safetensors.index.json" (
+  if exist "%LEGACY_HF_HOME%\hub\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors.index.json" (
     echo [OCR GUI] Using legacy Chandra hub cache from .hf_cache\hub
     set "UNISCAN_CHANDRA_HF_HOME=%LEGACY_HF_HOME%"
     set "CHANDRA_CACHE_READY=1"

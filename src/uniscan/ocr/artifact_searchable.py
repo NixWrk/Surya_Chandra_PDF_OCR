@@ -2476,13 +2476,15 @@ def build_compare_txt_from_benchmark(
         status = str(row.get("status") or "").strip().lower()
         artifact_raw = str(row.get("artifact_path") or "").strip()
         if status != "ok":
+            row_error = str(row.get("error") or row.get("note") or "").strip()
+            detail = f": {row_error}" if row_error else ""
             results.append(
                 CompareTxtBuildResult(
                     engine=engine,
                     status="error",
                     source_artifact_path=artifact_raw or None,
                     compare_txt_path=None,
-                    error=f"engine status is '{status or 'unknown'}'",
+                    error=f"engine status is '{status or 'unknown'}'{detail}",
                 )
             )
             continue

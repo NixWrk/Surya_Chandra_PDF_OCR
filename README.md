@@ -47,6 +47,14 @@ Expected versions after a healthy setup:
 
 `pillow` is pinned below 11 only where Surya needs it. `surya-ocr==0.17.1` requires `pillow>=10.2,<11.0`, while Chandra can currently run with a newer Pillow version. This is one of the reasons the project does not use one shared venv for both engines.
 
+The setup script also downloads and verifies the model weights. Runtime is intentionally strict: the GUI and CLI require the local caches to exist and will fail instead of silently downloading weights or degrading output quality mid-run.
+
+Model cache locations:
+
+1. Chandra weights: `.hf_cache_chandra`, model `datalab-to/chandra-ocr-2`.
+2. Surya weights: `.surya_cache`, components `text_detection` and `text_recognition`.
+3. Auxiliary HF/ModelScope caches: `.hf_cache_surya` and `.modelscope_cache`.
+
 ## Quick Start: Local GUI
 
 ```powershell
@@ -56,7 +64,7 @@ cd Surya_Chandra_PDF_OCR
 .\run_basic_gui.cmd
 ```
 
-The first run can take a while. The script installs both environments, installs CUDA builds of PyTorch, and later the OCR engines may download model weights into local cache folders.
+The first setup can take a while. The script installs both environments, installs CUDA builds of PyTorch, downloads the OCR model weights, and verifies that the required caches are ready before it exits successfully.
 
 After setup, the GUI lets you:
 
@@ -242,13 +250,13 @@ Install the package into both venvs:
 ```
 
 `Chandra cache/weights preflight failed` or `Surya cache/weights preflight failed`:
-By default, local cache preflight is not required so first-run downloads can happen. For offline runs, pre-seed the caches and enable strict cache checks:
+The project requires local model caches at runtime. Re-run setup to download and verify the weights:
 
 ```powershell
-$env:UNISCAN_CHANDRA_REQUIRE_LOCAL_CACHE = "1"
-$env:UNISCAN_SURYA_REQUIRE_LOCAL_CACHE = "1"
-.\run_basic_gui.cmd
+.\setup_dual_venv.cmd
 ```
+
+Expected cache targets are `.hf_cache_chandra` for `datalab-to/chandra-ocr-2` and `.surya_cache` for Surya `text_detection` plus `text_recognition`. If setup cannot download them, fix network/auth/firewall access first; the GUI will not perform lazy model downloads during OCR.
 
 `setup_dual_venv.cmd` cannot find labels such as `ensure_venv`:
 Make sure the file has Windows CRLF line endings. A normal git checkout on Windows should handle this.
