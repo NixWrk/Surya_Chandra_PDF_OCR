@@ -120,6 +120,23 @@ The first setup can take a while. The script installs both environments, install
 
 The setup script is safe to re-run. If the expected CUDA torch stack is already installed, it skips the forced torch reinstall and only verifies the environment and caches.
 
+Chandra device policy is user-selectable at runtime:
+
+1. `auto` is the default. It leaves Chandra/Hugging Face to choose device placement.
+2. `cuda` forces Chandra onto `cuda:0` and fails if CUDA is unavailable or too small.
+3. `cpu` forces Chandra onto CPU. This avoids VRAM errors but can be very slow.
+
+```powershell
+$env:UNISCAN_CHANDRA_DEVICE_POLICY = "auto"  # default
+.\run_basic_gui.cmd
+
+$env:UNISCAN_CHANDRA_DEVICE_POLICY = "cuda"  # force GPU
+.\run_basic_gui.cmd
+
+$env:UNISCAN_CHANDRA_DEVICE_POLICY = "cpu"   # force CPU
+.\run_basic_gui.cmd
+```
+
 After setup, the GUI lets you:
 
 1. Choose a PDF.
@@ -303,6 +320,22 @@ Check `nvidia-smi` first. If the driver cannot see the GPU, PyTorch cannot use i
 
 `no kernel image is available for execution on the device`:
 The installed PyTorch CUDA wheel does not support your GPU architecture. For example, GTX 1070 is `sm_61`, while PyTorch `cu128` wheels support `sm_75+`. Re-run `setup_dual_venv.cmd`; it auto-selects `cu126` for older GPUs and verifies compatibility by running a tiny CUDA tensor before setup succeeds.
+
+`CUDA out of memory` while loading Chandra:
+The CUDA wheel is compatible, but Chandra's model does not fit into available VRAM. GTX 1070 has 8 GB VRAM, and Chandra may need more depending on driver, fragmentation, and page size. Use the runtime policy you want:
+
+```powershell
+$env:UNISCAN_CHANDRA_DEVICE_POLICY = "auto"
+.\run_basic_gui.cmd
+
+$env:UNISCAN_CHANDRA_DEVICE_POLICY = "cpu"
+.\run_basic_gui.cmd
+
+$env:UNISCAN_CHANDRA_DEVICE_POLICY = "cuda"
+.\run_basic_gui.cmd
+```
+
+`auto` is the recommended default. `cpu` is slower but avoids VRAM limits. `cuda` is useful when you know your GPU has enough VRAM and want a hard failure instead of fallback behavior.
 
 `pip's dependency resolver does not currently take into account all the packages that are installed`:
 This can appear during the forced CUDA PyTorch reinstall. In the Surya venv, PyTorch may temporarily pull `pillow 12.x`, which conflicts with `surya-ocr==0.17.1`; the setup script immediately pins Surya back to `pillow>=10.2,<11.0` after the torch install. Treat the final verification as authoritative: Surya should end on `pillow 10.4.0` or another `<11.0` build, while Chandra can stay on `pillow 12.x`.

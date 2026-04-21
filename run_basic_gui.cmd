@@ -32,7 +32,9 @@ if not defined UNISCAN_CHANDRA_HF_HOME set "UNISCAN_CHANDRA_HF_HOME=%CD%\.hf_cac
 set "LEGACY_HF_HOME=%CD%\.hf_cache"
 set "CHANDRA_CACHE_READY=0"
 if exist "%UNISCAN_CHANDRA_HF_HOME%\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors.index.json" set "CHANDRA_CACHE_READY=1"
+if exist "%UNISCAN_CHANDRA_HF_HOME%\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors" set "CHANDRA_CACHE_READY=1"
 if exist "%UNISCAN_CHANDRA_HF_HOME%\hub\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors.index.json" set "CHANDRA_CACHE_READY=1"
+if exist "%UNISCAN_CHANDRA_HF_HOME%\hub\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors" set "CHANDRA_CACHE_READY=1"
 if "%CHANDRA_CACHE_READY%"=="0" (
   if exist "%LEGACY_HF_HOME%\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors.index.json" (
     echo [OCR GUI] Using legacy Chandra cache from .hf_cache
@@ -41,7 +43,21 @@ if "%CHANDRA_CACHE_READY%"=="0" (
   )
 )
 if "%CHANDRA_CACHE_READY%"=="0" (
+  if exist "%LEGACY_HF_HOME%\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors" (
+    echo [OCR GUI] Using legacy Chandra cache from .hf_cache
+    set "UNISCAN_CHANDRA_HF_HOME=%LEGACY_HF_HOME%"
+    set "CHANDRA_CACHE_READY=1"
+  )
+)
+if "%CHANDRA_CACHE_READY%"=="0" (
   if exist "%LEGACY_HF_HOME%\hub\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors.index.json" (
+    echo [OCR GUI] Using legacy Chandra hub cache from .hf_cache\hub
+    set "UNISCAN_CHANDRA_HF_HOME=%LEGACY_HF_HOME%"
+    set "CHANDRA_CACHE_READY=1"
+  )
+)
+if "%CHANDRA_CACHE_READY%"=="0" (
+  if exist "%LEGACY_HF_HOME%\hub\models--datalab-to--chandra-ocr-2\snapshots\*\model.safetensors" (
     echo [OCR GUI] Using legacy Chandra hub cache from .hf_cache\hub
     set "UNISCAN_CHANDRA_HF_HOME=%LEGACY_HF_HOME%"
     set "CHANDRA_CACHE_READY=1"
@@ -61,9 +77,23 @@ set "HUGGINGFACE_HUB_CACHE=%UNISCAN_CHANDRA_HUGGINGFACE_HUB_CACHE%"
 set "HF_HUB_CACHE=%UNISCAN_CHANDRA_HF_HUB_CACHE%"
 set "TRANSFORMERS_CACHE="
 set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
-set "TORCH_DEVICE=cuda:0"
-set "UNISCAN_CHANDRA_PREFER_GPU=1"
-set "UNISCAN_CHANDRA_REQUIRE_GPU=1"
+if not defined UNISCAN_CHANDRA_DEVICE_POLICY set "UNISCAN_CHANDRA_DEVICE_POLICY=auto"
+if /I "%UNISCAN_CHANDRA_DEVICE_POLICY%"=="cuda" (
+  set "TORCH_DEVICE=cuda:0"
+  set "UNISCAN_CHANDRA_TORCH_DEVICE=cuda:0"
+  set "UNISCAN_CHANDRA_PREFER_GPU=1"
+  set "UNISCAN_CHANDRA_REQUIRE_GPU=1"
+) else if /I "%UNISCAN_CHANDRA_DEVICE_POLICY%"=="cpu" (
+  set "TORCH_DEVICE=cpu"
+  set "UNISCAN_CHANDRA_TORCH_DEVICE=cpu"
+  set "UNISCAN_CHANDRA_PREFER_GPU=0"
+  set "UNISCAN_CHANDRA_REQUIRE_GPU=0"
+) else (
+  set "TORCH_DEVICE="
+  set "UNISCAN_CHANDRA_TORCH_DEVICE="
+  set "UNISCAN_CHANDRA_PREFER_GPU=1"
+  set "UNISCAN_CHANDRA_REQUIRE_GPU=0"
+)
 set "UNISCAN_SURYA_ALLOW_TEXT_FALLBACK=0"
 set "UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON=1"
 

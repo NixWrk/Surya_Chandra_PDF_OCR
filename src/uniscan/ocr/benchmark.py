@@ -440,6 +440,7 @@ def _configure_chandra_runtime_device() -> str:
     """Resolve TORCH_DEVICE for Chandra before importing chandra.settings."""
 
     explicit = (os.environ.get("TORCH_DEVICE") or "").strip()
+    device_policy = (os.environ.get("UNISCAN_CHANDRA_DEVICE_POLICY") or "auto").strip().lower()
     prefer_gpu = _env_bool("UNISCAN_CHANDRA_PREFER_GPU", default=True)
     require_gpu = _env_bool("UNISCAN_CHANDRA_REQUIRE_GPU", default=False)
 
@@ -464,6 +465,39 @@ def _configure_chandra_runtime_device() -> str:
                     f"Chandra GPU mode requires CUDA, but TORCH_DEVICE='{explicit}' is unusable ({detail})."
                 )
         return explicit
+
+    if device_policy == "auto":
+        # Leave TORCH_DEVICE unset so Chandra/Hugging Face can use device_map="auto".
+        # This lets users with smaller GPUs choose whether to accept CPU/offload
+        # behavior instead of forcing the whole model onto cuda:0.
+        if require_gpu:
+            has_cuda, detail = _cuda_probe()
+            if not has_cuda:
+                raise RuntimeError(
+                    "Chandra GPU mode is required, but CUDA is unavailable. "
+                    f"Install a CUDA-enabled torch build in the Chandra venv ({detail})."
+                )
+        os.environ.pop("TORCH_DEVICE", None)
+        return "auto"
+
+    if device_policy == "cpu":
+        os.environ["TORCH_DEVICE"] = "cpu"
+        return "cpu"
+
+    if device_policy == "cuda":
+        has_cuda, detail = _cuda_probe()
+        if not has_cuda:
+            raise RuntimeError(
+                "Chandra CUDA mode was requested, but CUDA is unavailable. "
+                f"Install a CUDA-enabled torch build in the Chandra venv ({detail})."
+            )
+        os.environ["TORCH_DEVICE"] = "cuda:0"
+        return "cuda:0"
+
+    if device_policy not in {"", "legacy"}:
+        raise RuntimeError(
+            "Unsupported UNISCAN_CHANDRA_DEVICE_POLICY. Use one of: auto, cuda, cpu."
+        )
 
     if not prefer_gpu and not require_gpu:
         os.environ.setdefault("TORCH_DEVICE", "cpu")
