@@ -45,7 +45,7 @@ Expected versions after a healthy setup:
 1. `.venv_surya`: `torch==2.11.0+cu128`, `torchvision==0.26.0+cu128`, `torchaudio==2.11.0+cu128`, `pillow>=10.2,<11.0`.
 2. `.venv_chandra`: `torch==2.11.0+cu128`, `torchvision==0.26.0+cu128`, `torchaudio==2.11.0+cu128`.
 
-`pillow` is pinned below 11 only where Surya needs it. `surya-ocr==0.17.1` requires `pillow>=10.2,<11.0`, while Chandra can currently run with a newer Pillow version. This is one of the reasons the project does not use one shared venv for both engines.
+`pillow` is pinned below 11 only where Surya needs it. `surya-ocr==0.17.1` requires `pillow>=10.2,<11.0`, while Chandra can currently run with a newer Pillow version. This is one of the reasons the project does not use one shared venv for both engines. The base `uniscan` package allows newer Pillow builds; the Surya venv is pinned separately by `setup_dual_venv.cmd`.
 
 The setup script also downloads and verifies the model weights. Runtime is intentionally strict: the GUI and CLI require the local caches to exist and will fail instead of silently downloading weights or degrading output quality mid-run.
 
@@ -54,6 +54,51 @@ Model cache locations:
 1. Chandra weights: `.hf_cache_chandra`, model `datalab-to/chandra-ocr-2`.
 2. Surya weights: `.surya_cache`, components `text_detection` and `text_recognition`.
 3. Auxiliary HF/ModelScope caches: `.hf_cache_surya` and `.modelscope_cache`.
+
+## Project Status
+
+Repository hardening is complete as of 2026-04-21. The intended user path is now: clone the repository, run `setup_dual_venv.cmd`, then run `run_basic_gui.cmd` or the CLI. Future work should be treated as maintenance, dependency updates, or feature work rather than initial repository rescue.
+
+Completed baseline:
+
+1. Windows dual-venv setup for Surya and Chandra.
+2. CUDA PyTorch installation and verification in both venvs.
+3. Setup-time model weight downloads and cache verification.
+4. Strict runtime behavior when caches or geometry sidecars are missing.
+5. English README, menu labels, GUI copy, and web UI copy.
+6. Human-readable troubleshooting for expected setup warnings.
+
+## Last Verified Versions
+
+Last checked on 2026-04-21 with Python 3.11 on Windows and CUDA PyTorch `cu128`.
+
+Surya venv:
+
+1. `torch==2.11.0+cu128`
+2. `torchvision==0.26.0+cu128`
+3. `torchaudio==2.11.0+cu128`
+4. `surya-ocr==0.17.1`
+5. `pillow==10.4.0`
+6. `transformers==4.57.1`
+7. `huggingface-hub==0.36.2`
+8. `pypdfium2==4.30.0`
+9. `pypdf==6.10.2`
+10. `reportlab==4.4.10`
+11. `setuptools==70.2.0`
+
+Chandra venv:
+
+1. `torch==2.11.0+cu128`
+2. `torchvision==0.26.0+cu128`
+3. `torchaudio==2.11.0+cu128`
+4. `chandra-ocr==0.2.0`
+5. `pillow==12.1.1`
+6. `transformers==5.5.4`
+7. `huggingface-hub==1.11.0`
+8. `pypdfium2==4.30.0`
+9. `pypdf==6.10.2`
+10. `reportlab==4.4.10`
+11. `setuptools==70.2.0`
 
 ## Quick Start: Local GUI
 
@@ -240,6 +285,12 @@ Run `.\setup_dual_venv.cmd` again. The current setup script requires CUDA PyTorc
 
 `cuda_available: False`:
 Check `nvidia-smi` first. If the driver cannot see the GPU, PyTorch cannot use it either.
+
+`pip's dependency resolver does not currently take into account all the packages that are installed`:
+This can appear during the forced CUDA PyTorch reinstall. In the Surya venv, PyTorch may temporarily pull `pillow 12.x`, which conflicts with `surya-ocr==0.17.1`; the setup script immediately pins Surya back to `pillow>=10.2,<11.0` after the torch install. Treat the final verification as authoritative: Surya should end on `pillow 10.4.0` or another `<11.0` build, while Chandra can stay on `pillow 12.x`.
+
+`Warning: You are sending unauthenticated requests to the HF Hub`:
+This is a Hugging Face rate-limit warning, not a project failure. Chandra weights are large, about 10.6 GB for `datalab-to/chandra-ocr-2`, so unauthenticated downloads can be slow. If needed, set `HF_TOKEN` before running setup to use authenticated Hugging Face requests.
 
 `No module named uniscan`:
 Install the package into both venvs:

@@ -324,7 +324,9 @@ def _candidate_snapshot_dirs(candidate_root: Path) -> list[Path]:
 
 
 def _snapshot_has_chandra_weights(snapshot_dir: Path) -> bool:
-    if not (snapshot_dir / "model.safetensors.index.json").is_file():
+    has_single_file_weights = (snapshot_dir / "model.safetensors").is_file()
+    has_sharded_weights_index = (snapshot_dir / "model.safetensors.index.json").is_file()
+    if not has_single_file_weights and not has_sharded_weights_index:
         return False
     try:
         next(snapshot_dir.rglob("*.safetensors"))
