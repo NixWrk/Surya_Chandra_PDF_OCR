@@ -180,10 +180,10 @@ set "GPU_PY=%~1"
 set "GPU_NAME=%~2"
 call :verify_gpu_torch_stack "%GPU_PY%" "%GPU_NAME%" >nul 2>nul
 if not errorlevel 1 (
-  echo [dual-venv] %GPU_NAME% CUDA torch stack already OK (%TORCH_CUDA_FLAVOR%); skipping reinstall.
+  echo [dual-venv] %GPU_NAME% CUDA torch stack already OK - %TORCH_CUDA_FLAVOR% - skipping reinstall.
   exit /b 0
 )
-echo [dual-venv] Installing torch GPU stack into %GPU_NAME% venv (%TORCH_CUDA_FLAVOR%) ...
+echo [dual-venv] Installing torch GPU stack into %GPU_NAME% venv - %TORCH_CUDA_FLAVOR% ...
 where uv >nul 2>nul
 if not errorlevel 1 (
   uv pip install --python "%GPU_PY%" --index-url "%TORCH_INDEX_URL%" --upgrade --reinstall "torch==%TORCH_VERSION%" "torchvision==%TORCHVISION_VERSION%" "torchaudio==%TORCHAUDIO_VERSION%"
