@@ -812,9 +812,17 @@ def _collect_chandra_batch_outputs(
                                 continue
                         fallback_lines.append(text)
                     if line_rows:
+                        page_width = max(max(bbox[2] for bbox, _text in line_rows), 1.0)
+                        image_bbox = page.get("image_bbox")
+                        if (
+                            isinstance(image_bbox, (list, tuple))
+                            and len(image_bbox) == 4
+                            and all(isinstance(item, (int, float)) for item in image_bbox)
+                        ):
+                            page_width = max(page_width, float(image_bbox[2]))
                         order = _bbox_reading_order_indices(
                             [bbox for bbox, _text in line_rows],
-                            page_width=max(max(bbox[2] for bbox, _text in line_rows), 1.0),
+                            page_width=page_width,
                         )
                         text_lines.extend(line_rows[idx][1] for idx in order)
                     text_lines.extend(fallback_lines)
@@ -1097,6 +1105,14 @@ def _run_surya_module_cli(
                         elif text:
                             fallback_texts.append(text)
                 if line_payload:
+                    page_width = max(float(item["bbox"][2]) for item in line_payload)
+                    image_bbox = page_payload.get("image_bbox")
+                    if (
+                        isinstance(image_bbox, list)
+                        and len(image_bbox) == 4
+                        and all(isinstance(item, (int, float)) for item in image_bbox)
+                    ):
+                        page_width = max(page_width, float(image_bbox[2]))
                     order = _bbox_reading_order_indices(
                         [
                             (
@@ -1108,7 +1124,7 @@ def _run_surya_module_cli(
                             for item in line_payload
                             if isinstance(item.get("bbox"), list)
                         ],
-                        page_width=max(float(item["bbox"][2]) for item in line_payload),
+                        page_width=page_width,
                     )
                     line_payload = [line_payload[idx] for idx in order]
                     page_payload["text_lines"] = line_payload

@@ -625,9 +625,13 @@ def _bbox_reading_order_indices(
 
     content_x0 = min(item[1] for item in normalized)
     content_x1 = max(item[3] for item in normalized)
-    content_width = max(content_x1 - content_x0, float(page_width), 1.0)
+    content_width = max(content_x1 - content_x0, 1.0)
     narrow = [item for item in normalized if (item[3] - item[1]) <= content_width * 0.72]
-    candidates = narrow if len(narrow) >= 4 else normalized
+    widths = sorted(item[3] - item[1] for item in narrow)
+    median_w = widths[len(widths) // 2] if widths else 0.0
+    text_line_min_width = max(median_w * 0.60, content_width * 0.12)
+    text_like = [item for item in narrow if (item[3] - item[1]) >= text_line_min_width]
+    candidates = text_like if len(text_like) >= 4 else narrow if len(narrow) >= 4 else normalized
     by_center = sorted(candidates, key=lambda item: ((item[1] + item[3]) * 0.5, item[2]))
     min_side = max(2, int(len(by_center) * 0.15))
     if len(by_center) < min_side * 2:
@@ -635,7 +639,7 @@ def _bbox_reading_order_indices(
 
     heights = sorted(max(item[4] - item[2], 1.0) for item in by_center)
     median_h = heights[len(heights) // 2] if heights else 10.0
-    min_gutter = max(content_width * 0.045, median_h * 1.6, 8.0)
+    min_gutter = max(content_width * 0.022, median_h * 0.75, 8.0)
     best_split: float | None = None
     best_score = float("-inf")
 
@@ -666,13 +670,35 @@ def _bbox_reading_order_indices(
     if best_split is None:
         return default_order
 
+    prefix_cutoff: float | None = None
+    by_y = sorted(normalized, key=lambda item: (item[2], item[1]))
+    for idx in range(min(4, len(by_y) - 1)):
+        top_band = by_y[: idx + 1]
+        next_y = by_y[idx + 1][2]
+        gap = next_y - max(item[2] for item in top_band)
+        band_height = max(item[4] for item in top_band) - min(item[2] for item in top_band)
+        band_max_width = max(item[3] - item[1] for item in top_band)
+        looks_like_header = median_w > 0 and band_max_width <= median_w * 0.85
+        if gap > median_h * 1.1 and band_height <= median_h * 1.8 and looks_like_header:
+            prefix_cutoff = (max(item[4] for item in top_band) + next_y) * 0.5
+            break
+
+    prefix_indices: set[int] = set()
+    if prefix_cutoff is not None:
+        prefix_indices = {idx for idx, _x0, y0, _x1, _y1 in normalized if y0 < prefix_cutoff}
+
     def column_key(idx: int) -> tuple[int, float, float]:
         x0, y0, x1, _y1 = boxes[idx]
         center_x = (x0 + x1) * 0.5
         column = 0 if center_x < best_split else 1
         return (column, y0, x0)
 
-    return sorted(range(len(boxes)), key=column_key)
+    prefix_order = sorted(prefix_indices, key=lambda idx: (boxes[idx][1], boxes[idx][0]))
+    body_order = sorted(
+        (idx for idx in range(len(boxes)) if idx not in prefix_indices),
+        key=column_key,
+    )
+    return prefix_order + body_order
 
 
 def _split_line_to_word_fragments(

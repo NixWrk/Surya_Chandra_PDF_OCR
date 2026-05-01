@@ -14,6 +14,7 @@ from uniscan.ocr.artifact_searchable import (
     _PlacementCandidate,
     _align_token_indices,
     _assign_lines_to_boxes,
+    _bbox_reading_order_indices,
     _blend_placements_vertical,
     _build_searchable_pdf_from_text,
     _build_geometry_candidates,
@@ -439,6 +440,24 @@ def test_assign_lines_to_boxes_keeps_portrait_columns_in_reading_order() -> None
 
     assert [text for _bbox, text in placements] == lines
     assert [bbox[0] for bbox, _text in placements] == [20.0, 20.0, 20.0, 320.0, 320.0, 320.0]
+
+
+def test_bbox_reading_order_handles_tight_gutter_with_header() -> None:
+    labels = ["page", "header", "L1", "R1", "L2", "R2", "L3", "R3"]
+    boxes = [
+        (83.0, 74.0, 118.0, 90.0),
+        (891.0, 74.0, 1210.0, 91.0),
+        (85.0, 112.0, 629.0, 132.0),
+        (666.0, 115.0, 1209.0, 132.0),
+        (86.0, 136.0, 629.0, 153.0),
+        (666.0, 136.0, 1107.0, 153.0),
+        (85.0, 157.0, 629.0, 175.0),
+        (686.0, 159.0, 1209.0, 176.0),
+    ]
+
+    order = _bbox_reading_order_indices(boxes, page_width=1292.0)
+
+    assert [labels[idx] for idx in order] == ["page", "header", "L1", "L2", "L3", "R1", "R2", "R3"]
 
 
 def test_placements_from_surya_geometry_scales_and_cleans_text() -> None:
