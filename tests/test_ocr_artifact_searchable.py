@@ -18,6 +18,7 @@ from uniscan.ocr.artifact_searchable import (
     _build_searchable_pdf_from_text,
     _build_geometry_candidates,
     _choose_auto_candidate,
+    _clean_overlay_line,
     _estimate_page_split_weights,
     _expand_lines_to_target_count,
     _geometry_boxes_in_reading_order,
@@ -32,6 +33,7 @@ from uniscan.ocr.artifact_searchable import (
     _should_blend_primary_candidate,
     _split_line_to_token_boxes,
     _split_line_to_word_fragments,
+    _split_page_text_lines,
     _split_lines_to_pages_by_weights,
     _split_text_to_pages_by_token_weights,
     _split_text_to_pages,
@@ -134,6 +136,17 @@ def test_split_text_to_pages_by_token_weights_prefers_heavier_pages() -> None:
     assert token_counts[1] > token_counts[0]
     assert token_counts[1] > token_counts[2]
     assert sum(token_counts) == 24
+
+
+def test_clean_overlay_line_removes_ocr_hyphen_artifacts_without_breaking_compounds() -> None:
+    assert _clean_overlay_line("spatial descripti\u2014on") == "spatial description"
+    assert _clean_overlay_line("the environm-ent") == "the environment"
+    assert _clean_overlay_line("late-blind room-size") == "late-blind room-size"
+
+
+def test_split_page_text_lines_dehyphenates_line_breaks() -> None:
+    lines = _split_page_text_lines("physical move-\nment and spatial descripti\u2014on")
+    assert lines == ["physical movement and spatial description"]
 
 
 def test_estimate_page_split_weights_clips_outliers() -> None:
@@ -411,6 +424,23 @@ def test_assign_lines_to_boxes_spreads_assignments_when_many_boxes() -> None:
     assert y_positions[-1] >= 70.0
 
 
+def test_assign_lines_to_boxes_keeps_portrait_columns_in_reading_order() -> None:
+    lines = ["L1", "L2", "L3", "R1", "R2", "R3"]
+    boxes = [
+        (20.0, 10.0, 180.0, 24.0),
+        (320.0, 10.0, 480.0, 24.0),
+        (20.0, 32.0, 180.0, 46.0),
+        (320.0, 32.0, 480.0, 46.0),
+        (20.0, 54.0, 180.0, 68.0),
+        (320.0, 54.0, 480.0, 68.0),
+    ]
+
+    placements = _assign_lines_to_boxes(lines, boxes)
+
+    assert [text for _bbox, text in placements] == lines
+    assert [bbox[0] for bbox, _text in placements] == [20.0, 20.0, 20.0, 320.0, 320.0, 320.0]
+
+
 def test_placements_from_surya_geometry_scales_and_cleans_text() -> None:
     payload = {
         "image_width": 1000.0,
@@ -453,6 +483,29 @@ def test_placements_from_surya_geometry_auto_spread_orders_left_then_right() -> 
     )
     ordered_texts = [text for _, text in placements]
     assert ordered_texts == ["L-top", "L-mid", "L-bottom", "R-top", "R-mid", "R-bottom"]
+
+
+def test_placements_from_surya_geometry_orders_portrait_columns_left_then_right() -> None:
+    payload = {
+        "image_width": 1000.0,
+        "image_height": 1600.0,
+        "lines": [
+            {"text": "L1", "bbox": [80.0, 100.0, 420.0, 140.0]},
+            {"text": "R1", "bbox": [580.0, 100.0, 920.0, 140.0]},
+            {"text": "L2", "bbox": [80.0, 240.0, 420.0, 280.0]},
+            {"text": "R2", "bbox": [580.0, 240.0, 920.0, 280.0]},
+            {"text": "L3", "bbox": [80.0, 380.0, 420.0, 420.0]},
+            {"text": "R3", "bbox": [580.0, 380.0, 920.0, 420.0]},
+        ],
+    }
+
+    placements = _placements_from_surya_geometry(
+        page_data=payload,
+        page_width=500.0,
+        page_height=800.0,
+    )
+
+    assert [text for _bbox, text in placements] == ["L1", "L2", "L3", "R1", "R2", "R3"]
 
 
 def test_geometry_lines_in_reading_order_auto_spread() -> None:

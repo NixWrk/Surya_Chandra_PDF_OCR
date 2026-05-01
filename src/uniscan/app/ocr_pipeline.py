@@ -1,4 +1,4 @@
-﻿"""Reusable OCR workflow orchestration for desktop/web frontends."""
+"""Reusable OCR workflow orchestration for desktop/web frontends."""
 
 from __future__ import annotations
 
@@ -106,7 +106,9 @@ def _resolve_engine_python(engine: str) -> Path | None:
     raw = (os.environ.get(env_name) or "").strip()
     if not raw:
         return None
-    path = Path(raw).expanduser().resolve()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
     if not path.exists() or not path.is_file():
         raise RuntimeError(f"{env_name} points to missing python executable: {path}")
     return path

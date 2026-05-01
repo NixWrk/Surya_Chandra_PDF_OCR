@@ -272,3 +272,15 @@ def test_run_basic_ocr_benchmark_supports_engine_python_override(monkeypatch) ->
     assert summary.results[0].engine == "surya"
     assert summary.results[0].status == "ok"
     assert summary.failed_engines == tuple()
+
+
+def test_engine_python_override_accepts_relative_path(monkeypatch) -> None:
+    tmp_path = _new_test_dir()
+    fake_surya_python = tmp_path / "runtime" / "python.exe"
+    fake_surya_python.parent.mkdir(parents=True, exist_ok=True)
+    fake_surya_python.write_text("python", encoding="utf-8")
+
+    relative_python = fake_surya_python.relative_to(Path.cwd())
+    monkeypatch.setenv("UNISCAN_SURYA_PYTHON", str(relative_python))
+
+    assert ocr_pipeline._resolve_engine_python("surya") == fake_surya_python.resolve()

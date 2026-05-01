@@ -30,6 +30,11 @@ from .engine import (
     detect_ocr_engine_status,
     image_paths_to_searchable_pdf,
 )
+from .artifact_searchable import (
+    _bbox_reading_order_indices,
+    _clean_overlay_line,
+    _dehyphenate_line_breaks,
+)
 from .preprocessing import _strip_markdown
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -784,12 +789,35 @@ def _collect_chandra_batch_outputs(
                     lines = page.get("text_lines")
                     if not isinstance(lines, list):
                         continue
+                    line_rows: list[tuple[tuple[float, float, float, float], str]] = []
+                    fallback_lines: list[str] = []
                     for line in lines:
                         if not isinstance(line, dict):
                             continue
-                        text = str(line.get("text") or "").strip()
-                        if text:
-                            text_lines.append(text)
+                        text = _clean_overlay_line(str(line.get("text") or ""))
+                        if not text:
+                            continue
+                        bbox = line.get("bbox")
+                        if (
+                            isinstance(bbox, list)
+                            and len(bbox) == 4
+                            and all(isinstance(item, (int, float)) for item in bbox)
+                        ):
+                            x0 = min(float(bbox[0]), float(bbox[2]))
+                            y0 = min(float(bbox[1]), float(bbox[3]))
+                            x1 = max(float(bbox[0]), float(bbox[2]))
+                            y1 = max(float(bbox[1]), float(bbox[3]))
+                            if x1 > x0 and y1 > y0:
+                                line_rows.append(((x0, y0, x1, y1), text))
+                                continue
+                        fallback_lines.append(text)
+                    if line_rows:
+                        order = _bbox_reading_order_indices(
+                            [bbox for bbox, _text in line_rows],
+                            page_width=max(max(bbox[2] for bbox, _text in line_rows), 1.0),
+                        )
+                        text_lines.extend(line_rows[idx][1] for idx in order)
+                    text_lines.extend(fallback_lines)
 
             page_dir = work_dir / f"page_{source_page:04d}"
             page_dir.mkdir(parents=True, exist_ok=True)
@@ -805,7 +833,7 @@ def _collect_chandra_batch_outputs(
                 }
             )
 
-        page_text = "\n".join(text_lines)
+        page_text = "\n".join(_dehyphenate_line_breaks(text_lines))
         page_texts.append(page_text)
         total_chars += len(page_text)
 
@@ -981,7 +1009,7 @@ def _run_surya_module_cli(
     *,
     lang: str,
     work_dir: Path,
-    which_fn,
+    which_fn=shutil.which,
     run_cmd,
 ) -> tuple[str, int]:
     if len(image_paths) == 0:
@@ -1049,9 +1077,10 @@ def _run_surya_module_cli(
                     page_payload["image_bbox"] = [float(item) for item in image_bbox]
 
                 line_payload: list[dict[str, Any]] = []
+                fallback_texts: list[str] = []
                 for line in page.get("text_lines", []):
                     if isinstance(line, dict):
-                        text = (line.get("text") or "").strip()
+                        text = _clean_overlay_line(str(line.get("text") or ""))
                         bbox = line.get("bbox")
                         if (
                             text
@@ -1065,10 +1094,26 @@ def _run_surya_module_cli(
                                     "bbox": [float(item) for item in bbox],
                                 }
                             )
-                        if text:
-                            collected.append(text)
+                        elif text:
+                            fallback_texts.append(text)
                 if line_payload:
+                    order = _bbox_reading_order_indices(
+                        [
+                            (
+                                float(item["bbox"][0]),
+                                float(item["bbox"][1]),
+                                float(item["bbox"][2]),
+                                float(item["bbox"][3]),
+                            )
+                            for item in line_payload
+                            if isinstance(item.get("bbox"), list)
+                        ],
+                        page_width=max(float(item["bbox"][2]) for item in line_payload),
+                    )
+                    line_payload = [line_payload[idx] for idx in order]
                     page_payload["text_lines"] = line_payload
+                    collected.extend(str(item["text"]) for item in line_payload)
+                collected.extend(fallback_texts)
                 if page_payload:
                     image_payload["pages"].append(page_payload)
             if image_payload["pages"]:
@@ -1084,7 +1129,7 @@ def _run_surya_module_cli(
                         continue
                     for line in page.get("text_lines", []):
                         if isinstance(line, dict):
-                            text = (line.get("text") or "").strip()
+                            text = _clean_overlay_line(str(line.get("text") or ""))
                             if text:
                                 collected.append(text)
         if sidecar_images:
@@ -1094,7 +1139,7 @@ def _run_surya_module_cli(
                 encoding="utf-8",
             )
 
-        text = "\n".join(collected)
+        text = "\n".join(_dehyphenate_line_breaks(collected))
         return text, len(text)
 
     def _run_cli_with_geometry(
@@ -2021,14 +2066,14 @@ def _run_olmocr_direct(
     raise RuntimeError("olmOCR failed: " + " | ".join(errors))
 
 
-# Registry mapping engine names to their extraction functions
-_ENGINE_EXTRACTION_FUNCTIONS = {
-    OCR_ENGINE_PADDLEOCR: _run_paddleocr_direct,
-    OCR_ENGINE_SURYA: _run_surya_direct,
-    OCR_ENGINE_MINERU: _run_mineru_direct,
-    OCR_ENGINE_CHANDRA: _run_chandra_direct,
-    OCR_ENGINE_OLMOCR: _run_olmocr_direct,
-}
+def _engine_extraction_functions():
+    return {
+        OCR_ENGINE_PADDLEOCR: _run_paddleocr_direct,
+        OCR_ENGINE_SURYA: _run_surya_direct,
+        OCR_ENGINE_MINERU: _run_mineru_direct,
+        OCR_ENGINE_CHANDRA: _run_chandra_direct,
+        OCR_ENGINE_OLMOCR: _run_olmocr_direct,
+    }
 
 
 def _run_extraction_engine(
@@ -2041,7 +2086,7 @@ def _run_extraction_engine(
     run_cmd,
 ) -> tuple[str, int]:
     # Use registry pattern to avoid repetitive if/elif chains
-    extraction_func = _ENGINE_EXTRACTION_FUNCTIONS.get(engine)
+    extraction_func = _engine_extraction_functions().get(engine)
     if extraction_func is None:
         raise ValueError(f"Unsupported extraction engine: {engine}")
 

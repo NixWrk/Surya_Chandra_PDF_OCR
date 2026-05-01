@@ -63,6 +63,14 @@ _HYBRID_BLEND_SECONDARY_ADVANTAGE_MIN = 0.08
 _HYBRID_POLICY_AUTO = "auto"
 _HYBRID_POLICY_SURYA_ONLY = "surya_only"
 _HYBRID_POLICY_SOFTLINE = "softline"
+_LETTER_CLASS = r"A-Za-z\u0400-\u04ff"
+_INTRA_WORD_DASH_RE = re.compile(rf"(?<=[{_LETTER_CLASS}])[\u2010-\u2015\u2212](?=[{_LETTER_CLASS}])")
+_OCR_SUFFIX_HYPHEN_RE = re.compile(
+    rf"([{_LETTER_CLASS}]{{5,}})-"
+    r"(on|ent|ing|ed|ly|tion|sion|ment|able|ible|al|ic|ive|ous|ate|ity|ies)\b",
+    re.IGNORECASE,
+)
+_LINE_END_HYPHEN_RE = re.compile(rf"([{_LETTER_CLASS}]{{3,}})-$")
 
 _ALIGN_CHAR_FOLD = {
     # Cyrillic -> ASCII-like fold
@@ -110,8 +118,11 @@ def _normalize_key(value: str) -> str:
 def _clean_overlay_line(raw_line: str) -> str:
     # Strip lightweight markdown/html markers so they do not leak into the
     # selectable text layer (<b>, <math>, etc.).
-    line = re.sub(r"</?[^>\n]+>", "", raw_line)
+    line = raw_line.replace("\u00ad", "")
+    line = re.sub(r"</?[^>\n]+>", "", line)
     line = line.replace("\u00a0", " ")
+    line = _INTRA_WORD_DASH_RE.sub("", line)
+    line = _OCR_SUFFIX_HYPHEN_RE.sub(r"\1\2", line)
     line = re.sub(r"\s+", " ", line)
     return line.strip()
 
@@ -568,6 +579,18 @@ def _estimate_page_line_bboxes(
     return result
 
 
+def _dehyphenate_line_breaks(lines: Sequence[str]) -> list[str]:
+    merged: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        if merged and _LINE_END_HYPHEN_RE.search(merged[-1]) and re.match(rf"^[{_LETTER_CLASS}]", line):
+            merged[-1] = _LINE_END_HYPHEN_RE.sub(r"\1", merged[-1]) + line
+            continue
+        merged.append(line)
+    return merged
+
+
 def _split_page_text_lines(text: str) -> list[str]:
     lines: list[str] = []
     for raw in text.splitlines():
@@ -577,7 +600,79 @@ def _split_page_text_lines(text: str) -> list[str]:
         if line.startswith("[SOURCE PAGE"):
             continue
         lines.append(line)
-    return lines
+    return _dehyphenate_line_breaks(lines)
+
+
+def _bbox_reading_order_indices(
+    boxes: Sequence[tuple[float, float, float, float]],
+    *,
+    page_width: float,
+) -> list[int]:
+    if not boxes:
+        return []
+    default_order = sorted(range(len(boxes)), key=lambda idx: (boxes[idx][1], boxes[idx][0]))
+    if len(boxes) < 4:
+        return default_order
+
+    normalized: list[tuple[int, float, float, float, float]] = []
+    for idx, box in enumerate(boxes):
+        x0, y0, x1, y1 = box
+        if x1 <= x0 or y1 <= y0:
+            continue
+        normalized.append((idx, float(x0), float(y0), float(x1), float(y1)))
+    if len(normalized) < 4:
+        return default_order
+
+    content_x0 = min(item[1] for item in normalized)
+    content_x1 = max(item[3] for item in normalized)
+    content_width = max(content_x1 - content_x0, float(page_width), 1.0)
+    narrow = [item for item in normalized if (item[3] - item[1]) <= content_width * 0.72]
+    candidates = narrow if len(narrow) >= 4 else normalized
+    by_center = sorted(candidates, key=lambda item: ((item[1] + item[3]) * 0.5, item[2]))
+    min_side = max(2, int(len(by_center) * 0.15))
+    if len(by_center) < min_side * 2:
+        return default_order
+
+    heights = sorted(max(item[4] - item[2], 1.0) for item in by_center)
+    median_h = heights[len(heights) // 2] if heights else 10.0
+    min_gutter = max(content_width * 0.045, median_h * 1.6, 8.0)
+    best_split: float | None = None
+    best_score = float("-inf")
+
+    for split_idx in range(min_side, len(by_center) - min_side + 1):
+        left = by_center[:split_idx]
+        right = by_center[split_idx:]
+        left_x1 = max(item[3] for item in left)
+        right_x0 = min(item[1] for item in right)
+        gutter = right_x0 - left_x1
+        if gutter < min_gutter:
+            continue
+
+        left_y0 = min(item[2] for item in left)
+        left_y1 = max(item[4] for item in left)
+        right_y0 = min(item[2] for item in right)
+        right_y1 = max(item[4] for item in right)
+        overlap = min(left_y1, right_y1) - max(left_y0, right_y0)
+        min_span = max(min(left_y1 - left_y0, right_y1 - right_y0), 1.0)
+        if overlap < max(median_h * 2.0, min_span * 0.30):
+            continue
+
+        balance = min(len(left), len(right)) / max(len(left), len(right))
+        score = gutter + (balance * min_gutter)
+        if score > best_score:
+            best_score = score
+            best_split = (left_x1 + right_x0) * 0.5
+
+    if best_split is None:
+        return default_order
+
+    def column_key(idx: int) -> tuple[int, float, float]:
+        x0, y0, x1, _y1 = boxes[idx]
+        center_x = (x0 + x1) * 0.5
+        column = 0 if center_x < best_split else 1
+        return (column, y0, x0)
+
+    return sorted(range(len(boxes)), key=column_key)
 
 
 def _split_line_to_word_fragments(
@@ -1230,41 +1325,48 @@ def _assign_lines_to_boxes(
 
     normalized_boxes = list(boxes)
     if len(normalized_boxes) > 1:
-        heights = sorted(max(item[3] - item[1], 1.0) for item in normalized_boxes)
-        median_h = float(heights[len(heights) // 2]) if heights else 10.0
-        y_threshold = max(2.0, median_h * 0.7)
-        rows: list[dict[str, float]] = []
-        for x0, y0, x1, y1 in sorted(normalized_boxes, key=lambda item: (item[1], item[0])):
-            cy = (y0 + y1) / 2.0
-            target: dict[str, float] | None = None
-            for row in reversed(rows[-6:]):
-                if abs(cy - row["cy"]) <= y_threshold:
-                    target = row
-                    break
-            if target is None:
-                rows.append(
-                    {
-                        "x0": x0,
-                        "y0": y0,
-                        "x1": x1,
-                        "y1": y1,
-                        "cy": cy,
-                        "count": 1.0,
-                    }
-                )
-            else:
-                count = target["count"]
-                target["x0"] = min(target["x0"], x0)
-                target["y0"] = min(target["y0"], y0)
-                target["x1"] = max(target["x1"], x1)
-                target["y1"] = max(target["y1"], y1)
-                target["cy"] = (target["cy"] * count + cy) / (count + 1.0)
-                target["count"] = count + 1.0
+        default_order = sorted(range(len(normalized_boxes)), key=lambda idx: (normalized_boxes[idx][1], normalized_boxes[idx][0]))
+        page_width = max(max(item[2] for item in normalized_boxes), 1.0)
+        reading_order = _bbox_reading_order_indices(normalized_boxes, page_width=page_width)
+        has_column_order = reading_order != default_order
+        if has_column_order:
+            normalized_boxes = [normalized_boxes[idx] for idx in reading_order]
+        else:
+            heights = sorted(max(item[3] - item[1], 1.0) for item in normalized_boxes)
+            median_h = float(heights[len(heights) // 2]) if heights else 10.0
+            y_threshold = max(2.0, median_h * 0.7)
+            rows: list[dict[str, float]] = []
+            for x0, y0, x1, y1 in sorted(normalized_boxes, key=lambda item: (item[1], item[0])):
+                cy = (y0 + y1) / 2.0
+                target: dict[str, float] | None = None
+                for row in reversed(rows[-6:]):
+                    if abs(cy - row["cy"]) <= y_threshold:
+                        target = row
+                        break
+                if target is None:
+                    rows.append(
+                        {
+                            "x0": x0,
+                            "y0": y0,
+                            "x1": x1,
+                            "y1": y1,
+                            "cy": cy,
+                            "count": 1.0,
+                        }
+                    )
+                else:
+                    count = target["count"]
+                    target["x0"] = min(target["x0"], x0)
+                    target["y0"] = min(target["y0"], y0)
+                    target["x1"] = max(target["x1"], x1)
+                    target["y1"] = max(target["y1"], y1)
+                    target["cy"] = (target["cy"] * count + cy) / (count + 1.0)
+                    target["count"] = count + 1.0
 
-        normalized_boxes = [
-            (row["x0"], row["y0"], row["x1"], row["y1"])
-            for row in sorted(rows, key=lambda row: (row["y0"], row["x0"]))
-        ]
+            normalized_boxes = [
+                (row["x0"], row["y0"], row["x1"], row["y1"])
+                for row in sorted(rows, key=lambda row: (row["y0"], row["x0"]))
+            ]
 
     if len(lines) <= len(normalized_boxes):
         if len(lines) == 1:
@@ -1502,31 +1604,11 @@ def _placements_from_surya_geometry(
     if not placement_rows:
         return []
 
-    # Automatic spread ordering:
-    # for wide pages with content on both halves, keep reading order as
-    # left page top->bottom, then right page top->bottom.
-    page_aspect = (page_width / page_height) if page_height > 0 else 0.0
-    spread_split_x = image_width * 0.5
-    if page_aspect >= 1.15:
-        left_count = sum(1 for _, _, cx in placement_rows if cx < image_width * 0.47)
-        right_count = sum(1 for _, _, cx in placement_rows if cx > image_width * 0.53)
-        min_side = max(3, int(len(placement_rows) * 0.12))
-        is_spread = left_count >= min_side and right_count >= min_side
-    else:
-        is_spread = False
-
-    if is_spread:
-        placement_rows.sort(
-            key=lambda row: (
-                1 if row[2] >= spread_split_x else 0,
-                row[0][1],
-                row[0][0],
-            )
-        )
-    else:
-        placement_rows.sort(key=lambda row: (row[0][1], row[0][0]))
-
-    return [(bbox, text) for bbox, text, _ in placement_rows]
+    order = _bbox_reading_order_indices(
+        [bbox for bbox, _text, _center_x in placement_rows],
+        page_width=page_width,
+    )
+    return [(placement_rows[idx][0], placement_rows[idx][1]) for idx in order]
 
 
 def _placements_from_surya_geometry_yx(
@@ -1622,28 +1704,11 @@ def _geometry_boxes_in_reading_order(
     if not rows:
         return []
 
-    page_aspect = (page_width / page_height) if page_height > 0 else 0.0
-    spread_split_x = image_width * 0.5
-    if page_aspect >= 1.15:
-        left_count = sum(1 for _, cx in rows if cx < image_width * 0.47)
-        right_count = sum(1 for _, cx in rows if cx > image_width * 0.53)
-        min_side = max(3, int(len(rows) * 0.12))
-        is_spread = left_count >= min_side and right_count >= min_side
-    else:
-        is_spread = False
-
-    if is_spread:
-        rows.sort(
-            key=lambda row: (
-                1 if row[1] >= spread_split_x else 0,
-                row[0][1],
-                row[0][0],
-            )
-        )
-    else:
-        rows.sort(key=lambda row: (row[0][1], row[0][0]))
-
-    return [bbox for bbox, _ in rows]
+    order = _bbox_reading_order_indices(
+        [bbox for bbox, _center_x in rows],
+        page_width=page_width,
+    )
+    return [rows[idx][0] for idx in order]
 
 
 def _geometry_lines_in_reading_order(
@@ -1694,28 +1759,11 @@ def _geometry_lines_in_reading_order(
     if not placement_rows:
         return []
 
-    page_aspect = (page_width / page_height) if page_height > 0 else 0.0
-    spread_split_x = image_width * 0.5
-    if page_aspect >= 1.15:
-        left_count = sum(1 for _, _, _, _, _, cx in placement_rows if cx < image_width * 0.47)
-        right_count = sum(1 for _, _, _, _, _, cx in placement_rows if cx > image_width * 0.53)
-        min_side = max(3, int(len(placement_rows) * 0.12))
-        is_spread = left_count >= min_side and right_count >= min_side
-    else:
-        is_spread = False
-
-    if is_spread:
-        placement_rows.sort(
-            key=lambda row: (
-                1 if row[5] >= spread_split_x else 0,
-                row[2],
-                row[1],
-            )
-        )
-    else:
-        placement_rows.sort(key=lambda row: (row[2], row[1]))
-
-    return [text for text, *_ in placement_rows]
+    order = _bbox_reading_order_indices(
+        [(x0, y0, x1, y1) for _text, x0, y0, x1, y1, _center_x in placement_rows],
+        page_width=page_width,
+    )
+    return [placement_rows[idx][0] for idx in order]
 
 
 def _placements_from_geometry_text_with_linefit(
@@ -1762,6 +1810,61 @@ def _normalize_source_page_rotation(source_page) -> None:
         return
 
 
+def _coalesce_text_layer_placements(
+    placements: Sequence[tuple[tuple[float, float, float, float], str]],
+) -> list[tuple[tuple[float, float, float, float], str]]:
+    groups: list[tuple[list[tuple[float, float, float, float]], list[str]]] = []
+
+    def can_join(
+        prev_box: tuple[float, float, float, float],
+        next_box: tuple[float, float, float, float],
+    ) -> bool:
+        px0, py0, px1, py1 = prev_box
+        nx0, ny0, nx1, ny1 = next_box
+        overlap = min(py1, ny1) - max(py0, ny0)
+        min_h = max(min(py1 - py0, ny1 - ny0), 0.5)
+        if overlap < min_h * 0.45:
+            return False
+        gap = nx0 - px1
+        max_gap = max(min_h * 3.5, (px1 - px0) * 0.25, 3.0)
+        return -min_h <= gap <= max_gap
+
+    for bbox, text in placements:
+        if not text.strip() or "\n" in text:
+            groups.append(([bbox], [text]))
+            continue
+        if groups:
+            last_boxes, last_texts = groups[-1]
+            if last_texts and "\n" not in last_texts[-1] and can_join(last_boxes[-1], bbox):
+                last_boxes.append(bbox)
+                last_texts.append(text)
+                continue
+        groups.append(([bbox], [text]))
+
+    coalesced: list[tuple[tuple[float, float, float, float], str]] = []
+    for boxes, texts in groups:
+        x0 = min(item[0] for item in boxes)
+        y0 = min(item[1] for item in boxes)
+        x1 = max(item[2] for item in boxes)
+        y1 = max(item[3] for item in boxes)
+        if any("\n" in item for item in texts):
+            lines = []
+            for item in texts:
+                lines.extend(_clean_overlay_line(line) for line in item.splitlines() if line.strip())
+            text = "\n".join(line for line in lines if line)
+        else:
+            text = " ".join(item.strip() for item in texts if item.strip())
+        if text:
+            clean_text = (
+                "\n".join(_clean_overlay_line(line) for line in text.splitlines())
+                if "\n" in text
+                else _clean_overlay_line(text)
+            )
+            if clean_text.strip():
+                coalesced.append(((x0, y0, x1, y1), clean_text))
+    return coalesced
+
+
 def _build_overlay_page(
     *,
     page_width: float,
@@ -1776,7 +1879,25 @@ def _build_overlay_page(
     packet = BytesIO()
     pdf_canvas = canvas.Canvas(packet, pagesize=(page_width, page_height), pageCompression=1)
 
-    for bbox, text in placements:
+    def draw_invisible_text(*, line: str, bbox: tuple[float, float, float, float]) -> None:
+        x0, y0, x1, y1 = bbox
+        width = max(x1 - x0 - 0.6, 0.5)
+        height = max(y1 - y0 - 0.4, 0.4)
+        font_size = max(min(height * 0.80, 32.0), 0.12)
+        natural_width = max(pdfmetrics.stringWidth(line, font_name, font_size), 0.01)
+        # Keep the OCR line as one text object so extractors/search preserve spaces.
+        horiz_scale = max(min((width / natural_width) * 100.0, 140.0), 10.0)
+        baseline_y = max(page_height - y1 + (height - font_size) * 0.55, 0.2)
+
+        text_obj = pdf_canvas.beginText(max(x0 + 0.2, 0.2), baseline_y)
+        text_obj.setFont(font_name, font_size)
+        text_obj.setTextRenderMode(3)  # invisible selectable text
+        if abs(horiz_scale - 100.0) > 0.5:
+            text_obj.setHorizScale(horiz_scale)
+        text_obj.textLine(line)
+        pdf_canvas.drawText(text_obj)
+
+    for bbox, text in _coalesce_text_layer_placements(placements):
         if not text.strip():
             continue
         x0, y0, x1, y1 = bbox
@@ -1789,24 +1910,7 @@ def _build_overlay_page(
             sub_y0 = y0 + (line_height * line_idx)
             sub_y1 = y0 + (line_height * (line_idx + 1))
             sub_bbox = (x0, sub_y0, x1, sub_y1)
-            fragments = _split_line_to_word_fragments(line, bbox=sub_bbox)
-            for frag_bbox, frag_text in fragments:
-                fx0, fy0, fx1, fy1 = frag_bbox
-                width = max(fx1 - fx0 - 0.6, 0.5)
-                height = max(fy1 - fy0 - 0.4, 0.4)
-                font_size = max(min(height * 0.80, 32.0), 0.12)
-                natural_width = max(pdfmetrics.stringWidth(frag_text, font_name, font_size), 0.01)
-                # Keep scaling narrow to preserve selection fidelity.
-                horiz_scale = max(min((width / natural_width) * 100.0, 140.0), 70.0)
-                baseline_y = max(page_height - fy1 + (height - font_size) * 0.55, 0.2)
-
-                text_obj = pdf_canvas.beginText(max(fx0 + 0.2, 0.2), baseline_y)
-                text_obj.setFont(font_name, font_size)
-                text_obj.setTextRenderMode(3)  # invisible selectable text
-                if abs(horiz_scale - 100.0) > 0.5:
-                    text_obj.setHorizScale(horiz_scale)
-                text_obj.textLine(frag_text)
-                pdf_canvas.drawText(text_obj)
+            draw_invisible_text(line=line, bbox=sub_bbox)
 
     pdf_canvas.save()
     packet.seek(0)

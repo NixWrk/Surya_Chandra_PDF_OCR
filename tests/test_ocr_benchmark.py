@@ -110,6 +110,29 @@ def test_run_ocr_benchmark_writes_report_and_artifacts(tmp_path, monkeypatch) ->
     def fake_surya(image_paths, *, lang, work_dir, which_fn, run_cmd):
         assert "surya_work" in str(work_dir)
         assert len(image_paths) == 1
+        sidecar = work_dir / "surya_page_lines.json"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "images": [
+                        {
+                            "image_name": image_paths[0].name,
+                            "pages": [
+                                {
+                                    "image_bbox": [0, 0, 1, 1],
+                                    "text_lines": [
+                                        {"text": "x" * 13, "bbox": [0, 0, 1, 1]}
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         return f"surya:{lang}:{len(image_paths)}", 13
 
     def fake_mineru(image_paths, *, lang, work_dir, which_fn, run_cmd):
@@ -544,6 +567,66 @@ def test_run_extraction_engine_pagewise_collects_chandra_sidecar(tmp_path, monke
     assert progress_steps == [(1, 2, 1), (2, 2, 2)]
 
 
+def test_run_extraction_engine_pagewise_orders_chandra_columns(tmp_path, monkeypatch) -> None:
+    image_path = tmp_path / "p1.png"
+    image_path.write_bytes(b"img")
+
+    def fake_chandra_direct(
+        _image_paths,
+        *,
+        lang,
+        work_dir,
+        which_fn,
+        run_cmd,
+        page_progress_cb=None,
+    ):
+        sidecar = work_dir / "chandra_page_lines.json"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "images": [
+                        {
+                            "image_name": _image_paths[0].name,
+                            "pages": [
+                                {
+                                    "text_lines": [
+                                        {"text": "L1", "bbox": [20, 10, 180, 24]},
+                                        {"text": "R1", "bbox": [320, 10, 480, 24]},
+                                        {"text": "L2", "bbox": [20, 32, 180, 46]},
+                                        {"text": "R2", "bbox": [320, 32, 480, 46]},
+                                        {"text": "L3", "bbox": [20, 54, 180, 68]},
+                                        {"text": "R3", "bbox": [320, 54, 480, 68]},
+                                    ]
+                                }
+                            ],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return "ignored aggregate", 16
+
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_chandra_direct", fake_chandra_direct)
+
+    page_texts, chars, page_errors, page_metadata = ocr_benchmark_mod._run_extraction_engine_pagewise(
+        OCR_ENGINE_CHANDRA,
+        [image_path],
+        source_pages_1based=[1],
+        lang="rus",
+        work_dir=tmp_path / "work",
+        which_fn=lambda _name: None,
+        run_cmd=lambda *_args, **_kwargs: None,
+    )
+
+    assert page_texts == ["L1\nL2\nL3\nR1\nR2\nR3"]
+    assert chars == len(page_texts[0])
+    assert page_errors == []
+    assert len(page_metadata) == 1
+
+
 def test_write_pagewise_text_artifacts_copies_chandra_geometry(tmp_path: Path) -> None:
     output_dir = tmp_path / "out"
     aggregate_path = tmp_path / "doc_chandra.txt"
@@ -580,6 +663,7 @@ def test_configure_chandra_runtime_device_prefers_cuda(monkeypatch) -> None:
     fake_torch = SimpleNamespace(__version__="9.9.9", cuda=_Cuda())
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.delenv("TORCH_DEVICE", raising=False)
+    monkeypatch.setenv("UNISCAN_CHANDRA_DEVICE_POLICY", "legacy")
     monkeypatch.setenv("UNISCAN_CHANDRA_PREFER_GPU", "1")
     monkeypatch.delenv("UNISCAN_CHANDRA_REQUIRE_GPU", raising=False)
 

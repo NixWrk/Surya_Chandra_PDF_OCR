@@ -8,6 +8,8 @@ __pycache__
 *.log
 *.tmp
 *.cache
+*.pdf
+*.PDF
 outputs
 .hf_cache
 .hf_cache*
@@ -15,5 +17,13 @@ outputs
 .modelscope_cache
 .tmp*
 .uv_cache
+.pytest_cache
+.ruff_cache
+.venv_latest_*
+build
+dist
+*.egg-info
+artifacts
+_run_exec
 OCRmypdf_plugins
 PDFs

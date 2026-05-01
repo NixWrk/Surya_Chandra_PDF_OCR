@@ -64,7 +64,8 @@ RUN python -m venv /opt/venvs/chandra && \
       "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA_FLAVOR}" \
       "torchaudio==${TORCHAUDIO_VERSION}+${TORCH_CUDA_FLAVOR}"
 
-RUN chmod +x /app/scripts/docker-entrypoint.sh && \
+RUN sed -i 's/\r$//' /app/scripts/docker-entrypoint.sh && \
+    chmod +x /app/scripts/docker-entrypoint.sh && \
     mkdir -p /cache/hf_chandra /cache/hf_surya /cache/surya_models /cache/modelscope /data/work /data/in /data/out
 
 ENV PATH="/opt/venvs/chandra/bin:/opt/venvs/surya/bin:${PATH}" \
@@ -91,6 +92,9 @@ ENV PATH="/opt/venvs/chandra/bin:/opt/venvs/surya/bin:${PATH}" \
 VOLUME ["/cache", "/data/work", "/data/in", "/data/out"]
 
 EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${UNISCAN_HTTP_PORT:-8000}/health" || exit 1
 
 ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
 CMD []
