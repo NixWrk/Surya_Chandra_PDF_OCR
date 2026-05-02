@@ -23,7 +23,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md /app/
-COPY src /app/src
 COPY scripts/docker-entrypoint.sh /app/scripts/docker-entrypoint.sh
 
 RUN python -m pip install --upgrade pip "setuptools<82" wheel
@@ -31,8 +30,18 @@ RUN python -m pip install --upgrade pip "setuptools<82" wheel
 # Surya runtime venv
 RUN python -m venv /opt/venvs/surya && \
     /opt/venvs/surya/bin/python -m pip install --upgrade pip "setuptools<82" wheel && \
-    /opt/venvs/surya/bin/python -m pip install /app && \
     /opt/venvs/surya/bin/python -m pip install \
+      --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_FLAVOR}" \
+      --upgrade --force-reinstall \
+      "torch==${TORCH_VERSION}+${TORCH_CUDA_FLAVOR}" \
+      "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA_FLAVOR}" \
+      "torchaudio==${TORCHAUDIO_VERSION}+${TORCH_CUDA_FLAVOR}" && \
+    /opt/venvs/surya/bin/python -m pip install \
+      "opencv-python>=4.8" \
+      "numpy>=1.26" \
+      "pillow>=10.2" \
+      "img2pdf>=0.5" \
+      "pymupdf>=1.24" \
       "pypdf>=4.0" \
       "reportlab>=4.0" \
       "surya-ocr==0.17.1" \
@@ -40,31 +49,33 @@ RUN python -m venv /opt/venvs/surya && \
       "huggingface-hub>=0.34,<1.0" \
       "tokenizers>=0.22,<0.23" \
       "pypdfium2==4.30.0" && \
-    /opt/venvs/surya/bin/python -m pip install \
-      --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_FLAVOR}" \
-      --upgrade --force-reinstall \
-      "torch==${TORCH_VERSION}+${TORCH_CUDA_FLAVOR}" \
-      "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA_FLAVOR}" \
-      "torchaudio==${TORCHAUDIO_VERSION}+${TORCH_CUDA_FLAVOR}" && \
     /opt/venvs/surya/bin/python -m pip install --upgrade "pillow>=10.2,<11.0"
 
 # Chandra runtime venv
 RUN python -m venv /opt/venvs/chandra && \
     /opt/venvs/chandra/bin/python -m pip install --upgrade pip "setuptools<82" wheel && \
-    /opt/venvs/chandra/bin/python -m pip install /app && \
-    /opt/venvs/chandra/bin/python -m pip install \
-      "pypdf>=4.0" \
-      "reportlab>=4.0" \
-      "chandra-ocr[hf]==0.2.0" \
-      "pypdfium2==4.30.0" && \
     /opt/venvs/chandra/bin/python -m pip install \
       --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_FLAVOR}" \
       --upgrade --force-reinstall \
       "torch==${TORCH_VERSION}+${TORCH_CUDA_FLAVOR}" \
       "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA_FLAVOR}" \
-      "torchaudio==${TORCHAUDIO_VERSION}+${TORCH_CUDA_FLAVOR}"
+      "torchaudio==${TORCHAUDIO_VERSION}+${TORCH_CUDA_FLAVOR}" && \
+    /opt/venvs/chandra/bin/python -m pip install \
+      "opencv-python>=4.8" \
+      "numpy>=1.26" \
+      "pillow>=10.2" \
+      "img2pdf>=0.5" \
+      "pymupdf>=1.24" \
+      "pypdf>=4.0" \
+      "reportlab>=4.0" \
+      "chandra-ocr[hf]==0.2.0" \
+      "pypdfium2==4.30.0"
 
-RUN sed -i 's/\r$//' /app/scripts/docker-entrypoint.sh && \
+COPY src /app/src
+
+RUN /opt/venvs/surya/bin/python -m pip install --no-deps --no-build-isolation /app && \
+    /opt/venvs/chandra/bin/python -m pip install --no-deps --no-build-isolation /app && \
+    sed -i 's/\r$//' /app/scripts/docker-entrypoint.sh && \
     chmod +x /app/scripts/docker-entrypoint.sh && \
     mkdir -p /cache/hf_chandra /cache/hf_surya /cache/surya_models /cache/modelscope /data/work /data/in /data/out
 
