@@ -1891,6 +1891,53 @@ def _coalesce_text_layer_placements(
     return coalesced
 
 
+def _should_center_overlay_line(
+    line: str,
+    *,
+    raw_horiz_scale: float,
+    bbox: tuple[float, float, float, float],
+    page_width: float,
+) -> bool:
+    if raw_horiz_scale <= 145.0 or page_width <= 0.0:
+        return False
+
+    x0, _y0, x1, _y1 = bbox
+    box_center = (x0 + x1) * 0.5
+    if abs(box_center - (page_width * 0.5)) > page_width * 0.18:
+        return False
+
+    stripped = line.strip()
+    if not stripped:
+        return False
+
+    tokens = re.findall(rf"[{_LETTER_CLASS}0-9]+", stripped)
+    if not tokens:
+        return False
+    if len(tokens) == 1 and len(tokens[0]) <= 2:
+        return True
+
+    letters = [char for char in stripped if char.isalpha()]
+    if letters:
+        uppercase = [
+            char
+            for char in letters
+            if char.upper() == char and char.lower() != char
+        ]
+        if len(uppercase) / len(letters) >= 0.55:
+            return True
+
+    if len(tokens) <= 4:
+        capitalized = [
+            token
+            for token in tokens
+            if token[:1].isupper() and not token[:1].islower()
+        ]
+        if len(capitalized) / len(tokens) >= 0.5:
+            return True
+
+    return False
+
+
 def _build_overlay_page(
     *,
     page_width: float,
@@ -1912,10 +1959,20 @@ def _build_overlay_page(
         font_size = max(min(height * 0.80, 32.0), 0.12)
         natural_width = max(pdfmetrics.stringWidth(line, font_name, font_size), 0.01)
         # Keep the OCR line as one text object so extractors/search preserve spaces.
-        horiz_scale = max(min((width / natural_width) * 100.0, 140.0), 10.0)
+        raw_horiz_scale = (width / natural_width) * 100.0
+        horiz_scale = max(min(raw_horiz_scale, 140.0), 10.0)
+        drawn_width = natural_width * (horiz_scale / 100.0)
+        draw_x = max(x0 + 0.2, 0.2)
+        if _should_center_overlay_line(
+            line,
+            raw_horiz_scale=raw_horiz_scale,
+            bbox=bbox,
+            page_width=page_width,
+        ):
+            draw_x += max((width - drawn_width) * 0.5, 0.0)
         baseline_y = max(page_height - y1 + (height - font_size) * 0.55, 0.2)
 
-        text_obj = pdf_canvas.beginText(max(x0 + 0.2, 0.2), baseline_y)
+        text_obj = pdf_canvas.beginText(draw_x, baseline_y)
         text_obj.setFont(font_name, font_size)
         text_obj.setTextRenderMode(3)  # invisible selectable text
         if abs(horiz_scale - 100.0) > 0.5:

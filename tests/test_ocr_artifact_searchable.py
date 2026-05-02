@@ -32,6 +32,7 @@ from uniscan.ocr.artifact_searchable import (
     _placements_from_surya_geometry,
     _parse_artifact_filename,
     _should_blend_primary_candidate,
+    _should_center_overlay_line,
     _split_line_to_token_boxes,
     _split_line_to_word_fragments,
     _split_page_text_lines,
@@ -458,6 +459,35 @@ def test_bbox_reading_order_handles_tight_gutter_with_header() -> None:
     order = _bbox_reading_order_indices(boxes, page_width=1292.0)
 
     assert [labels[idx] for idx in order] == ["page", "header", "L1", "L2", "L3", "R1", "R2", "R3"]
+
+
+def test_should_center_overlay_line_only_for_centered_heading_like_text() -> None:
+    centered_bbox = (100.0, 100.0, 500.0, 130.0)
+
+    assert _should_center_overlay_line(
+        "СОЮЗА ССР",
+        raw_horiz_scale=260.0,
+        bbox=centered_bbox,
+        page_width=600.0,
+    )
+    assert _should_center_overlay_line(
+        "Москва",
+        raw_horiz_scale=360.0,
+        bbox=centered_bbox,
+        page_width=600.0,
+    )
+    assert not _should_center_overlay_line(
+        "called it his",
+        raw_horiz_scale=360.0,
+        bbox=(40.0, 100.0, 300.0, 130.0),
+        page_width=600.0,
+    )
+    assert not _should_center_overlay_line(
+        "The patient who has a high-school education is a very poor reader",
+        raw_horiz_scale=110.0,
+        bbox=centered_bbox,
+        page_width=600.0,
+    )
 
 
 def test_placements_from_surya_geometry_scales_and_cleans_text() -> None:
