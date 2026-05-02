@@ -20,6 +20,8 @@ from uniscan.app import (
     parse_page_numbers,
 )
 
+DEFAULT_DELETE_ORIGINAL_TEXT_LAYER = True
+
 
 @dataclass(slots=True)
 class _JobState:
@@ -31,6 +33,7 @@ class _JobState:
     pages: str
     lang: str
     strict: bool
+    delete_original_text_layer: bool
     filename: str
     run_dir: str | None = None
     result_path: Path | None = None
@@ -48,16 +51,24 @@ def _query_bool(raw: str | None, *, default: bool) -> bool:
     return default
 
 
-def _parse_job_request(parsed, *, default_lang: str) -> tuple[str, str, str, bool, str]:
+def _parse_job_request(parsed, *, default_lang: str) -> tuple[str, str, str, bool, str, bool]:
     query = parse_qs(parsed.query, keep_blank_values=True)
     mode = (query.get("mode", [PDF_MODE_HYBRID])[0] or PDF_MODE_HYBRID).strip()
     pages_raw = (query.get("pages", [""])[0] or "").strip()
     lang = (query.get("lang", [default_lang])[0] or default_lang).strip()
     strict = _query_bool(query.get("strict", ["1"])[0], default=True)
+    delete_original_text_layer = _query_bool(
+        (
+            query.get("delete_text_layer")
+            or query.get("delete_original_text_layer")
+            or ["1" if DEFAULT_DELETE_ORIGINAL_TEXT_LAYER else "0"]
+        )[0],
+        default=DEFAULT_DELETE_ORIGINAL_TEXT_LAYER,
+    )
     filename = (query.get("filename", ["document.pdf"])[0] or "document.pdf").strip()
     if not filename.lower().endswith(".pdf"):
         filename = f"{filename}.pdf"
-    return mode, pages_raw, lang, strict, filename
+    return mode, pages_raw, lang, strict, filename, delete_original_text_layer
 
 
 def _html_ui() -> bytes:
@@ -220,6 +231,13 @@ def _html_ui() -> bytes:
           <option value="0">false</option>
         </select>
       </div>
+      <div class="field">
+        <label>Existing text layer</label>
+        <select id="deleteTextLayer">
+          <option value="1" selected>remove</option>
+          <option value="0">keep</option>
+        </select>
+      </div>
     </div>
     <div class="actions">
       <button id="runBtn">Run OCR</button>
@@ -240,6 +258,7 @@ def _html_ui() -> bytes:
     const pagesEl = document.getElementById("pages");
     const langEl = document.getElementById("lang");
     const strictEl = document.getElementById("strict");
+    const deleteTextLayerEl = document.getElementById("deleteTextLayer");
     const runBtn = document.getElementById("runBtn");
     const downloadBtn = document.getElementById("downloadBtn");
     const barEl = document.getElementById("bar");
@@ -317,6 +336,7 @@ def _html_ui() -> bytes:
         mode: modeEl.value,
         lang: langEl.value.trim() || "rus+eng",
         strict: strictEl.value,
+        delete_text_layer: deleteTextLayerEl.value,
         filename: file.name
       });
       const pages = pagesEl.value.trim();
@@ -391,6 +411,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
             "pages": job.pages,
             "lang": job.lang,
             "strict": job.strict,
+            "delete_original_text_layer": job.delete_original_text_layer,
             "filename": job.filename,
         }
         if job.run_dir:
@@ -401,7 +422,16 @@ def _build_handler(*, work_root: Path, default_lang: str):
             payload["result_url"] = f"/api/jobs/{job.job_id}/result"
         return payload
 
-    def _run_job(job_id: str, *, payload: bytes, mode: str, pages_raw: str, lang: str, strict: bool) -> None:
+    def _run_job(
+        job_id: str,
+        *,
+        payload: bytes,
+        mode: str,
+        pages_raw: str,
+        lang: str,
+        strict: bool,
+        delete_original_text_layer: bool,
+    ) -> None:
         def _set_state(
             *,
             status: str | None = None,
@@ -444,6 +474,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 return_bytes=False,
                 strict=strict,
                 progress=_progress_cb,
+                delete_original_text_layer=delete_original_text_layer,
             )
             result_target = jobs_root / job_id / "result.pdf"
             result_target.parent.mkdir(parents=True, exist_ok=True)
@@ -503,7 +534,10 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 if not payload:
                     raise ValueError("Request body is empty. Send raw PDF bytes.")
 
-                mode, pages_raw, lang, strict, _filename = _parse_job_request(parsed, default_lang=default_lang)
+                mode, pages_raw, lang, strict, _filename, delete_original_text_layer = _parse_job_request(
+                    parsed,
+                    default_lang=default_lang,
+                )
                 page_numbers = parse_page_numbers(pages_raw)
                 summary = build_searchable_pdf(
                     pdf_bytes=payload,
@@ -514,6 +548,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
                     overwrite_input_path=False,
                     return_bytes=True,
                     strict=strict,
+                    delete_original_text_layer=delete_original_text_layer,
                 )
                 output_bytes = summary.output_pdf_bytes
                 if output_bytes is None:
@@ -539,7 +574,10 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 payload = self._read_request_body()
                 if not payload:
                     raise ValueError("Request body is empty. Send raw PDF bytes.")
-                mode, pages_raw, lang, strict, filename = _parse_job_request(parsed, default_lang=default_lang)
+                mode, pages_raw, lang, strict, filename, delete_original_text_layer = _parse_job_request(
+                    parsed,
+                    default_lang=default_lang,
+                )
                 parse_page_numbers(pages_raw)
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -555,6 +593,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 pages=pages_raw,
                 lang=lang,
                 strict=bool(strict),
+                delete_original_text_layer=bool(delete_original_text_layer),
                 filename=filename,
             )
             with jobs_lock:
@@ -569,6 +608,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
                     "pages_raw": pages_raw,
                     "lang": lang,
                     "strict": strict,
+                    "delete_original_text_layer": delete_original_text_layer,
                 },
                 daemon=True,
             )
