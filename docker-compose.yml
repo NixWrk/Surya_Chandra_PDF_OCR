@@ -3,8 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: uniscan-ocr:latest
-    container_name: uniscan-ocr-api
+    image: surya-chandra-ocr:latest
+    container_name: surya-chandra-ocr-api
     ports:
       - "${UNISCAN_HOST_PORT:-8000}:8000"
     environment:
