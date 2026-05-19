@@ -20,6 +20,7 @@ from uniscan.ocr.artifact_searchable import (
     _build_geometry_candidates,
     _choose_auto_candidate,
     _clean_overlay_line,
+    _coalesce_text_layer_placements,
     _estimate_page_split_weights,
     _expand_lines_to_target_count,
     _geometry_boxes_in_reading_order,
@@ -33,6 +34,7 @@ from uniscan.ocr.artifact_searchable import (
     _parse_artifact_filename,
     _should_blend_primary_candidate,
     _should_center_overlay_line,
+    _sort_text_layer_placements,
     _split_line_to_token_boxes,
     _split_line_to_word_fragments,
     _split_page_text_lines,
@@ -512,6 +514,24 @@ def test_bbox_reading_order_uses_center_gutter_before_vertical_position() -> Non
     assert ordered_labels.index("L-body-2") < ordered_labels.index("R-title-1")
 
 
+def test_bbox_reading_order_handles_near_center_spread_gutter() -> None:
+    labels = ["R-header", "L-header", "R1", "L1", "R2", "L2", "L3", "L4"]
+    boxes = [
+        (485.7, 18.2, 559.4, 31.8),
+        (65.2, 24.8, 137.6, 37.3),
+        (322.7, 39.8, 560.0, 69.8),
+        (63.5, 44.5, 299.2, 77.0),
+        (322.7, 69.1, 560.0, 99.1),
+        (63.5, 76.4, 299.2, 109.3),
+        (63.5, 108.6, 299.2, 141.5),
+        (63.5, 140.8, 299.2, 173.4),
+    ]
+
+    order = _bbox_reading_order_indices(boxes, page_width=589.0)
+
+    assert [labels[idx] for idx in order] == ["L-header", "L1", "L2", "L3", "L4", "R-header", "R1", "R2"]
+
+
 def test_bbox_reading_order_handles_four_columns_on_one_spread() -> None:
     labels = ["C1A", "C2A", "C3A", "C4A", "C1B", "C2B", "C3B", "C4B"]
     boxes = [
@@ -868,6 +888,56 @@ def test_build_searchable_pdf_orders_four_column_spread_text_layer(
     expected = ["C1A", "C1B", "C2A", "C2B", "C3A", "C3B", "C4A", "C4B"]
     positions = [extracted.index(item) for item in expected]
     assert positions == sorted(positions)
+
+
+def test_build_geometry_candidates_prefers_geometry_text_when_source_order_is_mixed() -> None:
+    page_lines = [
+        "R-header",
+        "L-header",
+        "R-one epsilon zeta",
+        "L-one alpha beta",
+        "R-two eta theta",
+        "L-two gamma delta",
+    ]
+    page_data = {
+        "image_width": 600.0,
+        "image_height": 400.0,
+        "lines": [
+            {"text": "L-header", "bbox": [70.0, 30.0, 160.0, 45.0]},
+            {"text": "L-one alpha beta", "bbox": [70.0, 70.0, 310.0, 90.0]},
+            {"text": "L-two gamma delta", "bbox": [70.0, 105.0, 310.0, 125.0]},
+            {"text": "R-header", "bbox": [485.0, 25.0, 560.0, 40.0]},
+            {"text": "R-one epsilon zeta", "bbox": [330.0, 65.0, 560.0, 85.0]},
+            {"text": "R-two eta theta", "bbox": [330.0, 100.0, 560.0, 120.0]},
+        ],
+    }
+
+    candidates = _build_geometry_candidates(
+        page_lines=page_lines,
+        page_width=600.0,
+        page_height=400.0,
+        line_boxes=[],
+        primary_page_data=page_data,
+        secondary_page_data=None,
+    )
+    chosen, _override = _choose_auto_candidate(candidates)
+
+    assert chosen is not None
+    assert chosen.strategy == "linefit"
+    ordered_texts = [
+        text
+        for _bbox, text in _coalesce_text_layer_placements(
+            _sort_text_layer_placements(chosen.placements, page_width=600.0)
+        )
+    ]
+    assert ordered_texts == [
+        "L-header",
+        "L-one alpha beta",
+        "L-two gamma delta",
+        "R-header",
+        "R-one epsilon zeta",
+        "R-two eta theta",
+    ]
 
 
 def test_build_searchable_pdf_normalizes_rotated_pages(tmp_path: Path) -> None:

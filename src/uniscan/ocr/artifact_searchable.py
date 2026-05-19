@@ -666,14 +666,27 @@ def _bbox_reading_order_indices(
     center_x = page_width * 0.5
     center_split: float | None = None
     if page_width > 0.0:
-        center_left = [item for item in normalized if item[3] < center_x]
-        center_right = [item for item in normalized if item[1] > center_x]
+        center_left = [item for item in normalized if ((item[1] + item[3]) * 0.5) < center_x]
+        center_right = [item for item in normalized if ((item[1] + item[3]) * 0.5) >= center_x]
         if len(center_left) >= min_side and len(center_right) >= min_side:
             center_left_x1 = max(item[3] for item in center_left)
             center_right_x0 = min(item[1] for item in center_right)
             center_gutter = center_right_x0 - center_left_x1
-            if center_left_x1 < center_x < center_right_x0 and center_gutter >= min_gutter:
-                center_split = (center_left_x1 + center_right_x0) * 0.5
+            split_x = (center_left_x1 + center_right_x0) * 0.5
+            left_y0 = min(item[2] for item in center_left)
+            left_y1 = max(item[4] for item in center_left)
+            right_y0 = min(item[2] for item in center_right)
+            right_y1 = max(item[4] for item in center_right)
+            overlap = min(left_y1, right_y1) - max(left_y0, right_y0)
+            min_span = max(min(left_y1 - left_y0, right_y1 - right_y0), 1.0)
+            near_center = abs(split_x - center_x) <= max(page_width * 0.08, min_gutter * 2.0)
+            center_min_gutter = max(content_width * 0.018, median_h * 0.60, 6.0)
+            if (
+                near_center
+                and center_gutter >= center_min_gutter
+                and overlap >= max(median_h * 2.0, min_span * 0.30)
+            ):
+                center_split = split_x
 
     split_candidates: list[tuple[float, float]] = []
 
@@ -1083,6 +1096,46 @@ def _coverage_between_line_sets(
     return float(max(0.0, min(1.0, coverage)))
 
 
+def _token_bag_coverage_between_line_sets(
+    *,
+    source_lines: Sequence[str],
+    target_lines: Sequence[str],
+) -> float:
+    source_tokens = [_normalize_alignment_token(token) for token in _TOKEN_RE.findall(" ".join(source_lines))]
+    target_tokens = [_normalize_alignment_token(token) for token in _TOKEN_RE.findall(" ".join(target_lines))]
+    source_counts: dict[str, int] = {}
+    target_counts: dict[str, int] = {}
+    for token in source_tokens:
+        if token:
+            source_counts[token] = source_counts.get(token, 0) + 1
+    for token in target_tokens:
+        if token:
+            target_counts[token] = target_counts.get(token, 0) + 1
+    total = sum(source_counts.values())
+    if total <= 0:
+        return 0.0
+    matched = sum(min(count, target_counts.get(token, 0)) for token, count in source_counts.items())
+    return float(max(0.0, min(1.0, float(matched) / float(total))))
+
+
+def _placement_reading_order_stability(
+    placements: Sequence[tuple[tuple[float, float, float, float], str]],
+    *,
+    page_width: float,
+) -> float:
+    if len(placements) < 4:
+        return 1.0
+    order = _bbox_reading_order_indices(
+        [bbox for bbox, _text in placements],
+        page_width=page_width,
+    )
+    if len(order) != len(placements):
+        return 1.0
+    tolerance = max(3, int(len(order) * 0.02))
+    stable = sum(1 for pos, idx in enumerate(order) if abs(idx - pos) <= tolerance)
+    return float(stable) / float(max(len(order), 1))
+
+
 def _candidate_score(
     *,
     coverage: float,
@@ -1250,10 +1303,19 @@ def _build_geometry_candidates(
             source_line_count=source_line_count,
             geometry_line_count=len(geometry_boxes),
         )
-        geometry_text_coverage = _coverage_between_line_sets(
+        geometry_sequence_coverage = _coverage_between_line_sets(
             source_lines=page_lines,
             target_lines=geometry_lines,
         )
+        geometry_text_coverage = geometry_sequence_coverage
+        if line_fit >= 0.85:
+            geometry_text_coverage = max(
+                geometry_text_coverage,
+                _token_bag_coverage_between_line_sets(
+                    source_lines=page_lines,
+                    target_lines=geometry_lines,
+                ),
+            )
 
         placements_align, align_coverage = _placements_from_chandra_text_aligned_to_geometry(
             page_lines=page_lines,
@@ -1263,7 +1325,20 @@ def _build_geometry_candidates(
         )
         if placements_align:
             token_ratio = min(1.0, float(_count_tokens_in_placements(placements_align)) / float(token_count))
-            coverage = max(align_coverage, geometry_text_coverage)
+            coverage = max(align_coverage, geometry_sequence_coverage)
+            score = _candidate_score(
+                coverage=coverage,
+                line_fit=line_fit,
+                token_ratio=token_ratio,
+                source=source_name,
+                strategy="align",
+            )
+            order_stability = _placement_reading_order_stability(
+                placements_align,
+                page_width=page_width,
+            )
+            if order_stability < 0.82:
+                score -= (0.82 - order_stability) * 0.14
             candidates.append(
                 _PlacementCandidate(
                     source=source_name,
@@ -1272,13 +1347,7 @@ def _build_geometry_candidates(
                     coverage=coverage,
                     line_fit=line_fit,
                     token_ratio=token_ratio,
-                    score=_candidate_score(
-                        coverage=coverage,
-                        line_fit=line_fit,
-                        token_ratio=token_ratio,
-                        source=source_name,
-                        strategy="align",
-                    ),
+                    score=score,
                 )
             )
 
@@ -1294,6 +1363,16 @@ def _build_geometry_candidates(
         if placements_assign:
             token_ratio = min(1.0, float(_count_tokens_in_placements(placements_assign)) / float(token_count))
             coverage = max(geometry_text_coverage, line_fit * 0.82)
+            score = _candidate_score(
+                coverage=coverage,
+                line_fit=line_fit,
+                token_ratio=token_ratio,
+                source=source_name,
+                strategy="assign",
+            )
+            source_order_gap = max(0.0, geometry_text_coverage - geometry_sequence_coverage)
+            if line_fit >= 0.85 and source_order_gap > 0.12:
+                score -= source_order_gap * 0.30
             candidates.append(
                 _PlacementCandidate(
                     source=source_name,
@@ -1302,13 +1381,7 @@ def _build_geometry_candidates(
                     coverage=coverage,
                     line_fit=line_fit,
                     token_ratio=token_ratio,
-                    score=_candidate_score(
-                        coverage=coverage,
-                        line_fit=line_fit,
-                        token_ratio=token_ratio,
-                        source=source_name,
-                        strategy="assign",
-                    ),
+                    score=score,
                 )
             )
 
@@ -1794,10 +1867,11 @@ def _geometry_lines_in_reading_order(
     if image_width <= 0.0 or image_height <= 0.0:
         return []
 
+    scale_x = page_width / image_width
+    scale_y = page_height / image_height
     placement_rows: list[
         tuple[
             str,
-            float,
             float,
             float,
             float,
@@ -1822,14 +1896,19 @@ def _geometry_lines_in_reading_order(
         y1 = max(float(bbox[1]), float(bbox[3]))
         if x1 <= x0 or y1 <= y0:
             continue
-        center_x_px = (x0 + x1) * 0.5
-        placement_rows.append((text, x0, y0, x1, y1, center_x_px))
+        bx0 = max(0.0, x0 * scale_x)
+        by0 = max(0.0, y0 * scale_y)
+        bx1 = min(page_width, x1 * scale_x)
+        by1 = min(page_height, y1 * scale_y)
+        if bx1 <= bx0 or by1 <= by0:
+            continue
+        placement_rows.append((text, bx0, by0, bx1, by1))
 
     if not placement_rows:
         return []
 
     order = _bbox_reading_order_indices(
-        [(x0, y0, x1, y1) for _text, x0, y0, x1, y1, _center_x in placement_rows],
+        [(x0, y0, x1, y1) for _text, x0, y0, x1, y1 in placement_rows],
         page_width=page_width,
     )
     return [placement_rows[idx][0] for idx in order]
