@@ -458,7 +458,76 @@ def test_bbox_reading_order_handles_tight_gutter_with_header() -> None:
 
     order = _bbox_reading_order_indices(boxes, page_width=1292.0)
 
-    assert [labels[idx] for idx in order] == ["page", "header", "L1", "L2", "L3", "R1", "R2", "R3"]
+    assert [labels[idx] for idx in order] == ["page", "L1", "L2", "L3", "header", "R1", "R2", "R3"]
+
+
+def test_bbox_reading_order_keeps_headers_inside_spread_pages() -> None:
+    labels = ["R-header", "L-header", "L1", "R1", "L2", "R2"]
+    boxes = [
+        (700.0, 20.0, 820.0, 38.0),
+        (80.0, 28.0, 200.0, 46.0),
+        (82.0, 80.0, 420.0, 100.0),
+        (702.0, 80.0, 1040.0, 100.0),
+        (82.0, 120.0, 420.0, 140.0),
+        (702.0, 120.0, 1040.0, 140.0),
+    ]
+
+    order = _bbox_reading_order_indices(boxes, page_width=1120.0)
+
+    assert [labels[idx] for idx in order] == ["L-header", "L1", "L2", "R-header", "R1", "R2"]
+
+
+def test_bbox_reading_order_uses_center_gutter_before_vertical_position() -> None:
+    labels = [
+        "R-title-1",
+        "R-title-2",
+        "R-title-3",
+        "L-title-1",
+        "L-title-2",
+        "L-title-3",
+        "L-title-4",
+        "L-body-1",
+        "L-body-2",
+        "R-body-1",
+        "R-body-2",
+    ]
+    boxes = [
+        (421.2, 24.8, 494.3, 34.1),
+        (497.2, 24.8, 528.7, 34.1),
+        (531.6, 24.8, 549.1, 34.1),
+        (36.1, 30.2, 52.8, 39.1),
+        (55.6, 30.2, 128.9, 39.1),
+        (131.7, 30.2, 159.2, 39.1),
+        (161.9, 30.2, 192.2, 39.1),
+        (36.1, 48.7, 98.5, 55.9),
+        (101.0, 48.7, 130.2, 55.9),
+        (309.3, 46.1, 345.7, 52.9),
+        (348.3, 46.1, 353.5, 52.9),
+    ]
+
+    order = _bbox_reading_order_indices(boxes, page_width=589.0)
+
+    ordered_labels = [labels[idx] for idx in order]
+    assert ordered_labels.index("L-title-1") < ordered_labels.index("R-title-1")
+    assert ordered_labels.index("L-body-2") < ordered_labels.index("R-title-1")
+
+
+def test_bbox_reading_order_handles_four_columns_on_one_spread() -> None:
+    labels = ["C1A", "C2A", "C3A", "C4A", "C1B", "C2B", "C3B", "C4B"]
+    boxes = [
+        (60.0, 100.0, 170.0, 118.0),
+        (210.0, 100.0, 320.0, 118.0),
+        (560.0, 100.0, 670.0, 118.0),
+        (710.0, 100.0, 820.0, 118.0),
+        (60.0, 140.0, 170.0, 158.0),
+        (210.0, 140.0, 320.0, 158.0),
+        (560.0, 140.0, 670.0, 158.0),
+        (710.0, 140.0, 820.0, 158.0),
+    ]
+
+    order = _bbox_reading_order_indices(boxes, page_width=900.0)
+
+    assert [labels[idx] for idx in order] == ["C1A", "C1B", "C2A", "C2B", "C3A", "C3B", "C4A", "C4B"]
 
 
 def test_should_center_overlay_line_only_for_centered_heading_like_text() -> None:
@@ -663,6 +732,142 @@ def test_build_searchable_pdf_keeps_text_when_boxes_are_tiny(monkeypatch, tmp_pa
     extracted = _extract_pdf_text(out_pdf)
     assert "Line 000" in extracted
     assert "Line 119" in extracted
+
+
+def test_build_searchable_pdf_wraps_overcompressed_overlay_lines(monkeypatch, tmp_path: Path) -> None:
+    src_pdf = _build_sample_pdf(tmp_path, "compressed_overlay_fixture", [40])
+    out_pdf = tmp_path / "compressed_overlay_out.pdf"
+    text = (
+        "[SOURCE PAGE 1]\n"
+        "Исполняют его следующим образом. На светочувствительную бумагу кладут рисунок "
+        "или печатный лист, прикрывают стеклом и выставляют на дневной свет.\n"
+    )
+
+    monkeypatch.setattr(
+        "uniscan.ocr.artifact_searchable._estimate_page_line_bboxes",
+        lambda **_kwargs: [(20.0, 20.0, 160.0, 52.0)],
+    )
+
+    _build_searchable_pdf_from_text(
+        source_pdf=src_pdf,
+        text=text,
+        out_pdf=out_pdf,
+    )
+
+    extracted = _normalize_ws(_extract_pdf_text(out_pdf))
+    assert "Исполняют его следующим образом" in extracted
+    assert "светочувствительную бумагу" in extracted
+
+    from pypdf import PdfReader
+    from pypdf.generic import ContentStream
+
+    reader = PdfReader(str(out_pdf))
+    content = ContentStream(reader.pages[0].get_contents(), reader)
+    horiz_scales = [
+        float(operands[0])
+        for operands, operator in content.operations
+        if operator == b"Tz" and operands
+    ]
+    assert horiz_scales
+    assert min(horiz_scales) >= 64.0
+
+
+def test_build_searchable_pdf_orders_hybrid_text_layer_by_geometry_columns(
+    monkeypatch, tmp_path: Path
+) -> None:
+    src_pdf = _build_sample_pdf(tmp_path, "column_order_fixture", [40])
+    out_pdf = tmp_path / "column_order_out.pdf"
+    text = "\n".join(
+        [
+            "[SOURCE PAGE 1]",
+            "LEFT-ONE",
+            "RIGHT-ONE",
+            "LEFT-TWO",
+            "RIGHT-TWO",
+        ]
+    )
+
+    monkeypatch.setattr(
+        "uniscan.ocr.artifact_searchable._estimate_page_line_bboxes",
+        lambda **_kwargs: [],
+    )
+
+    _build_searchable_pdf_from_text(
+        source_pdf=src_pdf,
+        text=text,
+        out_pdf=out_pdf,
+        surya_geometry_by_page={
+            1: {
+                "image_width": 1000.0,
+                "image_height": 1000.0,
+                "lines": [
+                    {"text": "LEFT-ONE", "bbox": [100.0, 100.0, 380.0, 150.0]},
+                    {"text": "RIGHT-ONE", "bbox": [620.0, 100.0, 900.0, 150.0]},
+                    {"text": "LEFT-TWO", "bbox": [100.0, 200.0, 380.0, 250.0]},
+                    {"text": "RIGHT-TWO", "bbox": [620.0, 200.0, 900.0, 250.0]},
+                ],
+            }
+        },
+        geometry_linefit_prefer=True,
+    )
+
+    extracted = _normalize_ws(_extract_pdf_text(out_pdf))
+    assert extracted.index("LEFT-ONE") < extracted.index("LEFT-TWO")
+    assert extracted.index("LEFT-TWO") < extracted.index("RIGHT-ONE")
+    assert extracted.index("RIGHT-ONE") < extracted.index("RIGHT-TWO")
+
+
+def test_build_searchable_pdf_orders_four_column_spread_text_layer(
+    monkeypatch, tmp_path: Path
+) -> None:
+    src_pdf = _build_sample_pdf(tmp_path, "four_column_spread_fixture", [40])
+    out_pdf = tmp_path / "four_column_spread_out.pdf"
+    text = "\n".join(
+        [
+            "[SOURCE PAGE 1]",
+            "C1A",
+            "C2A",
+            "C3A",
+            "C4A",
+            "C1B",
+            "C2B",
+            "C3B",
+            "C4B",
+        ]
+    )
+
+    monkeypatch.setattr(
+        "uniscan.ocr.artifact_searchable._estimate_page_line_bboxes",
+        lambda **_kwargs: [],
+    )
+
+    _build_searchable_pdf_from_text(
+        source_pdf=src_pdf,
+        text=text,
+        out_pdf=out_pdf,
+        surya_geometry_by_page={
+            1: {
+                "image_width": 900.0,
+                "image_height": 900.0,
+                "lines": [
+                    {"text": "C1A", "bbox": [60.0, 100.0, 170.0, 118.0]},
+                    {"text": "C2A", "bbox": [210.0, 100.0, 320.0, 118.0]},
+                    {"text": "C3A", "bbox": [560.0, 100.0, 670.0, 118.0]},
+                    {"text": "C4A", "bbox": [710.0, 100.0, 820.0, 118.0]},
+                    {"text": "C1B", "bbox": [60.0, 140.0, 170.0, 158.0]},
+                    {"text": "C2B", "bbox": [210.0, 140.0, 320.0, 158.0]},
+                    {"text": "C3B", "bbox": [560.0, 140.0, 670.0, 158.0]},
+                    {"text": "C4B", "bbox": [710.0, 140.0, 820.0, 158.0]},
+                ],
+            }
+        },
+        geometry_linefit_prefer=True,
+    )
+
+    extracted = _normalize_ws(_extract_pdf_text(out_pdf))
+    expected = ["C1A", "C1B", "C2A", "C2B", "C3A", "C3B", "C4A", "C4B"]
+    positions = [extracted.index(item) for item in expected]
+    assert positions == sorted(positions)
 
 
 def test_build_searchable_pdf_normalizes_rotated_pages(tmp_path: Path) -> None:

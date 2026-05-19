@@ -63,6 +63,10 @@ _HYBRID_BLEND_SECONDARY_ADVANTAGE_MIN = 0.08
 _HYBRID_POLICY_AUTO = "auto"
 _HYBRID_POLICY_SURYA_ONLY = "surya_only"
 _HYBRID_POLICY_SOFTLINE = "softline"
+_TEXT_LAYER_MIN_HORIZ_SCALE = 65.0
+_TEXT_LAYER_WRAP_TRIGGER_HORIZ_SCALE = 35.0
+_TEXT_LAYER_MIN_WRAPPED_LINE_HEIGHT = 5.0
+_TEXT_LAYER_MAX_WRAP_LINES = 6
 _LETTER_CLASS = r"A-Za-z\u0400-\u04ff"
 _INTRA_WORD_DASH_RE = re.compile(rf"(?<=[{_LETTER_CLASS}])[\u2010-\u2015\u2212](?=[{_LETTER_CLASS}])")
 _OCR_SUFFIX_HYPHEN_RE = re.compile(
@@ -419,27 +423,46 @@ def _wrap_line_to_width(
     if pdfmetrics.stringWidth(line, font_name, font_size) <= max_width:
         return [line]
 
-    parts: list[str] = []
-    start = 0
-    while start < len(line):
-        low = start + 1
-        high = len(line)
-        best = start + 1
-        while low <= high:
-            mid = (low + high) // 2
-            chunk = line[start:mid]
-            width = pdfmetrics.stringWidth(chunk, font_name, font_size)
-            if width <= max_width:
-                best = mid
-                low = mid + 1
-            else:
-                high = mid - 1
-        if best <= start:
+    def split_token(token: str) -> list[str]:
+        chunks: list[str] = []
+        start = 0
+        while start < len(token):
+            low = start + 1
+            high = len(token)
             best = start + 1
-        parts.append(line[start:best])
-        start = best
-        while start < len(line) and line[start] == " ":
-            start += 1
+            while low <= high:
+                mid = (low + high) // 2
+                chunk = token[start:mid]
+                width = pdfmetrics.stringWidth(chunk, font_name, font_size)
+                if width <= max_width:
+                    best = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            if best <= start:
+                best = start + 1
+            chunks.append(token[start:best])
+            start = best
+        return chunks
+
+    parts: list[str] = []
+    current = ""
+    for token in line.split(" "):
+        if not token:
+            continue
+        candidate = token if not current else f"{current} {token}"
+        if pdfmetrics.stringWidth(candidate, font_name, font_size) <= max_width:
+            current = candidate
+            continue
+        if current:
+            parts.append(current)
+            current = ""
+        if pdfmetrics.stringWidth(token, font_name, font_size) <= max_width:
+            current = token
+        else:
+            parts.extend(split_token(token))
+    if current:
+        parts.append(current)
     return parts
 
 
@@ -640,8 +663,19 @@ def _bbox_reading_order_indices(
     heights = sorted(max(item[4] - item[2], 1.0) for item in by_center)
     median_h = heights[len(heights) // 2] if heights else 10.0
     min_gutter = max(content_width * 0.022, median_h * 0.75, 8.0)
-    best_split: float | None = None
-    best_score = float("-inf")
+    center_x = page_width * 0.5
+    center_split: float | None = None
+    if page_width > 0.0:
+        center_left = [item for item in normalized if item[3] < center_x]
+        center_right = [item for item in normalized if item[1] > center_x]
+        if len(center_left) >= min_side and len(center_right) >= min_side:
+            center_left_x1 = max(item[3] for item in center_left)
+            center_right_x0 = min(item[1] for item in center_right)
+            center_gutter = center_right_x0 - center_left_x1
+            if center_left_x1 < center_x < center_right_x0 and center_gutter >= min_gutter:
+                center_split = (center_left_x1 + center_right_x0) * 0.5
+
+    split_candidates: list[tuple[float, float]] = []
 
     for split_idx in range(min_side, len(by_center) - min_side + 1):
         left = by_center[:split_idx]
@@ -663,12 +697,21 @@ def _bbox_reading_order_indices(
 
         balance = min(len(left), len(right)) / max(len(left), len(right))
         score = gutter + (balance * min_gutter)
-        if score > best_score:
-            best_score = score
-            best_split = (left_x1 + right_x0) * 0.5
+        split_candidates.append(((left_x1 + right_x0) * 0.5, score))
 
-    if best_split is None:
+    if not split_candidates and center_split is None:
         return default_order
+
+    split_candidates.sort(key=lambda item: item[1], reverse=True)
+    split_positions: list[float] = []
+    if center_split is not None:
+        split_positions.append(center_split)
+    min_split_distance = max(min_gutter * 1.5, median_h * 2.0)
+    for split_x, _score in split_candidates:
+        if any(abs(split_x - existing) < min_split_distance for existing in split_positions):
+            continue
+        split_positions.append(split_x)
+    split_positions.sort()
 
     prefix_cutoff: float | None = None
     by_y = sorted(normalized, key=lambda item: (item[2], item[1]))
@@ -690,15 +733,15 @@ def _bbox_reading_order_indices(
     def column_key(idx: int) -> tuple[int, float, float]:
         x0, y0, x1, _y1 = boxes[idx]
         center_x = (x0 + x1) * 0.5
-        column = 0 if center_x < best_split else 1
+        column = sum(1 for split_x in split_positions if center_x >= split_x)
         return (column, y0, x0)
 
-    prefix_order = sorted(prefix_indices, key=lambda idx: (boxes[idx][1], boxes[idx][0]))
-    body_order = sorted(
-        (idx for idx in range(len(boxes)) if idx not in prefix_indices),
-        key=column_key,
-    )
-    return prefix_order + body_order
+    def reading_key(idx: int) -> tuple[int, int, float, float]:
+        column, y0, x0 = column_key(idx)
+        prefix_rank = 0 if idx in prefix_indices else 1
+        return (column, prefix_rank, y0, x0)
+
+    return sorted(range(len(boxes)), key=reading_key)
 
 
 def _split_line_to_word_fragments(
@@ -1891,6 +1934,23 @@ def _coalesce_text_layer_placements(
     return coalesced
 
 
+def _sort_text_layer_placements(
+    placements: Sequence[tuple[tuple[float, float, float, float], str]],
+    *,
+    page_width: float,
+) -> list[tuple[tuple[float, float, float, float], str]]:
+    if len(placements) < 2:
+        return list(placements)
+
+    order = _bbox_reading_order_indices(
+        [bbox for bbox, _text in placements],
+        page_width=page_width,
+    )
+    if len(order) != len(placements):
+        return list(placements)
+    return [placements[idx] for idx in order]
+
+
 def _should_center_overlay_line(
     line: str,
     *,
@@ -1938,6 +1998,93 @@ def _should_center_overlay_line(
     return False
 
 
+def _overlay_font_size_for_box(height: float) -> float:
+    return max(min(max(height - 0.4, 0.4) * 0.80, 32.0), 0.12)
+
+
+def _overlay_raw_horiz_scale(
+    *,
+    line: str,
+    font_name: str,
+    font_size: float,
+    width: float,
+) -> float:
+    from reportlab.pdfbase import pdfmetrics
+
+    natural_width = max(pdfmetrics.stringWidth(line, font_name, font_size), 0.01)
+    return (max(width - 0.6, 0.5) / natural_width) * 100.0
+
+
+def _wrap_overlay_line_for_box(
+    line: str,
+    *,
+    bbox: tuple[float, float, float, float],
+    font_name: str,
+) -> list[str]:
+    x0, y0, x1, y1 = bbox
+    width = max(x1 - x0 - 0.6, 0.5)
+    height = max(y1 - y0 - 0.4, 0.4)
+    font_size = _overlay_font_size_for_box(height)
+    raw_horiz_scale = _overlay_raw_horiz_scale(
+        line=line,
+        font_name=font_name,
+        font_size=font_size,
+        width=width,
+    )
+    if raw_horiz_scale >= _TEXT_LAYER_WRAP_TRIGGER_HORIZ_SCALE:
+        return [line]
+    tokens = _TOKEN_RE.findall(line)
+    if len(tokens) <= 1:
+        return [line]
+    if len(line) < 48 and len(tokens) <= 5:
+        return [line]
+
+    max_lines = min(
+        _TEXT_LAYER_MAX_WRAP_LINES,
+        max(1, int(height // _TEXT_LAYER_MIN_WRAPPED_LINE_HEIGHT)),
+    )
+    if max_lines <= 1:
+        return [line]
+
+    best: list[str] = [line]
+    for target_lines in range(2, max_lines + 1):
+        sub_height = height / float(target_lines)
+        sub_font_size = _overlay_font_size_for_box(sub_height)
+        wrapped = _wrap_line_to_width(
+            line,
+            font_name=font_name,
+            font_size=sub_font_size,
+            max_width=width,
+        )
+        if len(wrapped) > 1:
+            best = wrapped
+        if len(wrapped) <= target_lines:
+            return wrapped
+    return best
+
+
+def _wrap_overlay_lines_for_box(
+    lines: Sequence[str],
+    *,
+    bbox: tuple[float, float, float, float],
+    font_name: str,
+) -> list[str]:
+    if not lines:
+        return []
+    x0, y0, x1, y1 = bbox
+    line_height = max((y1 - y0) / max(len(lines), 1), 0.5)
+    wrapped: list[str] = []
+    for line_idx, line in enumerate(lines):
+        sub_bbox = (
+            x0,
+            y0 + (line_height * line_idx),
+            x1,
+            y0 + (line_height * (line_idx + 1)),
+        )
+        wrapped.extend(_wrap_overlay_line_for_box(line, bbox=sub_bbox, font_name=font_name))
+    return wrapped or list(lines)
+
+
 def _build_overlay_page(
     *,
     page_width: float,
@@ -1956,10 +2103,15 @@ def _build_overlay_page(
         x0, y0, x1, y1 = bbox
         width = max(x1 - x0 - 0.6, 0.5)
         height = max(y1 - y0 - 0.4, 0.4)
-        font_size = max(min(height * 0.80, 32.0), 0.12)
+        font_size = _overlay_font_size_for_box(height)
         natural_width = max(pdfmetrics.stringWidth(line, font_name, font_size), 0.01)
         # Keep the OCR line as one text object so extractors/search preserve spaces.
         raw_horiz_scale = (width / natural_width) * 100.0
+        if raw_horiz_scale < _TEXT_LAYER_MIN_HORIZ_SCALE:
+            shrink_ratio = max(raw_horiz_scale / _TEXT_LAYER_MIN_HORIZ_SCALE, 0.01)
+            font_size = max(font_size * shrink_ratio, 0.12)
+            natural_width = max(pdfmetrics.stringWidth(line, font_name, font_size), 0.01)
+            raw_horiz_scale = (width / natural_width) * 100.0
         horiz_scale = max(min(raw_horiz_scale, 140.0), 10.0)
         drawn_width = natural_width * (horiz_scale / 100.0)
         draw_x = max(x0 + 0.2, 0.2)
@@ -1980,13 +2132,15 @@ def _build_overlay_page(
         text_obj.textLine(line)
         pdf_canvas.drawText(text_obj)
 
-    for bbox, text in _coalesce_text_layer_placements(placements):
+    sorted_placements = _sort_text_layer_placements(placements, page_width=page_width)
+    for bbox, text in _coalesce_text_layer_placements(sorted_placements):
         if not text.strip():
             continue
         x0, y0, x1, y1 = bbox
         overlay_lines = [item.strip() for item in text.splitlines() if item.strip()]
         if not overlay_lines:
             continue
+        overlay_lines = _wrap_overlay_lines_for_box(overlay_lines, bbox=bbox, font_name=font_name)
 
         line_height = max((y1 - y0) / max(len(overlay_lines), 1), 0.5)
         for line_idx, line in enumerate(overlay_lines):
