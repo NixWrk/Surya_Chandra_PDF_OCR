@@ -6,10 +6,12 @@ import json
 import shutil
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from uniscan.app import (
@@ -21,6 +23,10 @@ from uniscan.app import (
 )
 
 DEFAULT_DELETE_ORIGINAL_TEXT_LAYER = True
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass(slots=True)
@@ -35,9 +41,228 @@ class _JobState:
     strict: bool
     delete_original_text_layer: bool
     filename: str
+    created_at: str = field(default_factory=_utc_now)
+    updated_at: str = field(default_factory=_utc_now)
+    input_bytes: int = 0
+    result_bytes: int = 0
+    completed_at: str | None = None
     run_dir: str | None = None
     result_path: Path | None = None
     error: str | None = None
+
+
+_ACTIVE_JOB_STATUSES = {"queued", "running"}
+
+
+class _JobStore:
+    def __init__(self, jobs_root: Path):
+        self.jobs_root = jobs_root
+        self.jobs_root.mkdir(parents=True, exist_ok=True)
+        self._jobs: dict[str, _JobState] = {}
+        self._lock = threading.Lock()
+        self._load_existing_jobs()
+
+    def create(self, job: _JobState) -> None:
+        with self._lock:
+            self._jobs[job.job_id] = job
+            self._write_metadata_locked(job)
+            self._append_event_locked(
+                job,
+                "created",
+                "OCR job was created.",
+                {"status": job.status, "input_bytes": job.input_bytes},
+            )
+
+    def get(self, job_id: str) -> _JobState | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def update(
+        self,
+        job_id: str,
+        updates: dict[str, Any],
+        *,
+        event: str | None = None,
+        message: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> _JobState | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            for key, value in updates.items():
+                setattr(job, key, value)
+            job.updated_at = _utc_now()
+            self._write_metadata_locked(job)
+            if event:
+                self._append_event_locked(job, event, message or event, metadata or updates)
+            return job
+
+    def metadata(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            payload = _serialize_job(job)
+            payload["metadata_path"] = str(self._metadata_path(job.job_id))
+            payload["events_path"] = str(self._events_path(job.job_id))
+            if job.result_path is not None:
+                payload["result_path"] = str(job.result_path)
+            return payload
+
+    def health(self) -> dict[str, Any]:
+        with self._lock:
+            counts: dict[str, int] = {}
+            for job in self._jobs.values():
+                counts[job.status] = counts.get(job.status, 0) + 1
+            return {
+                "ok": True,
+                "root": str(self.jobs_root),
+                "jobs": len(self._jobs),
+                "counts": counts,
+                "durable": True,
+            }
+
+    def _load_existing_jobs(self) -> None:
+        for metadata_path in sorted(self.jobs_root.glob("*/metadata.json")):
+            try:
+                raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+                job = _job_from_metadata(raw)
+            except Exception:
+                continue
+
+            result_candidate = metadata_path.parent / "result.pdf"
+            if job.result_path is None and result_candidate.exists():
+                job.result_path = result_candidate.resolve()
+            if job.result_path is not None and Path(job.result_path).exists():
+                job.result_path = Path(job.result_path).resolve()
+                job.result_bytes = Path(job.result_path).stat().st_size
+                if job.status in _ACTIVE_JOB_STATUSES:
+                    job.status = "done"
+                    job.progress = 100
+                    job.message = "Recovered completed OCR result."
+                    job.completed_at = job.completed_at or _utc_now()
+            elif job.status in _ACTIVE_JOB_STATUSES:
+                job.status = "interrupted"
+                job.message = "OCR API restarted before this job finished."
+                job.error = job.error or "Interrupted by OCR API restart."
+            job.updated_at = _utc_now()
+            self._jobs[job.job_id] = job
+            self._write_metadata_locked(job)
+
+    def _job_dir(self, job_id: str) -> Path:
+        return self.jobs_root / job_id
+
+    def _metadata_path(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / "metadata.json"
+
+    def _events_path(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / "events.jsonl"
+
+    def _write_metadata_locked(self, job: _JobState) -> None:
+        job_dir = self._job_dir(job.job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(self._metadata_path(job.job_id), _serialize_job(job))
+
+    def _append_event_locked(
+        self,
+        job: _JobState,
+        event: str,
+        message: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        job_dir = self._job_dir(job.job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "created_at": _utc_now(),
+            "job_id": job.job_id,
+            "event": event,
+            "message": message,
+            "status": job.status,
+            "progress": job.progress,
+            "metadata": _json_safe(metadata or {}),
+        }
+        with self._events_path(job.job_id).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _serialize_job(job: _JobState) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "job_id": job.job_id,
+        "status": job.status,
+        "progress": int(max(0, min(100, job.progress))),
+        "message": job.message,
+        "mode": job.mode,
+        "pages": job.pages,
+        "lang": job.lang,
+        "strict": job.strict,
+        "delete_original_text_layer": job.delete_original_text_layer,
+        "filename": job.filename,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "input_bytes": job.input_bytes,
+        "result_bytes": job.result_bytes,
+    }
+    if job.completed_at:
+        payload["completed_at"] = job.completed_at
+    if job.run_dir:
+        payload["run_dir"] = job.run_dir
+    if job.error:
+        payload["error"] = job.error
+    if job.result_path is not None:
+        payload["result_path"] = str(job.result_path)
+    if job.result_path is not None and job.result_path.exists() and job.status == "done":
+        payload["result_url"] = f"/api/jobs/{job.job_id}/result"
+        payload["metadata_url"] = f"/api/jobs/{job.job_id}/metadata"
+    return payload
+
+
+def _job_from_metadata(payload: dict[str, Any]) -> _JobState:
+    result_path_raw = payload.get("result_path")
+    return _JobState(
+        job_id=str(payload["job_id"]),
+        status=str(payload.get("status") or "interrupted"),
+        progress=int(payload.get("progress") or 0),
+        message=str(payload.get("message") or ""),
+        mode=str(payload.get("mode") or PDF_MODE_HYBRID),
+        pages=str(payload.get("pages") or ""),
+        lang=str(payload.get("lang") or DEFAULT_BASIC_GUI_LANG),
+        strict=bool(payload.get("strict", True)),
+        delete_original_text_layer=bool(payload.get("delete_original_text_layer", True)),
+        filename=str(payload.get("filename") or "document.pdf"),
+        created_at=str(payload.get("created_at") or _utc_now()),
+        updated_at=str(payload.get("updated_at") or _utc_now()),
+        input_bytes=int(payload.get("input_bytes") or 0),
+        result_bytes=int(payload.get("result_bytes") or 0),
+        completed_at=(
+            str(payload["completed_at"])
+            if payload.get("completed_at") is not None
+            else None
+        ),
+        run_dir=str(payload["run_dir"]) if payload.get("run_dir") else None,
+        result_path=Path(str(result_path_raw)) if result_path_raw else None,
+        error=str(payload["error"]) if payload.get("error") else None,
+    )
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _query_bool(raw: str | None, *, default: bool) -> bool:
@@ -398,29 +623,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
     jobs_root.mkdir(parents=True, exist_ok=True)
     pipeline_root.mkdir(parents=True, exist_ok=True)
 
-    jobs: dict[str, _JobState] = {}
-    jobs_lock = threading.Lock()
-
-    def _serialize_job(job: _JobState) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "job_id": job.job_id,
-            "status": job.status,
-            "progress": int(max(0, min(100, job.progress))),
-            "message": job.message,
-            "mode": job.mode,
-            "pages": job.pages,
-            "lang": job.lang,
-            "strict": job.strict,
-            "delete_original_text_layer": job.delete_original_text_layer,
-            "filename": job.filename,
-        }
-        if job.run_dir:
-            payload["run_dir"] = job.run_dir
-        if job.error:
-            payload["error"] = job.error
-        if job.result_path is not None and job.result_path.exists() and job.status == "done":
-            payload["result_url"] = f"/api/jobs/{job.job_id}/result"
-        return payload
+    job_store = _JobStore(jobs_root)
 
     def _run_job(
         job_id: str,
@@ -441,22 +644,30 @@ def _build_handler(*, work_root: Path, default_lang: str):
             result_path: Path | None = None,
             error: str | None = None,
         ) -> None:
-            with jobs_lock:
-                job = jobs.get(job_id)
-                if job is None:
-                    return
-                if status is not None:
-                    job.status = status
-                if progress is not None:
-                    job.progress = int(max(0, min(100, progress)))
-                if message is not None:
-                    job.message = message
-                if run_dir is not None:
-                    job.run_dir = run_dir
-                if result_path is not None:
-                    job.result_path = result_path
-                if error is not None:
-                    job.error = error
+            updates: dict[str, Any] = {}
+            if status is not None:
+                updates["status"] = status
+            if progress is not None:
+                updates["progress"] = int(max(0, min(100, progress)))
+            if message is not None:
+                updates["message"] = message
+            if run_dir is not None:
+                updates["run_dir"] = run_dir
+            if result_path is not None:
+                updates["result_path"] = result_path
+                updates["result_bytes"] = result_path.stat().st_size if result_path.exists() else 0
+            if error is not None:
+                updates["error"] = error
+            if status == "done":
+                updates["completed_at"] = _utc_now()
+            event = status or "progress"
+            job_store.update(
+                job_id,
+                updates,
+                event=event,
+                message=message or event,
+                metadata=updates,
+            )
 
         def _progress_cb(value: int, status: str) -> None:
             _set_state(status="running", progress=value, message=status)
@@ -515,6 +726,15 @@ def _build_handler(*, work_root: Path, default_lang: str):
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.end_headers()
             self.wfile.write(payload)
+
+        def _send_pdf_file(self, *, path: Path, filename: str) -> None:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(path.stat().st_size))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.end_headers()
+            with path.open("rb") as stream:
+                shutil.copyfileobj(stream, self.wfile)
 
         def _read_request_body(self) -> bytes:
             raw_len = self.headers.get("Content-Length", "")
@@ -595,9 +815,9 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 strict=bool(strict),
                 delete_original_text_layer=bool(delete_original_text_layer),
                 filename=filename,
+                input_bytes=len(payload),
             )
-            with jobs_lock:
-                jobs[job_id] = job
+            job_store.create(job)
 
             worker = threading.Thread(
                 target=_run_job,
@@ -616,16 +836,21 @@ def _build_handler(*, work_root: Path, default_lang: str):
             self._send_json(HTTPStatus.ACCEPTED, _serialize_job(job))
 
         def _handle_get_job(self, job_id: str) -> None:
-            with jobs_lock:
-                job = jobs.get(job_id)
+            job = job_store.get(job_id)
             if job is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Job not found: {job_id}"})
                 return
             self._send_json(HTTPStatus.OK, _serialize_job(job))
 
+        def _handle_get_job_metadata(self, job_id: str) -> None:
+            metadata = job_store.metadata(job_id)
+            if metadata is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Job not found: {job_id}"})
+                return
+            self._send_json(HTTPStatus.OK, metadata)
+
         def _handle_get_job_result(self, job_id: str) -> None:
-            with jobs_lock:
-                job = jobs.get(job_id)
+            job = job_store.get(job_id)
             if job is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Job not found: {job_id}"})
                 return
@@ -635,7 +860,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
             filename = job.filename
             safe_name = filename[:-4] if filename.lower().endswith(".pdf") else filename
             download_name = f"{safe_name}.searchable.pdf"
-            self._send_pdf(status=HTTPStatus.OK, payload=job.result_path.read_bytes(), filename=download_name)
+            self._send_pdf_file(path=job.result_path, filename=download_name)
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -649,6 +874,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
                         "status": "ok",
                         "service": "uniscan",
                         "mode_default": PDF_MODE_HYBRID,
+                        "job_store": job_store.health(),
                     },
                 )
                 return
@@ -659,6 +885,9 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 return
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "jobs" and parts[3] == "result":
                 self._handle_get_job_result(parts[2])
+                return
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "jobs" and parts[3] == "metadata":
+                self._handle_get_job_metadata(parts[2])
                 return
 
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})

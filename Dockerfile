@@ -31,6 +31,8 @@ RUN python -m pip install --upgrade pip "setuptools<82" wheel
 RUN python -m venv /opt/venvs/surya && \
     /opt/venvs/surya/bin/python -m pip install --upgrade pip "setuptools<82" wheel && \
     /opt/venvs/surya/bin/python -m pip install \
+      --resume-retries 20 \
+      --timeout 60 \
       --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_FLAVOR}" \
       --upgrade --force-reinstall \
       "torch==${TORCH_VERSION}+${TORCH_CUDA_FLAVOR}" \
@@ -55,6 +57,8 @@ RUN python -m venv /opt/venvs/surya && \
 RUN python -m venv /opt/venvs/chandra && \
     /opt/venvs/chandra/bin/python -m pip install --upgrade pip "setuptools<82" wheel && \
     /opt/venvs/chandra/bin/python -m pip install \
+      --resume-retries 20 \
+      --timeout 60 \
       --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_FLAVOR}" \
       --upgrade --force-reinstall \
       "torch==${TORCH_VERSION}+${TORCH_CUDA_FLAVOR}" \

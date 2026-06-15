@@ -22,5 +22,15 @@ services:
       - ./.modelscope_cache:/cache/modelscope
       - ./outputs:/data/work
       - ./PDFs:/data/in
+    networks:
+      default:
+      zotero-automation:
+        aliases:
+          - surya-chandra-ocr-api
+          - ocr-api
     gpus: all
     restart: unless-stopped
+
+networks:
+  zotero-automation:
+    external: true

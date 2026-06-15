@@ -14,33 +14,35 @@ This is now the preferred integration path for external orchestrators such as
 `zotero-worker`, because long OCR runs can be observed through polling instead
 of one silent synchronous response.
 
-Current limitation: job state is stored in process memory. Result PDFs are
-written under the configured work root, but the job index and status metadata
-are lost if the HTTP service process or container restarts.
+Current status: the HTTP service now writes durable per-job metadata under
+`UNISCAN_WORK_ROOT/jobs/<job_id>/metadata.json`, appends progress events to
+`events.jsonl`, and keeps completed `result.pdf` files discoverable after
+restart. Active in-memory work cannot be resumed yet; `queued` or `running`
+jobs are restored as `interrupted`, which lets external orchestrators fail fast
+and retry from their own durable queues.
 
 ## Goal
 
 Make the async HTTP job API restart-tolerant enough for long OCR documents and
 external queue orchestrators.
 
-After implementation, an OCR API restart should not erase knowledge of jobs that
-were created before the restart. Completed results should remain discoverable,
-and interrupted running jobs should be reported explicitly instead of looking
-like unknown job IDs.
+An OCR API restart should not erase knowledge of jobs that were created before
+the restart. Completed results should remain discoverable, and interrupted
+running jobs should be reported explicitly instead of looking like unknown job
+IDs. This baseline is implemented; the remaining work is deeper metadata,
+cleanup, and long-document restart verification.
 
 ## Persistent Job Store
 
-Add a persistent job store under `UNISCAN_WORK_ROOT`, for example:
+Implemented baseline store under `UNISCAN_WORK_ROOT`, with this layout:
 
 ```text
-<work_root>/jobs.sqlite
-<work_root>/jobs/<job_id>/input.pdf
 <work_root>/jobs/<job_id>/result.pdf
 <work_root>/jobs/<job_id>/events.jsonl
 <work_root>/jobs/<job_id>/metadata.json
 ```
 
-The SQLite store should track:
+Future SQLite-backed scheduling can add:
 
 1. `job_id`
 2. `status`: `queued`, `running`, `done`, `error`, `interrupted`, `cancelled`
@@ -63,8 +65,9 @@ The SQLite store should track:
 19. `worker_pid` or process identity
 20. `heartbeat_at`
 
-Store request input bytes as `input.pdf` before returning `202 Accepted`, so a
-job has a durable record even if OCR starts later.
+Optional future work: store request input bytes as `input.pdf` before returning
+`202 Accepted`, so a job can be resumed by the OCR container itself instead of
+being retried by an external orchestrator.
 
 ## Result Metadata
 
@@ -173,4 +176,3 @@ Keep the initial implementation conservative:
 4. keep in-memory locks around job updates, but make SQLite the source of truth;
 5. avoid automatic concurrent OCR after restart until scheduling semantics are
    explicit and tested.
-

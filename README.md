@@ -236,12 +236,16 @@ curl "http://127.0.0.1:8000/api/jobs/<job_id>"
 curl -L "http://127.0.0.1:8000/api/jobs/<job_id>/result" -o output.searchable.pdf
 ```
 
-Durability roadmap:
+Durability:
 
-The async API currently keeps job state in memory. The planned hardening work is
-tracked in [docs/HTTP_JOB_DURABILITY_PLAN.md](docs/HTTP_JOB_DURABILITY_PLAN.md):
-persistent job store, result metadata, restart recovery, retention cleanup, and
-the long-document smoke test that should validate the behavior.
+The async API keeps durable job metadata under `UNISCAN_WORK_ROOT/jobs`.
+Each job directory contains `metadata.json`, `events.jsonl`, and, after
+completion, `result.pdf`. Completed results remain discoverable after a service
+restart. Jobs that were `queued` or `running` during a restart are marked
+`interrupted` instead of disappearing, so callers can fail fast and retry at the
+orchestrator layer. Remaining hardening work, such as retention cleanup and the
+long-document restart smoke test, is tracked in
+[docs/HTTP_JOB_DURABILITY_PLAN.md](docs/HTTP_JOB_DURABILITY_PLAN.md).
 
 ## Docker
 
