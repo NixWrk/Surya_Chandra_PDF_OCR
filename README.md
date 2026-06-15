@@ -236,6 +236,13 @@ curl "http://127.0.0.1:8000/api/jobs/<job_id>"
 curl -L "http://127.0.0.1:8000/api/jobs/<job_id>/result" -o output.searchable.pdf
 ```
 
+Durability roadmap:
+
+The async API currently keeps job state in memory. The planned hardening work is
+tracked in [docs/HTTP_JOB_DURABILITY_PLAN.md](docs/HTTP_JOB_DURABILITY_PLAN.md):
+persistent job store, result metadata, restart recovery, retention cleanup, and
+the long-document smoke test that should validate the behavior.
+
 ## Docker
 
 Docker is useful when you want a repeatable GPU runtime with persistent model caches.
