@@ -74,6 +74,8 @@ Completed baseline:
 4. Strict runtime behavior when caches or geometry sidecars are missing.
 5. English README, menu labels, GUI copy, and web UI copy.
 6. Human-readable troubleshooting for expected setup warnings.
+7. Durable async HTTP job metadata with restart-visible `done` and
+   `interrupted` states for external orchestrators.
 
 ## Last Verified Versions
 
@@ -233,6 +235,7 @@ curl -X POST "http://127.0.0.1:8000/api/jobs?mode=chandra+surya&lang=rus+eng&str
   --data-binary "@input.pdf"
 
 curl "http://127.0.0.1:8000/api/jobs/<job_id>"
+curl "http://127.0.0.1:8000/api/jobs/<job_id>/metadata"
 curl -L "http://127.0.0.1:8000/api/jobs/<job_id>/result" -o output.searchable.pdf
 ```
 
@@ -240,11 +243,14 @@ Durability:
 
 The async API keeps durable job metadata under `UNISCAN_WORK_ROOT/jobs`.
 Each job directory contains `metadata.json`, `events.jsonl`, and, after
-completion, `result.pdf`. Completed results remain discoverable after a service
-restart. Jobs that were `queued` or `running` during a restart are marked
-`interrupted` instead of disappearing, so callers can fail fast and retry at the
-orchestrator layer. Remaining hardening work, such as retention cleanup and the
-long-document restart smoke test, is tracked in
+completion, `result.pdf`. `GET /api/jobs/<job_id>` returns the current job
+summary, `GET /api/jobs/<job_id>/metadata` returns the persisted metadata file,
+and `GET /api/jobs/<job_id>/result` downloads the completed searchable PDF.
+Completed results remain discoverable after a service restart. Jobs that were
+`queued` or `running` during a restart are marked `interrupted` instead of
+disappearing, so callers can fail fast and retry at the orchestrator layer.
+Remaining hardening work, such as retention cleanup and the long-document
+restart smoke test, is tracked in
 [docs/HTTP_JOB_DURABILITY_PLAN.md](docs/HTTP_JOB_DURABILITY_PLAN.md).
 
 ## Docker
