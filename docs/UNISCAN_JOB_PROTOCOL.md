@@ -24,6 +24,7 @@ GET /api/jobs
 GET /api/jobs/<job_id>
 GET /api/jobs/<job_id>/metadata
 GET /api/jobs/<job_id>/result
+POST /api/jobs/<job_id>/cancel
 GET /health
 ```
 
@@ -34,7 +35,7 @@ scripts, but it is not the preferred boundary for containers or queues.
 
 The service accepts OCR jobs from multiple independent callers, or "employers",
 such as different projects, workers, containers, and manual tools. Accepted jobs
-share one OCR-owned FIFO queue.
+share one OCR-owned priority queue.
 
 The OCR worker concurrency is fixed at `1`: no more than one document is
 processed at a time. This is intentional because Chandra, Surya, and local LLM
@@ -42,8 +43,8 @@ work may contend for the same GPU memory. HTTP requests may arrive concurrently,
 but actual OCR execution is serialized by the service.
 
 `GET /api/jobs` exposes `worker_concurrency: 1` along with queue counts and
-active jobs. Callers should use `priority`, `gpu_policy`, and estimated resource
-metadata for scheduling decisions, but the current implementation does not
+active jobs. Waiting jobs are ordered by `priority` and creation time:
+`interactive`, then `normal`, then `batch`, then `low`. The service does not
 preempt a running OCR document.
 
 ## Create Job
@@ -64,8 +65,9 @@ X-Estimated-Pages: 42
 X-TTL-Seconds: 86400
 ```
 
-The request body is the raw PDF. The service persists job metadata before OCR
-processing starts.
+The request body is the raw PDF. The service persists `<job>/input.pdf`,
+`metadata.json`, `events.jsonl`, and a SQLite job index before returning
+`202 Accepted`.
 
 On the host machine, use `http://127.0.0.1:8000`. From a Docker container on the
 shared Compose network, use `http://surya-chandra-ocr-api:8000`.
@@ -149,6 +151,7 @@ New job response:
   "created_at": "2026-06-19T12:00:00+00:00",
   "updated_at": "2026-06-19T12:00:00+00:00",
   "input_bytes": 123456,
+  "input_path": "/data/work/jobs/4c60b5e7f1ad/input.pdf",
   "result_bytes": 0,
   "protocol_version": "uniscan-ocr-job.v1",
   "project_id": "zotero",
@@ -162,7 +165,8 @@ New job response:
   "estimated_pages": 42,
   "ttl_seconds": 86400,
   "input_sha256": "<sha256>",
-  "request_fingerprint": "<sha256>"
+  "request_fingerprint": "<sha256>",
+  "gpu_reservation_status": "reserve_ok"
 }
 ```
 
@@ -189,7 +193,20 @@ Completed jobs include:
 | `done` | Result PDF is ready. | Download `result_url`. |
 | `error` | OCR failed. | Decide whether to retry, downgrade mode, or mark manual review. |
 | `interrupted` | Service restarted before completion. | Resubmit from the caller's durable source queue. |
-| `cancelled` | Reserved future state. | Treat as terminal unless caller intentionally cancelled. |
+| `cancelled` | Queued job was cancelled before processing started. | Treat as terminal. |
+
+## Cancellation
+
+Queued jobs can be cancelled before OCR starts:
+
+```http
+POST /api/jobs/<job_id>/cancel
+```
+
+If the job is still `queued`, the response is `200 OK` and the job becomes
+`cancelled`. Running OCR jobs are not forcibly stopped; cancelling a `running`
+job returns `409 Conflict` because the current OCR pipeline is not
+cooperative-cancellable.
 
 ## Queue Summary
 
@@ -212,8 +229,57 @@ Completed jobs include:
 
 External schedulers can use this with the persisted `priority`, `gpu_policy`,
 `estimated_vram_gb`, and `estimated_pages` fields. The current implementation
-stores and exposes this metadata; stronger reservation and scheduling can be
-added later without changing the request contract.
+uses priority for waiting jobs and keeps execution serialized.
+
+## Durability And Retention
+
+Accepted jobs are stored under `UNISCAN_WORK_ROOT/jobs`:
+
+```text
+jobs/
+  jobs.sqlite3
+  <job_id>/
+    input.pdf
+    metadata.json
+    events.jsonl
+    result.pdf
+```
+
+On restart:
+
+1. `done` jobs with `result.pdf` stay discoverable.
+2. `queued` jobs with `input.pdf` are requeued automatically.
+3. `running` jobs are marked `interrupted`.
+4. `queued` jobs without `input.pdf` are marked `interrupted`.
+
+Retention cleanup is controlled by:
+
+```env
+UNISCAN_JOB_CLEANUP_ON_START=1
+UNISCAN_JOB_RETENTION_DAYS=30
+UNISCAN_FAILED_JOB_RETENTION_DAYS=90
+```
+
+Per-job `ttl_seconds` overrides the default retention window for terminal jobs.
+Cleanup never removes `queued` or `running` jobs.
+
+## GPU Reservation Hook
+
+If `UNISCAN_GPU_RESERVATION_URL` is set, the OCR worker sends JSON `reserve` and
+`release` requests around OCR processing for jobs whose `gpu_policy` is not
+`cpu` or `none`.
+
+```env
+UNISCAN_GPU_RESERVATION_URL=http://llm-orchestrator:8080/gpu/reservations
+UNISCAN_GPU_RESERVATION_REQUIRED=0
+UNISCAN_GPU_RESERVATION_TIMEOUT_MS=3000
+```
+
+The reserve payload includes `job_id`, caller metadata, `priority`,
+`gpu_policy`, `estimated_vram_gb`, `estimated_pages`, and OCR `mode`. A
+successful response may include `reservation_id`; if present, it is sent back on
+release. When `UNISCAN_GPU_RESERVATION_REQUIRED=1`, reservation failure marks
+the OCR job as `error`.
 
 ## Ownership Rules
 

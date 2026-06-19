@@ -107,6 +107,18 @@ This metadata is stored with `metadata.json` and surfaced through
 `GET /api/jobs` and `GET /api/queue` expose queue counts, active jobs, recent
 jobs, `worker_concurrency: 1`, and the same coarse GPU metadata for schedulers.
 
+The OCR service supports an optional reservation hook:
+
+```env
+UNISCAN_GPU_RESERVATION_URL=http://llm-orchestrator:8080/gpu/reservations
+UNISCAN_GPU_RESERVATION_REQUIRED=0
+UNISCAN_GPU_RESERVATION_TIMEOUT_MS=3000
+```
+
+When configured, OCR sends `reserve` before processing and `release` after
+processing. Without this URL, the OCR service still serializes its own jobs and
+exposes resource metadata for external schedulers.
+
 ## Elvis Projects Layout
 
 The expected local grouping is:
@@ -128,9 +140,9 @@ and should not vendor their runtime logic.
 
 ## Implementation Tasks
 
-1. Promote the current file-backed durable metadata into a SQLite-backed job
-   store when concurrent scheduling needs stronger guarantees.
-2. Add a long-document restart smoke test to prove status/result durability.
-3. Document project-level priority rules for OCR vs LLM work.
-4. Add actual GPU reservation handshakes once the LLM orchestrator exposes a
-   compatible reservation endpoint.
+1. Point `UNISCAN_GPU_RESERVATION_URL` at the real LLM orchestrator once its
+   reservation endpoint is available.
+2. Add a live cross-container smoke test that exercises OCR reserve/release
+   against that endpoint.
+3. Document project-level priority rules for conflicts outside OCR, such as
+   local LLM interactive sessions versus batch translation.

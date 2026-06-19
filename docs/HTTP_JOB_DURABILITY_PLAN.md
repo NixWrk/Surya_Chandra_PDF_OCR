@@ -17,18 +17,19 @@ of one silent synchronous response.
 For the cross-project OCR request shape and GPU coordination rules with the LLM
 orchestrator, see [OCR Orchestrator And GPU Contract](ORCHESTRATOR_GPU_CONTRACT.md).
 
-Current status: the HTTP service now writes durable per-job metadata under
-`UNISCAN_WORK_ROOT/jobs/<job_id>/metadata.json`, appends progress events to
-`events.jsonl`, and keeps completed `result.pdf` files discoverable after
-restart. Job metadata now includes the shared
+Current status: the HTTP service now writes durable per-job inputs and metadata
+under `UNISCAN_WORK_ROOT/jobs/<job_id>/`, appends progress events to
+`events.jsonl`, keeps a SQLite job index, and keeps completed `result.pdf` files
+discoverable after restart. Job metadata now includes the shared
 `uniscan-ocr-job.v1` protocol fields described in
 [UniScan OCR Job Protocol](UNISCAN_JOB_PROTOCOL.md), including caller identity,
 idempotency, priority, and coarse GPU estimates. `GET /api/jobs` exposes queue
 counts, active jobs, recent jobs, and `worker_concurrency: 1`. The service may
 accept jobs from multiple callers, but only one OCR document is processed at a
-time. Active in-memory work cannot be resumed yet; `queued` or `running` jobs
-are restored as `interrupted`, which lets external orchestrators fail fast and
-retry from their own durable queues.
+time. `queued` jobs with durable `input.pdf` are requeued after restart. Active
+in-memory `running` work cannot be resumed yet; running jobs are restored as
+`interrupted`, which lets external orchestrators fail fast and retry from their
+own durable queues.
 
 ## Goal
 
@@ -38,20 +39,26 @@ external queue orchestrators.
 An OCR API restart should not erase knowledge of jobs that were created before
 the restart. Completed results should remain discoverable, and interrupted
 running jobs should be reported explicitly instead of looking like unknown job
-IDs. This baseline is implemented; the remaining work is deeper metadata,
-cleanup, and long-document restart verification.
+IDs. This baseline is implemented.
 
 ## Persistent Job Store
 
 Implemented baseline store under `UNISCAN_WORK_ROOT`, with this layout:
 
 ```text
+<work_root>/jobs/jobs.sqlite3
+<work_root>/jobs/<job_id>/input.pdf
 <work_root>/jobs/<job_id>/result.pdf
 <work_root>/jobs/<job_id>/events.jsonl
 <work_root>/jobs/<job_id>/metadata.json
 ```
 
-Future SQLite-backed scheduling can add:
+The SQLite job index stores the serialized job record plus indexed status,
+idempotency key, priority, and timestamps. A future migration may make SQLite
+the only source of truth, but the current implementation intentionally keeps
+human-readable sidecars.
+
+The stored metadata includes:
 
 1. `job_id`
 2. `status`: `queued`, `running`, `done`, `error`, `interrupted`, `cancelled`
@@ -87,9 +94,8 @@ Future SQLite-backed scheduling can add:
 32. `input_sha256`
 33. `request_fingerprint`
 
-Optional future work: store request input bytes as `input.pdf` before returning
-`202 Accepted`, so a job can be resumed by the OCR container itself instead of
-being retried by an external orchestrator.
+Inputs are stored as `input.pdf` before returning `202 Accepted`, so queued jobs
+can be resumed by the OCR container itself.
 
 ## Result Metadata
 
@@ -114,14 +120,14 @@ On service startup:
 1. open or migrate the persistent store;
 2. scan jobs that were `queued` or `running`;
 3. if `result.pdf` exists, mark the job `done`;
-4. if no result exists, mark previously `running` jobs as `interrupted`;
-5. leave `queued` jobs queued only if a future worker loop will actually pick
-   them up automatically;
-6. keep completed result metadata available until retention cleanup removes it.
+4. requeue `queued` jobs when `input.pdf` exists;
+5. mark `queued` jobs without `input.pdf` as `interrupted`;
+6. mark previously `running` jobs as `interrupted`;
+7. keep completed result metadata available until retention cleanup removes it.
 
-The first implementation may choose not to resume interrupted OCR automatically.
-It is enough to report `interrupted` clearly so the external orchestrator can
-retry the source document.
+The service does not resume a partially running OCR process. It reports
+`interrupted` clearly so the external orchestrator can retry the source
+document.
 
 ## API Changes
 
@@ -158,9 +164,15 @@ GET /api/jobs
 GET /api/queue
 ```
 
+Implemented cancellation endpoint:
+
+```http
+POST /api/jobs/<job_id>/cancel
+```
+
 ## Retention And Cleanup
 
-Add retention controls so the work root does not grow forever:
+Retention controls keep the work root from growing forever:
 
 ```env
 UNISCAN_JOB_RETENTION_DAYS=30
@@ -168,9 +180,9 @@ UNISCAN_FAILED_JOB_RETENTION_DAYS=90
 UNISCAN_JOB_CLEANUP_ON_START=1
 ```
 
-Cleanup must never remove a currently `running` job. Completed result cleanup
-should remove both database rows and job directory files in one transaction-like
-operation where possible.
+Cleanup never removes `queued` or `running` jobs. Terminal job cleanup removes
+the job directory and the SQLite index row. Per-job `ttl_seconds` overrides the
+default retention windows.
 
 ## Verification Plan
 
@@ -190,21 +202,22 @@ Manual long-document smoke test:
 
 Automated tests:
 
-1. creating a job persists a row and input file before OCR starts;
-2. progress updates survive a store reload;
+1. creating a job persists a SQLite row and input file before OCR starts;
+2. queued jobs with input survive a store reload and are requeueable;
 3. completed result metadata survives a service restart;
 4. running jobs are recovered as `interrupted`;
-5. missing result files for `done` jobs are reported as a clear server-side
-   consistency error;
-6. retention cleanup preserves active jobs and removes expired jobs.
+5. waiting jobs are priority-ordered without preempting running work;
+6. queued jobs can be cancelled before processing starts;
+7. retention cleanup preserves active jobs and removes expired jobs;
+8. GPU reserve/release hooks preserve reservation metadata.
 
 ## Implementation Notes
 
-Keep the initial implementation conservative:
+Implementation remains conservative:
 
-1. introduce a small `JobStore` module instead of growing `web/service.py`;
+1. move `JobStore` to its own module if `web/service.py` grows further;
 2. use SQLite from the standard library;
 3. use atomic writes for `metadata.json` and `events.jsonl` appends;
-4. keep in-memory locks around job updates, but make SQLite the source of truth;
-5. keep OCR execution serialized unless a future GPU reservation layer provides
-   explicit, tested multi-document scheduling.
+4. keep in-memory locks around job updates and mirror updates into SQLite;
+5. keep OCR execution serialized unless a future scheduler proves explicit,
+   tested multi-document GPU scheduling is safe.

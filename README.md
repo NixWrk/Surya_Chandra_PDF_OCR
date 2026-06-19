@@ -254,6 +254,7 @@ curl "http://127.0.0.1:8000/api/jobs"
 curl "http://127.0.0.1:8000/api/jobs/<job_id>"
 curl "http://127.0.0.1:8000/api/jobs/<job_id>/metadata"
 curl -L "http://127.0.0.1:8000/api/jobs/<job_id>/result" -o output.searchable.pdf
+curl -X POST "http://127.0.0.1:8000/api/jobs/<job_id>/cancel"
 ```
 
 `X-Idempotency-Key` is the safe retry key. Repeating the exact same PDF and OCR
@@ -266,23 +267,35 @@ Queue model:
 The async API accepts jobs from multiple projects, workers, containers, and
 manual tools, but the OCR service runs exactly one OCR document at a time.
 `GET /api/jobs` reports `worker_concurrency: 1` with queue counts and active
-jobs. This keeps Chandra/Surya GPU use predictable while still allowing many
-callers to submit work safely.
+jobs. Waiting jobs are ordered by priority (`interactive`, `normal`, `batch`,
+`low`) and creation time; a running document is not preempted. This keeps
+Chandra/Surya GPU use predictable while still allowing many callers to submit
+work safely.
 
 Durability:
 
 The async API keeps durable job metadata under `UNISCAN_WORK_ROOT/jobs`.
-Each job directory contains `metadata.json`, `events.jsonl`, and, after
-completion, `result.pdf`. `GET /api/jobs` returns queue counts plus active and
-recent jobs, `GET /api/jobs/<job_id>` returns the current job summary,
+Each job directory contains `input.pdf`, `metadata.json`, `events.jsonl`, and,
+after completion, `result.pdf`; `jobs.sqlite3` keeps a service-owned job index.
+`GET /api/jobs` returns queue counts plus active and recent jobs,
+`GET /api/jobs/<job_id>` returns the current job summary,
 `GET /api/jobs/<job_id>/metadata` returns the persisted metadata file, and
 `GET /api/jobs/<job_id>/result` downloads the completed searchable PDF.
 Completed results remain discoverable after a service restart. Jobs that were
-`queued` or `running` during a restart are marked `interrupted` instead of
-disappearing, so callers can fail fast and retry at the orchestrator layer.
-Remaining hardening work, such as retention cleanup and the long-document
-restart smoke test, is tracked in
-[docs/HTTP_JOB_DURABILITY_PLAN.md](docs/HTTP_JOB_DURABILITY_PLAN.md).
+`queued` during a restart are requeued if `input.pdf` exists. Jobs that were
+`running` during a restart are marked `interrupted`, so callers can retry from
+their own durable source queue if needed.
+
+Retention cleanup can be enabled with:
+
+```env
+UNISCAN_JOB_CLEANUP_ON_START=1
+UNISCAN_JOB_RETENTION_DAYS=30
+UNISCAN_FAILED_JOB_RETENTION_DAYS=90
+```
+
+Optional GPU reservation hooks for an external LLM/GPU orchestrator are
+documented in [UniScan OCR Job Protocol](docs/UNISCAN_JOB_PROTOCOL.md).
 
 ## Docker
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import sqlite3
 import threading
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
@@ -19,6 +20,8 @@ from uniscan.web.service import (
     _parse_protocol_metadata,
     _query_bool,
     _request_fingerprint,
+    _release_gpu_for_job,
+    _reserve_gpu_for_job,
 )
 
 
@@ -198,6 +201,37 @@ def test_job_store_marks_active_jobs_interrupted_after_restart(tmp_path: Path) -
     assert metadata["finished_at"]
 
 
+def test_job_store_keeps_queued_job_with_input_requeueable_after_restart(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    input_path = store.write_input("JOBQ", b"%PDF queued")
+    store.create(
+        _JobState(
+            job_id="JOBQ",
+            status="queued",
+            progress=0,
+            message="Queued",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=len(b"%PDF queued"),
+            input_path=input_path,
+        )
+    )
+
+    reloaded = _JobStore(root)
+    metadata = reloaded.metadata("JOBQ")
+    requeueable = reloaded.requeueable_jobs()
+
+    assert metadata is not None
+    assert metadata["status"] == "queued"
+    assert metadata["input_path"] == str(input_path)
+    assert [job.job_id for job in requeueable] == ["JOBQ"]
+
+
 def test_job_store_summary_reports_counts_and_active_jobs(tmp_path: Path) -> None:
     root = tmp_path / "jobs"
     store = _JobStore(root)
@@ -225,6 +259,128 @@ def test_job_store_summary_reports_counts_and_active_jobs(tmp_path: Path) -> Non
     assert summary["worker_concurrency"] == UNISCAN_OCR_WORKER_CONCURRENCY
     assert summary["active_jobs"][0]["job_id"] == "JOB3"
     assert summary["active_jobs"][0]["priority"] == "interactive"
+
+
+def test_job_store_writes_sqlite_index(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    store.create(
+        _JobState(
+            job_id="JOBSQL",
+            status="queued",
+            progress=0,
+            message="Queued",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+            idempotency_key="jobsql:v1",
+            priority="batch",
+        )
+    )
+
+    with sqlite3.connect(root / "jobs.sqlite3") as conn:
+        row = conn.execute(
+            "SELECT status, idempotency_key, priority, metadata_json FROM jobs WHERE job_id = ?",
+            ("JOBSQL",),
+        ).fetchone()
+
+    assert row is not None
+    assert row[0] == "queued"
+    assert row[1] == "jobsql:v1"
+    assert row[2] == "batch"
+    assert json.loads(row[3])["job_id"] == "JOBSQL"
+
+
+def test_job_store_cleanup_expired_removes_terminal_jobs_only(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("UNISCAN_JOB_RETENTION_DAYS", "0")
+    monkeypatch.setenv("UNISCAN_FAILED_JOB_RETENTION_DAYS", "0")
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    old_time = "2026-01-01T00:00:00+00:00"
+    for job_id, status in (("DONE", "done"), ("ERR", "error"), ("ACTIVE", "queued")):
+        input_path = store.write_input(job_id, f"%PDF {job_id}".encode("ascii"))
+        store.create(
+            _JobState(
+                job_id=job_id,
+                status=status,
+                progress=100 if status != "queued" else 0,
+                message=status,
+                mode="chandra+surya",
+                pages="",
+                lang="rus+eng",
+                strict=True,
+                delete_original_text_layer=True,
+                filename="input.pdf",
+                input_bytes=10,
+                input_path=input_path,
+                created_at=old_time,
+                updated_at=old_time,
+                finished_at=old_time if status != "queued" else None,
+            )
+        )
+
+    result = store.cleanup_expired()
+
+    assert result["removed_count"] == 2
+    assert set(result["removed"]) == {"DONE", "ERR"}
+    assert store.metadata("DONE") is None
+    assert store.metadata("ERR") is None
+    assert store.metadata("ACTIVE") is not None
+    assert not (root / "DONE").exists()
+    assert not (root / "ERR").exists()
+    assert (root / "ACTIVE").exists()
+
+
+def test_gpu_reservation_hook_reserves_and_releases(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    store.create(
+        _JobState(
+            job_id="GPU1",
+            status="running",
+            progress=1,
+            message="Starting",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+            project_id="zotero",
+            service_id="worker",
+            task_id="task-1",
+            priority="interactive",
+            gpu_policy="auto",
+            estimated_vram_gb=8,
+        )
+    )
+    calls: list[dict] = []
+
+    def fake_post(payload):
+        calls.append(payload)
+        if payload["action"] == "reserve":
+            return {"ok": True, "reservation_id": "RES1"}
+        return {"ok": True}
+
+    monkeypatch.setenv("UNISCAN_GPU_RESERVATION_URL", "http://gpu.local/reservations")
+    monkeypatch.setattr("uniscan.web.service._post_gpu_reservation", fake_post)
+
+    reservation_id = _reserve_gpu_for_job(store, "GPU1")
+    _release_gpu_for_job(store, "GPU1", reservation_id)
+    metadata = store.metadata("GPU1")
+
+    assert reservation_id == "RES1"
+    assert [call["action"] for call in calls] == ["reserve", "release"]
+    assert calls[0]["estimated_vram_gb"] == 8
+    assert calls[1]["reservation_id"] == "RES1"
+    assert metadata is not None
+    assert metadata["gpu_reservation_id"] == "RES1"
+    assert metadata["gpu_reservation_status"] == "released"
 
 
 def test_http_jobs_are_processed_one_document_at_a_time(tmp_path: Path, monkeypatch) -> None:
@@ -329,6 +485,236 @@ def test_http_jobs_are_processed_one_document_at_a_time(tmp_path: Path, monkeypa
         assert second_started.wait(timeout=2)
         with lock:
             assert max_active == 1
+    finally:
+        release_first.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_job_persists_input_pdf_before_accepting(tmp_path: Path, monkeypatch) -> None:
+    result_pdf = tmp_path / "result.pdf"
+    result_pdf.write_bytes(b"%PDF result")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    def fake_build_searchable_pdf(**_kwargs):
+        return SimpleNamespace(output_pdf_path=result_pdf, run_dir=run_dir)
+
+    monkeypatch.setattr("uniscan.web.service.build_searchable_pdf", fake_build_searchable_pdf)
+    handler = _build_handler(work_root=tmp_path / "work", default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        port = server.server_address[1]
+        body = b"%PDF durable input"
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request(
+            "POST",
+            "/api/jobs?filename=input.pdf",
+            body=body,
+            headers={"Content-Type": "application/pdf", "X-Idempotency-Key": "input:v1"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+        input_path = tmp_path / "work" / "jobs" / payload["job_id"] / "input.pdf"
+        metadata_path = tmp_path / "work" / "jobs" / payload["job_id"] / "metadata.json"
+
+        assert response.status == HTTPStatus.ACCEPTED
+        assert input_path.read_bytes() == body
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        assert metadata["input_path"] == str(input_path.resolve())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_startup_requeues_persisted_queued_job(tmp_path: Path, monkeypatch) -> None:
+    work_root = tmp_path / "work"
+    jobs_root = work_root / "jobs"
+    store = _JobStore(jobs_root)
+    input_path = store.write_input("RESTORE1", b"%PDF restore")
+    store.create(
+        _JobState(
+            job_id="RESTORE1",
+            status="queued",
+            progress=0,
+            message="Queued",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=len(b"%PDF restore"),
+            input_path=input_path,
+        )
+    )
+    result_pdf = tmp_path / "result.pdf"
+    result_pdf.write_bytes(b"%PDF result")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    started = threading.Event()
+    seen_pdf_path: list[Path] = []
+
+    def fake_build_searchable_pdf(**kwargs):
+        seen_pdf_path.append(Path(kwargs["pdf_path"]))
+        started.set()
+        return SimpleNamespace(output_pdf_path=result_pdf, run_dir=run_dir)
+
+    monkeypatch.setattr("uniscan.web.service.build_searchable_pdf", fake_build_searchable_pdf)
+    handler = _build_handler(work_root=work_root, default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        assert started.wait(timeout=2)
+        assert seen_pdf_path == [input_path]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_priority_orders_waiting_jobs(tmp_path: Path, monkeypatch) -> None:
+    result_pdf = tmp_path / "result.pdf"
+    result_pdf.write_bytes(b"%PDF result")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    processed: list[str] = []
+    processed_lock = threading.Lock()
+
+    def fake_build_searchable_pdf(**kwargs):
+        job_id = Path(kwargs["pdf_path"]).parent.name
+        with processed_lock:
+            processed.append(job_id)
+            call_index = len(processed)
+        if call_index == 1:
+            first_started.set()
+            if not release_first.wait(timeout=5):
+                raise RuntimeError("Timed out waiting to release first OCR job.")
+        return SimpleNamespace(output_pdf_path=result_pdf, run_dir=run_dir)
+
+    monkeypatch.setattr("uniscan.web.service.build_searchable_pdf", fake_build_searchable_pdf)
+    handler = _build_handler(work_root=tmp_path / "work", default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def submit(filename: str, priority: str) -> str:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        conn.request(
+            "POST",
+            f"/api/jobs?filename={filename}",
+            body=f"%PDF {filename}".encode("ascii"),
+            headers={"Content-Type": "application/pdf", "X-Priority": priority},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+        assert response.status == HTTPStatus.ACCEPTED
+        return str(payload["job_id"])
+
+    try:
+        first_id = submit("first.pdf", "normal")
+        assert first_started.wait(timeout=2)
+        low_id = submit("low.pdf", "low")
+        interactive_id = submit("interactive.pdf", "interactive")
+
+        release_first.set()
+        deadline = threading.Event()
+        for _ in range(20):
+            with processed_lock:
+                if len(processed) >= 3:
+                    break
+            deadline.wait(timeout=0.05)
+
+        with processed_lock:
+            assert processed[:3] == [first_id, interactive_id, low_id]
+    finally:
+        release_first.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_cancel_queued_job(tmp_path: Path, monkeypatch) -> None:
+    result_pdf = tmp_path / "result.pdf"
+    result_pdf.write_bytes(b"%PDF result")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    call_count = 0
+    lock = threading.Lock()
+
+    def fake_build_searchable_pdf(**_kwargs):
+        nonlocal call_count
+        with lock:
+            call_count += 1
+            call_index = call_count
+        if call_index == 1:
+            first_started.set()
+            if not release_first.wait(timeout=5):
+                raise RuntimeError("Timed out waiting to release first OCR job.")
+        elif call_index == 2:
+            second_started.set()
+        return SimpleNamespace(output_pdf_path=result_pdf, run_dir=run_dir)
+
+    monkeypatch.setattr("uniscan.web.service.build_searchable_pdf", fake_build_searchable_pdf)
+    handler = _build_handler(work_root=tmp_path / "work", default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def submit(filename: str) -> str:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        conn.request(
+            "POST",
+            f"/api/jobs?filename={filename}",
+            body=f"%PDF {filename}".encode("ascii"),
+            headers={"Content-Type": "application/pdf"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+        assert response.status == HTTPStatus.ACCEPTED
+        return str(payload["job_id"])
+
+    try:
+        submit("first.pdf")
+        assert first_started.wait(timeout=2)
+        second_id = submit("second.pdf")
+
+        cancel_conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        cancel_conn.request("POST", f"/api/jobs/{second_id}/cancel")
+        cancel_response = cancel_conn.getresponse()
+        cancel_payload = json.loads(cancel_response.read().decode("utf-8"))
+        cancel_conn.close()
+
+        assert cancel_response.status == HTTPStatus.OK
+        assert cancel_payload["status"] == "cancelled"
+
+        release_first.set()
+        assert not second_started.wait(timeout=0.3)
+
+        status_conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        status_conn.request("GET", f"/api/jobs/{second_id}")
+        status_response = status_conn.getresponse()
+        status_payload = json.loads(status_response.read().decode("utf-8"))
+        status_conn.close()
+
+        assert status_response.status == HTTPStatus.OK
+        assert status_payload["status"] == "cancelled"
     finally:
         release_first.set()
         server.shutdown()

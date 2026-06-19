@@ -6,10 +6,14 @@ import json
 import hashlib
 import queue
 import shutil
+import sqlite3
 import threading
+import urllib.error
+import urllib.request
+import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,8 +34,10 @@ UNISCAN_OCR_WORKER_CONCURRENCY = 1
 
 _DEFAULT_PRIORITY = "normal"
 _KNOWN_PRIORITIES = {"interactive", "normal", "batch", "low"}
+_PRIORITY_RANK = {"interactive": 0, "normal": 10, "batch": 20, "low": 30}
 _DEFAULT_GPU_POLICY = "auto"
 _KNOWN_GPU_POLICIES = {"auto", "cuda", "cpu", "none"}
+_TERMINAL_JOB_STATUSES = {"done", "error", "interrupted", "cancelled"}
 
 
 def _utc_now() -> str:
@@ -54,6 +60,7 @@ class _JobState:
     updated_at: str = field(default_factory=_utc_now)
     input_bytes: int = 0
     result_bytes: int = 0
+    input_path: Path | None = None
     completed_at: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
@@ -74,6 +81,8 @@ class _JobState:
     ttl_seconds: int | None = None
     input_sha256: str | None = None
     request_fingerprint: str | None = None
+    gpu_reservation_id: str | None = None
+    gpu_reservation_status: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -94,7 +103,7 @@ class _ProtocolMetadata:
 @dataclass(slots=True, frozen=True)
 class _QueuedJob:
     job_id: str
-    payload: bytes
+    input_path: Path
     mode: str
     pages_raw: str
     lang: str
@@ -109,14 +118,20 @@ class _JobStore:
     def __init__(self, jobs_root: Path):
         self.jobs_root = jobs_root
         self.jobs_root.mkdir(parents=True, exist_ok=True)
+        self.db_path = self.jobs_root / "jobs.sqlite3"
         self._jobs: dict[str, _JobState] = {}
         self._lock = threading.Lock()
+        self._db_lock = threading.Lock()
+        self._init_db()
         self._load_existing_jobs()
+        if _env_bool("UNISCAN_JOB_CLEANUP_ON_START", default=False):
+            self.cleanup_expired()
 
     def create(self, job: _JobState) -> None:
         with self._lock:
             self._jobs[job.job_id] = job
             self._write_metadata_locked(job)
+            self._upsert_sqlite_locked(job)
             self._append_event_locked(
                 job,
                 "created",
@@ -155,9 +170,36 @@ class _JobStore:
                 setattr(job, key, value)
             job.updated_at = _utc_now()
             self._write_metadata_locked(job)
+            self._upsert_sqlite_locked(job)
             if event:
                 self._append_event_locked(job, event, message or event, metadata or updates)
             return job
+
+    def cancel(self, job_id: str) -> tuple[_JobState | None, bool, str | None]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None, False, f"Job not found: {job_id}"
+            if job.status == "queued":
+                now = _utc_now()
+                job.status = "cancelled"
+                job.progress = 100
+                job.message = "Cancelled"
+                job.finished_at = now
+                job.heartbeat_at = now
+                job.updated_at = now
+                self._write_metadata_locked(job)
+                self._upsert_sqlite_locked(job)
+                self._append_event_locked(
+                    job,
+                    "cancelled",
+                    "OCR job was cancelled before processing started.",
+                    {"status": job.status},
+                )
+                return job, True, None
+            if job.status == "running":
+                return job, False, "Running OCR jobs cannot be cancelled safely yet."
+            return job, False, f"Job is already terminal: {job.status}"
 
     def metadata(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -167,6 +209,8 @@ class _JobStore:
             payload = _serialize_job(job)
             payload["metadata_path"] = str(self._metadata_path(job.job_id))
             payload["events_path"] = str(self._events_path(job.job_id))
+            if job.input_path is not None:
+                payload["input_path"] = str(job.input_path)
             if job.result_path is not None:
                 payload["result_path"] = str(job.result_path)
             return payload
@@ -182,6 +226,7 @@ class _JobStore:
                 "jobs": len(self._jobs),
                 "counts": counts,
                 "durable": True,
+                "sqlite_path": str(self.db_path),
                 "worker_concurrency": UNISCAN_OCR_WORKER_CONCURRENCY,
             }
 
@@ -197,11 +242,52 @@ class _JobStore:
                 "ok": True,
                 "protocol_version": UNISCAN_JOB_PROTOCOL_VERSION,
                 "root": str(self.jobs_root),
+                "sqlite_path": str(self.db_path),
                 "jobs": len(jobs),
                 "counts": counts,
                 "worker_concurrency": UNISCAN_OCR_WORKER_CONCURRENCY,
                 "active_jobs": [_serialize_job(job) for job in active_jobs],
                 "recent_jobs": [_serialize_job(job) for job in recent_jobs],
+            }
+
+    def write_input(self, job_id: str, payload: bytes) -> Path:
+        input_path = self._input_path(job_id)
+        _atomic_write_bytes(input_path, payload)
+        return input_path.resolve()
+
+    def requeueable_jobs(self) -> list[_JobState]:
+        with self._lock:
+            return [
+                job
+                for job in sorted(self._jobs.values(), key=_job_queue_sort_key)
+                if job.status == "queued"
+                and job.input_path is not None
+                and Path(job.input_path).exists()
+            ]
+
+    def cleanup_expired(self, *, now: datetime | None = None) -> dict[str, Any]:
+        current = now or datetime.now(timezone.utc)
+        removed: list[str] = []
+        skipped_active: list[str] = []
+        with self._lock:
+            for job_id, job in list(self._jobs.items()):
+                if job.status in _ACTIVE_JOB_STATUSES:
+                    skipped_active.append(job_id)
+                    continue
+                if job.status not in _TERMINAL_JOB_STATUSES:
+                    continue
+                if not _job_expired(job, now=current):
+                    continue
+                job_dir = self._job_dir(job_id)
+                if _safe_remove_job_dir(root=self.jobs_root, target=job_dir):
+                    removed.append(job_id)
+                    self._jobs.pop(job_id, None)
+                    self._delete_sqlite_locked(job_id)
+            return {
+                "ok": True,
+                "removed": removed,
+                "removed_count": len(removed),
+                "skipped_active": skipped_active,
             }
 
     def _load_existing_jobs(self) -> None:
@@ -213,6 +299,9 @@ class _JobStore:
                 continue
 
             result_candidate = metadata_path.parent / "result.pdf"
+            input_candidate = metadata_path.parent / "input.pdf"
+            if job.input_path is None and input_candidate.exists():
+                job.input_path = input_candidate.resolve()
             if job.result_path is None and result_candidate.exists():
                 job.result_path = result_candidate.resolve()
             if job.result_path is not None and Path(job.result_path).exists():
@@ -225,6 +314,12 @@ class _JobStore:
                     job.completed_at = job.completed_at or _utc_now()
                     job.finished_at = job.finished_at or job.completed_at
                     job.heartbeat_at = job.heartbeat_at or job.completed_at
+            elif job.status == "queued" and job.input_path is not None and Path(job.input_path).exists():
+                job.progress = 0
+                job.message = "Recovered queued OCR job."
+                job.started_at = None
+                job.finished_at = None
+                job.heartbeat_at = None
             elif job.status in _ACTIVE_JOB_STATUSES:
                 interrupted_at = _utc_now()
                 job.status = "interrupted"
@@ -235,9 +330,13 @@ class _JobStore:
             job.updated_at = _utc_now()
             self._jobs[job.job_id] = job
             self._write_metadata_locked(job)
+            self._upsert_sqlite_locked(job)
 
     def _job_dir(self, job_id: str) -> Path:
         return self.jobs_root / job_id
+
+    def _input_path(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / "input.pdf"
 
     def _metadata_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / "metadata.json"
@@ -249,6 +348,66 @@ class _JobStore:
         job_dir = self._job_dir(job.job_id)
         job_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(self._metadata_path(job.job_id), _serialize_job(job))
+
+    def _init_db(self) -> None:
+        with self._connect_db() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    priority TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_idempotency_key ON jobs(idempotency_key)"
+            )
+
+    def _connect_db(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _upsert_sqlite_locked(self, job: _JobState) -> None:
+        payload = json.dumps(_serialize_job(job), ensure_ascii=False, sort_keys=True)
+        with self._db_lock, self._connect_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO jobs (
+                    job_id, status, idempotency_key, priority,
+                    created_at, updated_at, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    status=excluded.status,
+                    idempotency_key=excluded.idempotency_key,
+                    priority=excluded.priority,
+                    created_at=excluded.created_at,
+                    updated_at=excluded.updated_at,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    job.job_id,
+                    job.status,
+                    job.idempotency_key,
+                    job.priority,
+                    job.created_at,
+                    job.updated_at,
+                    payload,
+                ),
+            )
+
+    def _delete_sqlite_locked(self, job_id: str) -> None:
+        with self._db_lock, self._connect_db() as conn:
+            conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
 
     def _append_event_locked(
         self,
@@ -304,6 +463,8 @@ def _serialize_job(job: _JobState) -> dict[str, Any]:
         payload["run_dir"] = job.run_dir
     if job.error:
         payload["error"] = job.error
+    if job.input_path is not None:
+        payload["input_path"] = str(job.input_path)
     if job.request_id:
         payload["request_id"] = job.request_id
     if job.project_id:
@@ -324,6 +485,10 @@ def _serialize_job(job: _JobState) -> dict[str, Any]:
         payload["input_sha256"] = job.input_sha256
     if job.request_fingerprint:
         payload["request_fingerprint"] = job.request_fingerprint
+    if job.gpu_reservation_id:
+        payload["gpu_reservation_id"] = job.gpu_reservation_id
+    if job.gpu_reservation_status:
+        payload["gpu_reservation_status"] = job.gpu_reservation_status
     if job.result_path is not None:
         payload["result_path"] = str(job.result_path)
     if job.result_path is not None and job.result_path.exists() and job.status == "done":
@@ -334,6 +499,7 @@ def _serialize_job(job: _JobState) -> dict[str, Any]:
 
 def _job_from_metadata(payload: dict[str, Any]) -> _JobState:
     result_path_raw = payload.get("result_path")
+    input_path_raw = payload.get("input_path")
     return _JobState(
         job_id=str(payload["job_id"]),
         status=str(payload.get("status") or "interrupted"),
@@ -358,6 +524,7 @@ def _job_from_metadata(payload: dict[str, Any]) -> _JobState:
         finished_at=str(payload["finished_at"]) if payload.get("finished_at") else None,
         heartbeat_at=str(payload["heartbeat_at"]) if payload.get("heartbeat_at") else None,
         run_dir=str(payload["run_dir"]) if payload.get("run_dir") else None,
+        input_path=Path(str(input_path_raw)) if input_path_raw else None,
         result_path=Path(str(result_path_raw)) if result_path_raw else None,
         error=str(payload["error"]) if payload.get("error") else None,
         protocol_version=str(payload.get("protocol_version") or UNISCAN_JOB_PROTOCOL_VERSION),
@@ -381,6 +548,14 @@ def _job_from_metadata(payload: dict[str, Any]) -> _JobState:
         request_fingerprint=(
             str(payload["request_fingerprint"]) if payload.get("request_fingerprint") else None
         ),
+        gpu_reservation_id=(
+            str(payload["gpu_reservation_id"]) if payload.get("gpu_reservation_id") else None
+        ),
+        gpu_reservation_status=(
+            str(payload["gpu_reservation_status"])
+            if payload.get("gpu_reservation_status")
+            else None
+        ),
     )
 
 
@@ -394,6 +569,13 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp_path.replace(path)
 
 
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_bytes(payload)
+    tmp_path.replace(path)
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -402,6 +584,74 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return _query_bool(raw, default=default)
+
+
+def _env_int(name: str, *, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _priority_rank(priority: str | None) -> int:
+    return _PRIORITY_RANK.get((priority or _DEFAULT_PRIORITY).strip().lower(), 10)
+
+
+def _job_queue_sort_key(job: _JobState) -> tuple[int, str, str]:
+    return (_priority_rank(job.priority), job.created_at, job.job_id)
+
+
+def _parse_datetime(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _job_expired(job: _JobState, *, now: datetime) -> bool:
+    if job.status not in _TERMINAL_JOB_STATUSES:
+        return False
+    reference = (
+        _parse_datetime(job.finished_at)
+        or _parse_datetime(job.completed_at)
+        or _parse_datetime(job.updated_at)
+        or _parse_datetime(job.created_at)
+    )
+    if reference is None:
+        return False
+    if job.ttl_seconds is not None:
+        return now >= reference + timedelta(seconds=max(0, int(job.ttl_seconds)))
+    if job.status == "done":
+        days = _env_int("UNISCAN_JOB_RETENTION_DAYS", default=30)
+    else:
+        days = _env_int("UNISCAN_FAILED_JOB_RETENTION_DAYS", default=90)
+    return now >= reference + timedelta(days=max(0, days))
+
+
+def _safe_remove_job_dir(*, root: Path, target: Path) -> bool:
+    resolved_root = root.resolve()
+    resolved_target = target.resolve()
+    if resolved_target == resolved_root or resolved_root not in resolved_target.parents:
+        return False
+    if not resolved_target.exists():
+        return True
+    shutil.rmtree(resolved_target)
+    return True
 
 
 def _first_query_value(query: dict[str, list[str]], *names: str) -> str | None:
@@ -639,6 +889,135 @@ def _request_fingerprint(
     }
     body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _gpu_reservation_enabled_for(job: _JobState) -> bool:
+    if job.gpu_policy in {"cpu", "none"}:
+        return False
+    return bool((os.environ.get("UNISCAN_GPU_RESERVATION_URL") or "").strip())
+
+
+def _gpu_reservation_payload(
+    *,
+    action: str,
+    job: _JobState,
+    reservation_id: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "action": action,
+        "protocol_version": UNISCAN_JOB_PROTOCOL_VERSION,
+        "job_id": job.job_id,
+        "project_id": job.project_id,
+        "service_id": job.service_id,
+        "task_id": job.task_id,
+        "request_id": job.request_id,
+        "priority": job.priority,
+        "gpu_policy": job.gpu_policy,
+        "estimated_vram_gb": job.estimated_vram_gb,
+        "estimated_pages": job.estimated_pages,
+        "mode": job.mode,
+    }
+    if reservation_id:
+        payload["reservation_id"] = reservation_id
+    return payload
+
+
+def _post_gpu_reservation(payload: dict[str, Any]) -> dict[str, Any]:
+    url = (os.environ.get("UNISCAN_GPU_RESERVATION_URL") or "").strip()
+    if not url:
+        return {"ok": True, "skipped": True}
+    timeout_ms = _env_int("UNISCAN_GPU_RESERVATION_TIMEOUT_MS", default=3000)
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(0.1, timeout_ms / 1000.0)) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            if not body.strip():
+                return {"ok": True}
+            parsed = json.loads(body)
+            if not isinstance(parsed, dict):
+                return {"ok": True, "response": parsed}
+            return parsed
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GPU reservation {payload.get('action')} failed: HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"GPU reservation {payload.get('action')} failed: {exc}") from exc
+
+
+def _reserve_gpu_for_job(job_store: _JobStore, job_id: str) -> str | None:
+    job = job_store.get(job_id)
+    if job is None or not _gpu_reservation_enabled_for(job):
+        return None
+    required = _env_bool("UNISCAN_GPU_RESERVATION_REQUIRED", default=False)
+    try:
+        response = _post_gpu_reservation(_gpu_reservation_payload(action="reserve", job=job))
+    except Exception as exc:
+        job_store.update(
+            job_id,
+            {"gpu_reservation_status": f"reserve_failed: {exc}"},
+            event="gpu_reservation_failed",
+            message="GPU reservation failed.",
+        )
+        if required:
+            raise
+        return None
+    if response.get("ok") is False:
+        detail = response.get("error") or response.get("message") or "reservation denied"
+        job_store.update(
+            job_id,
+            {"gpu_reservation_status": f"reserve_denied: {detail}"},
+            event="gpu_reservation_denied",
+            message=str(detail),
+        )
+        if required:
+            raise RuntimeError(f"GPU reservation denied: {detail}")
+        return None
+    reservation_id = str(response.get("reservation_id") or "").strip() or None
+    job_store.update(
+        job_id,
+        {
+            "gpu_reservation_id": reservation_id,
+            "gpu_reservation_status": "reserved" if reservation_id else "reserve_ok",
+        },
+        event="gpu_reserved",
+        message="GPU reservation accepted.",
+    )
+    return reservation_id
+
+
+def _release_gpu_for_job(
+    job_store: _JobStore,
+    job_id: str,
+    reservation_id: str | None,
+) -> None:
+    job = job_store.get(job_id)
+    if job is None or not _gpu_reservation_enabled_for(job):
+        return
+    if reservation_id is None and job.gpu_reservation_status not in {"reserve_ok", "reserved"}:
+        return
+    try:
+        _post_gpu_reservation(
+            _gpu_reservation_payload(action="release", job=job, reservation_id=reservation_id)
+        )
+    except Exception as exc:
+        job_store.update(
+            job_id,
+            {"gpu_reservation_status": f"release_failed: {exc}"},
+            event="gpu_release_failed",
+            message="GPU reservation release failed.",
+        )
+        return
+    job_store.update(
+        job_id,
+        {"gpu_reservation_status": "released"},
+        event="gpu_released",
+        message="GPU reservation released.",
+    )
 
 
 def _query_bool(raw: str | None, *, default: bool) -> bool:
@@ -1000,12 +1379,40 @@ def _build_handler(*, work_root: Path, default_lang: str):
     pipeline_root.mkdir(parents=True, exist_ok=True)
 
     job_store = _JobStore(jobs_root)
-    job_queue: queue.Queue[_QueuedJob] = queue.Queue()
+    job_queue: queue.PriorityQueue[tuple[int, str, str, _QueuedJob]] = queue.PriorityQueue()
+
+    def _queue_job(job: _JobState) -> None:
+        if job.input_path is None:
+            job_store.update(
+                job.job_id,
+                {
+                    "status": "interrupted",
+                    "progress": 100,
+                    "message": "Failed",
+                    "error": "Queued OCR job has no durable input PDF.",
+                    "finished_at": _utc_now(),
+                    "heartbeat_at": _utc_now(),
+                },
+                event="interrupted",
+                message="Queued OCR job has no durable input PDF.",
+            )
+            return
+        queued = _QueuedJob(
+            job_id=job.job_id,
+            input_path=Path(job.input_path),
+            mode=job.mode,
+            pages_raw=job.pages,
+            lang=job.lang,
+            strict=job.strict,
+            delete_original_text_layer=job.delete_original_text_layer,
+        )
+        priority_rank, created_at, job_id = _job_queue_sort_key(job)
+        job_queue.put((priority_rank, created_at, job_id, queued))
 
     def _run_job(
         job_id: str,
         *,
-        payload: bytes,
+        input_path: Path,
         mode: str,
         pages_raw: str,
         lang: str,
@@ -1058,11 +1465,13 @@ def _build_handler(*, work_root: Path, default_lang: str):
         def _progress_cb(value: int, status: str) -> None:
             _set_state(status="running", progress=value, message=status)
 
-        _set_state(status="running", progress=1, message="Queued")
+        reservation_id: str | None = None
+        _set_state(status="running", progress=1, message="Starting")
         try:
+            reservation_id = _reserve_gpu_for_job(job_store, job_id)
             page_numbers = parse_page_numbers(pages_raw)
             summary: SearchablePdfSummary = build_searchable_pdf(
-                pdf_bytes=payload,
+                pdf_path=input_path,
                 mode=mode,
                 lang=lang,
                 page_numbers=page_numbers,
@@ -1086,14 +1495,19 @@ def _build_handler(*, work_root: Path, default_lang: str):
             )
         except Exception as exc:
             _set_state(status="error", progress=100, message="Failed", error=str(exc))
+        finally:
+            _release_gpu_for_job(job_store, job_id, reservation_id)
 
     def _worker_loop() -> None:
         while True:
-            queued_job = job_queue.get()
+            _, _, _, queued_job = job_queue.get()
             try:
+                current = job_store.get(queued_job.job_id)
+                if current is None or current.status != "queued":
+                    continue
                 _run_job(
                     queued_job.job_id,
-                    payload=queued_job.payload,
+                    input_path=queued_job.input_path,
                     mode=queued_job.mode,
                     pages_raw=queued_job.pages_raw,
                     lang=queued_job.lang,
@@ -1109,6 +1523,9 @@ def _build_handler(*, work_root: Path, default_lang: str):
         daemon=True,
     )
     worker.start()
+
+    for recovered_job in job_store.requeueable_jobs():
+        _queue_job(recovered_job)
 
     class SearchablePdfApiHandler(BaseHTTPRequestHandler):
         server_version = "UniScanHTTP/0.2"
@@ -1250,6 +1667,14 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 return
 
             job_id = uuid.uuid4().hex[:12]
+            try:
+                input_path = job_store.write_input(job_id, payload)
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": f"Failed to persist input PDF before accepting job: {exc}"},
+                )
+                return
             job = _JobState(
                 job_id=job_id,
                 status="queued",
@@ -1262,6 +1687,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 delete_original_text_layer=bool(delete_original_text_layer),
                 filename=filename,
                 input_bytes=len(payload),
+                input_path=input_path,
                 protocol_version=protocol.protocol_version,
                 request_id=protocol.request_id,
                 project_id=protocol.project_id,
@@ -1276,19 +1702,16 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 input_sha256=input_sha256,
                 request_fingerprint=request_fingerprint,
             )
-            job_store.create(job)
-
-            job_queue.put(
-                _QueuedJob(
-                    job_id=job_id,
-                    payload=payload,
-                    mode=mode,
-                    pages_raw=pages_raw,
-                    lang=lang,
-                    strict=strict,
-                    delete_original_text_layer=delete_original_text_layer,
+            try:
+                job_store.create(job)
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": f"Failed to persist OCR job metadata: {exc}"},
                 )
-            )
+                return
+
+            _queue_job(job)
             self._send_json(HTTPStatus.ACCEPTED, _serialize_job(job))
 
         def _handle_get_job(self, job_id: str) -> None:
@@ -1320,6 +1743,17 @@ def _build_handler(*, work_root: Path, default_lang: str):
             safe_name = filename[:-4] if filename.lower().endswith(".pdf") else filename
             download_name = f"{safe_name}.searchable.pdf"
             self._send_pdf_file(path=job.result_path, filename=download_name)
+
+        def _handle_cancel_job(self, job_id: str) -> None:
+            job, cancelled, error = job_store.cancel(job_id)
+            if job is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": error or f"Job not found: {job_id}"})
+                return
+            payload = _serialize_job(job)
+            if cancelled:
+                self._send_json(HTTPStatus.OK, payload)
+                return
+            self._send_json(HTTPStatus.CONFLICT, {"error": error or "Job cannot be cancelled.", "job": payload})
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -1363,6 +1797,10 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 return
             if parsed.path == "/api/jobs":
                 self._handle_create_job(parsed)
+                return
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "jobs" and parts[3] == "cancel":
+                self._handle_cancel_job(parts[2])
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
 
