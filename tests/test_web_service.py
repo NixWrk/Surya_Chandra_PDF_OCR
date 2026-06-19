@@ -98,6 +98,24 @@ def test_parse_protocol_metadata_from_headers_and_query() -> None:
     assert metadata.ttl_seconds == 3600
 
 
+def test_parse_protocol_metadata_defaults_to_cuda_gpu_policy() -> None:
+    parsed = urlparse("/api/jobs")
+    metadata = _parse_protocol_metadata(parsed, {})
+
+    assert metadata.gpu_policy == "cuda"
+
+
+def test_parse_protocol_metadata_rejects_cpu_gpu_policy() -> None:
+    parsed = urlparse("/api/jobs?gpu_policy=cpu")
+
+    try:
+        _parse_protocol_metadata(parsed, {})
+    except ValueError as exc:
+        assert "gpu_policy must be one of: auto, cuda" in str(exc)
+    else:
+        raise AssertionError("Expected cpu gpu_policy to be rejected")
+
+
 def test_job_store_persists_done_result_metadata(tmp_path: Path) -> None:
     root = tmp_path / "jobs"
     store = _JobStore(root)

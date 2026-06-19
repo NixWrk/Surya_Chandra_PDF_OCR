@@ -287,6 +287,50 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _torch_cuda_probe() -> tuple[bool, str]:
+    try:
+        import torch  # type: ignore
+    except Exception as exc:
+        return False, f"torch import failed: {exc}"
+
+    version = str(getattr(torch, "__version__", "unknown"))
+    try:
+        available = bool(torch.cuda.is_available())
+    except Exception as exc:
+        return False, f"torch.cuda probe failed: {exc}"
+    if not available:
+        return False, f"torch={version} cuda_available=False"
+
+    # When real torch is available, run a tiny CUDA tensor to catch incompatible
+    # wheels before a large OCR model starts loading.
+    if hasattr(torch, "ones"):
+        try:
+            tensor = torch.ones((1,), device="cuda")
+            _ = float(tensor.item())
+        except Exception as exc:
+            return False, f"torch={version} cuda tensor smoke failed: {exc}"
+
+    try:
+        device_count = int(torch.cuda.device_count())
+    except Exception:
+        device_count = 0
+    try:
+        device_name = str(torch.cuda.get_device_name(0)) if device_count > 0 else "unknown"
+    except Exception:
+        device_name = "unknown"
+    return True, f"torch={version} cuda_device_count={device_count} cuda_device_0={device_name}"
+
+
+def _require_torch_cuda(engine_label: str) -> str:
+    has_cuda, detail = _torch_cuda_probe()
+    if not has_cuda:
+        raise RuntimeError(
+            f"{engine_label} GPU mode requires CUDA, but CUDA is unavailable. "
+            f"Install a CUDA-enabled torch build in the engine venv ({detail})."
+        )
+    return detail
+
+
 def _has_any_files(root: Path, patterns: Sequence[str]) -> bool:
     for pattern in patterns:
         try:
@@ -445,57 +489,39 @@ def _configure_chandra_runtime_device() -> str:
     """Resolve TORCH_DEVICE for Chandra before importing chandra.settings."""
 
     explicit = (os.environ.get("TORCH_DEVICE") or "").strip()
-    device_policy = (os.environ.get("UNISCAN_CHANDRA_DEVICE_POLICY") or "auto").strip().lower()
+    require_gpu = _env_bool("UNISCAN_CHANDRA_REQUIRE_GPU", default=True)
+    default_policy = "cuda" if require_gpu else "auto"
+    device_policy = (
+        os.environ.get("UNISCAN_CHANDRA_DEVICE_POLICY") or default_policy
+    ).strip().lower()
     prefer_gpu = _env_bool("UNISCAN_CHANDRA_PREFER_GPU", default=True)
-    require_gpu = _env_bool("UNISCAN_CHANDRA_REQUIRE_GPU", default=False)
-
-    def _cuda_probe() -> tuple[bool, str]:
-        try:
-            import torch  # type: ignore
-        except Exception as exc:
-            return False, f"torch import failed: {exc}"
-        try:
-            available = bool(torch.cuda.is_available())
-        except Exception as exc:
-            return False, f"torch.cuda probe failed: {exc}"
-        if available:
-            return True, f"torch={getattr(torch, '__version__', 'unknown')}"
-        return False, f"torch={getattr(torch, '__version__', 'unknown')} cuda_available=False"
 
     if explicit:
+        if explicit.lower().startswith("cpu") and require_gpu:
+            raise RuntimeError(
+                "Chandra GPU mode requires CUDA, but TORCH_DEVICE='cpu' was requested."
+            )
         if explicit.lower().startswith("cuda"):
-            has_cuda, detail = _cuda_probe()
-            if not has_cuda and require_gpu:
-                raise RuntimeError(
-                    f"Chandra GPU mode requires CUDA, but TORCH_DEVICE='{explicit}' is unusable ({detail})."
-                )
+            _require_torch_cuda("Chandra")
         return explicit
 
     if device_policy == "auto":
         # Leave TORCH_DEVICE unset so Chandra/Hugging Face can use device_map="auto".
-        # This lets users with smaller GPUs choose whether to accept CPU/offload
-        # behavior instead of forcing the whole model onto cuda:0.
         if require_gpu:
-            has_cuda, detail = _cuda_probe()
-            if not has_cuda:
-                raise RuntimeError(
-                    "Chandra GPU mode is required, but CUDA is unavailable. "
-                    f"Install a CUDA-enabled torch build in the Chandra venv ({detail})."
-                )
+            _require_torch_cuda("Chandra")
         os.environ.pop("TORCH_DEVICE", None)
         return "auto"
 
     if device_policy == "cpu":
+        if require_gpu:
+            raise RuntimeError(
+                "Chandra GPU mode requires CUDA, but UNISCAN_CHANDRA_DEVICE_POLICY='cpu' was requested."
+            )
         os.environ["TORCH_DEVICE"] = "cpu"
         return "cpu"
 
     if device_policy == "cuda":
-        has_cuda, detail = _cuda_probe()
-        if not has_cuda:
-            raise RuntimeError(
-                "Chandra CUDA mode was requested, but CUDA is unavailable. "
-                f"Install a CUDA-enabled torch build in the Chandra venv ({detail})."
-            )
+        _require_torch_cuda("Chandra")
         os.environ["TORCH_DEVICE"] = "cuda:0"
         return "cuda:0"
 
@@ -508,19 +534,39 @@ def _configure_chandra_runtime_device() -> str:
         os.environ.setdefault("TORCH_DEVICE", "cpu")
         return os.environ["TORCH_DEVICE"]
 
-    has_cuda, detail = _cuda_probe()
+    has_cuda, _detail = _torch_cuda_probe()
     if has_cuda:
         os.environ["TORCH_DEVICE"] = "cuda:0"
         return "cuda:0"
 
     if require_gpu:
-        raise RuntimeError(
-            "Chandra GPU mode is required, but CUDA is unavailable. "
-            f"Install a CUDA-enabled torch build in the Chandra venv ({detail})."
-        )
+        _require_torch_cuda("Chandra")
 
     os.environ.setdefault("TORCH_DEVICE", "cpu")
     return os.environ["TORCH_DEVICE"]
+
+
+def _configure_surya_runtime_device() -> str:
+    """Resolve TORCH_DEVICE for Surya and enforce CUDA when requested."""
+
+    explicit = (os.environ.get("TORCH_DEVICE") or "").strip()
+    require_gpu = _env_bool("UNISCAN_SURYA_REQUIRE_GPU", default=True)
+
+    if explicit:
+        if explicit.lower().startswith("cpu") and require_gpu:
+            raise RuntimeError(
+                "Surya GPU mode requires CUDA, but TORCH_DEVICE='cpu' was requested."
+            )
+        if explicit.lower().startswith("cuda"):
+            _require_torch_cuda("Surya")
+        return explicit
+
+    if require_gpu:
+        _require_torch_cuda("Surya")
+        os.environ["TORCH_DEVICE"] = "cuda:0"
+        return "cuda:0"
+
+    return "auto"
 
 
 def _artifact_path_for_engine(output_dir: Path, pdf_stem: str, engine: str) -> Path:
@@ -1437,6 +1483,7 @@ def _run_surya_direct(
     os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
     os.environ.setdefault("MODELSCOPE_CACHE", str(_DEFAULT_MODELSCOPE_CACHE_HOME))
     _ensure_surya_cache_ready()
+    _configure_surya_runtime_device()
 
     module_error: Exception | None = None
     try:
@@ -1559,8 +1606,15 @@ def _run_chandra_module(
 
     _ = lang
     model = InferenceManager(method="hf")
-    if _env_bool("UNISCAN_CHANDRA_REQUIRE_GPU", default=False):
-        model_device = str(getattr(getattr(model, "model", None), "device", ""))
+    if _env_bool("UNISCAN_CHANDRA_REQUIRE_GPU", default=True):
+        raw_model = getattr(model, "model", None)
+        model_device = str(getattr(raw_model, "device", ""))
+        if not model_device and hasattr(raw_model, "parameters"):
+            try:
+                first_param = next(raw_model.parameters())
+                model_device = str(getattr(first_param, "device", ""))
+            except Exception:
+                model_device = ""
         if not model_device.lower().startswith("cuda"):
             raise RuntimeError(
                 "Chandra model loaded without CUDA device while GPU mode is required "

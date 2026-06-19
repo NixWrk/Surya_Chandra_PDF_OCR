@@ -71,11 +71,11 @@ try {
         }
     }
     else {
-        Write-Host "  No NVIDIA GPU detected. All engines will run on CPU." -ForegroundColor Yellow
+        Write-Host "  No NVIDIA GPU detected. UniScan OCR requires CUDA GPU for Chandra/Surya." -ForegroundColor Yellow
     }
 }
 catch {
-    Write-Host "  nvidia-smi not found. All engines will run on CPU." -ForegroundColor Yellow
+    Write-Host "  nvidia-smi not found. UniScan OCR requires CUDA GPU for Chandra/Surya." -ForegroundColor Yellow
 }
 
 # --- 3. Tesseract ---

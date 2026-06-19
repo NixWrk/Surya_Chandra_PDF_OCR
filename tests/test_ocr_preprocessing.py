@@ -248,7 +248,6 @@ def test_preprocess_image_file_basic(tmp_path: Path) -> None:
 
     assert result == dst
     assert dst.exists()
-    import cv2  # type: ignore
     out = _cv2_imread_unicode(dst)
     assert out is not None
 

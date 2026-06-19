@@ -17,7 +17,6 @@ from uniscan.io import imwrite_unicode, render_pdf_page_indices
 
 from .benchmark import _run_extraction_engine, resolve_pdf_page_indices
 from .engine import (
-    OCR_ENGINE_LABELS,
     OCR_ENGINE_VALUES,
     SEARCHABLE_PDF_ENGINES,
     detect_ocr_engine_status,

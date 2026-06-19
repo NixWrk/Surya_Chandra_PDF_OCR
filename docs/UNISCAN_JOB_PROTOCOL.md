@@ -59,7 +59,7 @@ X-Task-ID: zotero:item:ABCD1234:ocr
 X-Request-ID: 8cb04ca2-34a6-45a7-bf3d-fc4c83e8db3c
 X-Idempotency-Key: zotero:item:ABCD1234:ocr:v1
 X-Priority: batch
-X-GPU-Policy: auto
+X-GPU-Policy: cuda
 X-Estimated-VRAM-GB: 8
 X-Estimated-Pages: 42
 X-TTL-Seconds: 86400
@@ -100,7 +100,7 @@ be passed as query parameters for simple scripts.
 | `X-Request-ID` | `request_id` | Yes | One id per HTTP submission attempt. Auto-generated if omitted. |
 | `X-Idempotency-Key` | `idempotency_key` | Yes | Deterministic retry key for the exact OCR request. |
 | `X-Priority` | `priority` | Yes | `interactive`, `normal`, `batch`, or `low`. |
-| `X-GPU-Policy` | `gpu_policy`, `gpu` | Recommended | `auto`, `cuda`, `cpu`, or `none`. |
+| `X-GPU-Policy` | `gpu_policy`, `gpu` | Recommended | `cuda` or `auto`. OCR runtime is CUDA-only. |
 | `X-Estimated-VRAM-GB` | `estimated_vram_gb`, `vram_gb` | Recommended | Coarse VRAM estimate for external schedulers. |
 | `X-Estimated-Pages` | `estimated_pages` | Recommended | Coarse page count estimate. |
 | `X-TTL-Seconds` | `ttl_seconds` | Optional | Caller-requested metadata/result retention hint. |
@@ -160,7 +160,7 @@ New job response:
   "request_id": "8cb04ca2-34a6-45a7-bf3d-fc4c83e8db3c",
   "idempotency_key": "zotero:item:ABCD1234:ocr:v1",
   "priority": "batch",
-  "gpu_policy": "auto",
+  "gpu_policy": "cuda",
   "estimated_vram_gb": 8,
   "estimated_pages": 42,
   "ttl_seconds": 86400,
@@ -270,7 +270,8 @@ only stores and exposes resource hints supplied by the caller:
 
 An external orchestrator may use those fields before submitting OCR work. Once a
 job is accepted, the OCR service processes it according to its own single-worker
-queue and does not call back to an LLM/GPU orchestrator.
+queue and does not call back to an LLM/GPU orchestrator. Accepted OCR execution
+is CUDA-only: `cpu` and `none` are not valid `gpu_policy` values for this API.
 
 ## Ownership Rules
 
@@ -297,7 +298,7 @@ curl -X POST "http://127.0.0.1:8000/api/jobs?mode=chandra+surya&lang=rus+eng&str
   -H "X-Request-ID: $(uuidgen)" \
   -H "X-Idempotency-Key: zotero:item:ABCD1234:ocr:v1" \
   -H "X-Priority: batch" \
-  -H "X-GPU-Policy: auto" \
+  -H "X-GPU-Policy: cuda" \
   -H "X-Estimated-VRAM-GB: 8" \
   -H "X-Estimated-Pages: 42" \
   --data-binary "@input.pdf"

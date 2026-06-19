@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 import threading
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -22,12 +19,6 @@ from uniscan.app import (
 
 
 DEFAULT_LANG = DEFAULT_BASIC_GUI_LANG
-CPU_TORCH_PACKAGES: tuple[str, ...] = (
-    "torch==2.11.0+cpu",
-    "torchvision==0.26.0+cpu",
-    "torchaudio==2.11.0+cpu",
-)
-
 MODE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Chandra + Surya (default)", PDF_MODE_HYBRID),
     ("Chandra", PDF_MODE_CHANDRA),
@@ -53,7 +44,6 @@ class BasicOcrGui(tk.Tk):
         self.delete_original_layer_var = tk.BooleanVar(value=False)
 
         self._worker: threading.Thread | None = None
-        self._repair_worker: threading.Thread | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -238,113 +228,7 @@ class BasicOcrGui(tk.Tk):
     def _ui_error(self, message: str) -> None:
         self._set_running(False)
         self.status_var.set("Error")
-        if self._is_chandra_cuda_oom(message):
-            self._offer_chandra_cpu_repair(message)
-            return
         messagebox.showerror("Error", message)
-
-    @staticmethod
-    def _is_chandra_cuda_oom(message: str) -> bool:
-        lowered = message.lower()
-        if "chandra" not in lowered:
-            return False
-        return "cuda out of memory" in lowered or (
-            "tried to allocate" in lowered and "gpu" in lowered
-        )
-
-    def _offer_chandra_cpu_repair(self, message: str) -> None:
-        prompt = (
-            "Chandra ran out of GPU memory.\n\n"
-            "The current GPU does not have enough free VRAM for the Chandra model. "
-            "Surya can still use the GPU, while Chandra can be switched to CPU mode.\n\n"
-            "Do you want UniScan to install CPU PyTorch into the Chandra venv, "
-            "switch Chandra to CPU mode, and restart the GUI?\n\n"
-            "This can take several minutes and requires internet access."
-        )
-        if not messagebox.askyesno("Chandra GPU memory is not enough", prompt):
-            messagebox.showerror(
-                "Error",
-                message
-                + "\n\nTo retry manually, run with:\n"
-                "$env:UNISCAN_CHANDRA_DEVICE_POLICY = \"cpu\"\n"
-                ".\\run_basic_gui.cmd",
-            )
-            return
-        self._start_chandra_cpu_repair()
-
-    def _start_chandra_cpu_repair(self) -> None:
-        if self._repair_worker is not None and self._repair_worker.is_alive():
-            return
-        self._set_running(True)
-        self._ui_set_progress(0, "Installing Chandra CPU PyTorch...")
-        self._repair_worker = threading.Thread(
-            target=self._install_chandra_cpu_torch_worker,
-            daemon=True,
-        )
-        self._repair_worker.start()
-
-    def _install_chandra_cpu_torch_worker(self) -> None:
-        cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--index-url",
-            "https://download.pytorch.org/whl/cpu",
-            "--extra-index-url",
-            "https://pypi.org/simple",
-            "--upgrade",
-            "--force-reinstall",
-            *CPU_TORCH_PACKAGES,
-        ]
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(Path(__file__).resolve().parents[3]),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-        except Exception as exc:
-            self.after(0, self._ui_chandra_cpu_repair_failed, f"Failed to run pip: {exc}")
-            return
-
-        if proc.returncode != 0:
-            details = (proc.stderr or proc.stdout or "").strip()
-            if len(details) > 3000:
-                details = details[-3000:]
-            self.after(
-                0,
-                self._ui_chandra_cpu_repair_failed,
-                details or f"pip exited with {proc.returncode}",
-            )
-            return
-
-        self.after(0, self._ui_chandra_cpu_repair_done)
-
-    def _ui_chandra_cpu_repair_failed(self, details: str) -> None:
-        self._set_running(False)
-        self.status_var.set("CPU PyTorch install failed")
-        messagebox.showerror(
-            "CPU PyTorch install failed",
-            "UniScan could not install CPU PyTorch into the Chandra venv.\n\n"
-            f"{details}",
-        )
-
-    def _ui_chandra_cpu_repair_done(self) -> None:
-        os.environ["UNISCAN_CHANDRA_DEVICE_POLICY"] = "cpu"
-        os.environ["TORCH_DEVICE"] = "cpu"
-        os.environ["UNISCAN_CHANDRA_TORCH_DEVICE"] = "cpu"
-        os.environ["UNISCAN_CHANDRA_PREFER_GPU"] = "0"
-        os.environ["UNISCAN_CHANDRA_REQUIRE_GPU"] = "0"
-        self._ui_set_progress(100, "Restarting in Chandra CPU mode...")
-        messagebox.showinfo(
-            "Chandra CPU mode installed",
-            "CPU PyTorch was installed into the Chandra venv.\n\n"
-            "UniScan will now restart with Chandra forced to CPU mode.",
-        )
-        os.execv(sys.executable, [sys.executable, "-m", "uniscan.ui.basic_ocr_gui"])
 
 
 def main() -> int:

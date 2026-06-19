@@ -284,3 +284,13 @@ def test_engine_python_override_accepts_relative_path(monkeypatch) -> None:
     monkeypatch.setenv("UNISCAN_SURYA_PYTHON", str(relative_python))
 
     assert ocr_pipeline._resolve_engine_python("surya") == fake_surya_python.resolve()
+
+
+def test_engine_subprocess_env_maps_surya_gpu_runtime(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("UNISCAN_SURYA_TORCH_DEVICE", "cuda:0")
+    monkeypatch.setenv("UNISCAN_SURYA_REQUIRE_GPU", "1")
+
+    env = ocr_pipeline._build_engine_subprocess_env(engine="surya", repo_root=tmp_path)
+
+    assert env["TORCH_DEVICE"] == "cuda:0"
+    assert env["UNISCAN_SURYA_REQUIRE_GPU"] == "1"

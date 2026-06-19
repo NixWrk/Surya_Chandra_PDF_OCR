@@ -38,7 +38,7 @@ GPU-heavy work belongs outside this repository.
 External orchestrators should:
 
 1. decide when to submit OCR jobs;
-2. decide whether GPU/CPU capacity is available before submission;
+2. decide whether CUDA GPU capacity is available before submission;
 3. choose caller metadata, priority, `gpu_policy`, `estimated_vram_gb`, and
    `estimated_pages`;
 4. call `POST /api/jobs` only when OCR should accept and process the task;
@@ -69,7 +69,7 @@ OCR persists and exposes resource hints for external schedulers:
 ```json
 {
   "priority": "batch",
-  "gpu_policy": "auto",
+  "gpu_policy": "cuda",
   "estimated_vram_gb": 8,
   "estimated_pages": 42,
   "worker_concurrency": 1
@@ -77,7 +77,8 @@ OCR persists and exposes resource hints for external schedulers:
 ```
 
 These fields are informational inside OCR except that `priority` orders waiting
-OCR jobs. GPU arbitration remains an external responsibility.
+OCR jobs. GPU arbitration remains an external responsibility. OCR execution is
+CUDA-only; CPU fallback is outside the supported contract for this repository.
 
 ## Elvis Projects Layout
 

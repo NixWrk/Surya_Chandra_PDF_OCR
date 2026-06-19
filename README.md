@@ -128,20 +128,17 @@ The first setup can take a while. The script installs both environments, install
 
 The setup script is safe to re-run. If the expected CUDA torch stack is already installed, it skips the forced torch reinstall and only verifies the environment and caches.
 
-Chandra device policy is user-selectable at runtime:
+Runtime is GPU-only for the active OCR path:
 
-1. `auto` is the default. It leaves Chandra/Hugging Face to choose device placement.
-2. `cuda` forces Chandra onto `cuda:0` and fails if CUDA is unavailable or too small.
-3. `cpu` forces Chandra onto CPU. This avoids VRAM errors but can be very slow.
+1. `cuda` is the default for Chandra and Surya.
+2. `auto` is accepted only as a GPU metadata hint for schedulers; runtime still requires CUDA.
+3. `cpu` mode is not a supported OCR execution path in this repository.
 
 ```powershell
-$env:UNISCAN_CHANDRA_DEVICE_POLICY = "auto"  # default
-.\run_basic_gui.cmd
-
-$env:UNISCAN_CHANDRA_DEVICE_POLICY = "cuda"  # force GPU
-.\run_basic_gui.cmd
-
-$env:UNISCAN_CHANDRA_DEVICE_POLICY = "cpu"   # force CPU
+$env:UNISCAN_CHANDRA_DEVICE_POLICY = "cuda"
+$env:UNISCAN_CHANDRA_REQUIRE_GPU = "1"
+$env:UNISCAN_SURYA_TORCH_DEVICE = "cuda:0"
+$env:UNISCAN_SURYA_REQUIRE_GPU = "1"
 .\run_basic_gui.cmd
 ```
 
@@ -193,6 +190,10 @@ Use the Chandra environment for the main CLI:
 Build a searchable PDF in the default hybrid mode:
 
 ```powershell
+$env:UNISCAN_CHANDRA_DEVICE_POLICY = "cuda"
+$env:UNISCAN_CHANDRA_REQUIRE_GPU = "1"
+$env:UNISCAN_SURYA_TORCH_DEVICE = "cuda:0"
+$env:UNISCAN_SURYA_REQUIRE_GPU = "1"
 .\.venv_chandra\Scripts\python.exe -m uniscan searchable-pdf `
   --pdf "D:\path\input.pdf" `
   --mode chandra+surya `
@@ -209,6 +210,16 @@ Useful commands:
 .\.venv_chandra\Scripts\python.exe -m uniscan build-searchable-from-artifacts --help
 .\.venv_chandra\Scripts\python.exe -m uniscan serve-http --help
 ```
+
+GPU smoke/prewarm:
+
+```powershell
+.\scripts\run_hybrid_gpu_smoke.ps1 -InputPdf "D:\path\input.pdf" -Pages 1
+```
+
+The smoke script copies the input into `outputs/gpu_hybrid_smoke`, sets the
+CUDA-only Chandra/Surya runtime variables, uses the persistent local model
+caches, and runs `chandra+surya` without modifying the original PDF.
 
 ## HTTP Service
 
@@ -245,7 +256,7 @@ curl -X POST "http://127.0.0.1:8000/api/jobs?mode=chandra+surya&lang=rus+eng&str
   -H "X-Request-ID: <uuid-per-http-attempt>" \
   -H "X-Idempotency-Key: zotero:item:ABCD1234:ocr:v1" \
   -H "X-Priority: batch" \
-  -H "X-GPU-Policy: auto" \
+  -H "X-GPU-Policy: cuda" \
   -H "X-Estimated-VRAM-GB: 8" \
   -H "X-Estimated-Pages: 42" \
   --data-binary "@input.pdf"
@@ -296,7 +307,8 @@ UNISCAN_FAILED_JOB_RETENTION_DAYS=90
 
 GPU/LLM scheduling remains the responsibility of the external orchestrator. OCR
 stores resource hints such as `gpu_policy`, `estimated_vram_gb`, and
-`estimated_pages`, but does not reserve GPU slots itself.
+`estimated_pages`, but does not reserve GPU slots itself. The OCR runtime itself
+requires CUDA and fails loudly instead of falling back to CPU.
 
 ## Docker
 
@@ -384,22 +396,7 @@ Check `nvidia-smi` first. If the driver cannot see the GPU, PyTorch cannot use i
 The installed PyTorch CUDA wheel does not support your GPU architecture. For example, GTX 1070 is `sm_61`, while PyTorch `cu128` wheels support `sm_75+`. Re-run `setup_dual_venv.cmd`; it auto-selects `cu126` for older GPUs and verifies compatibility by running a tiny CUDA tensor before setup succeeds.
 
 `CUDA out of memory` while loading Chandra:
-The CUDA wheel is compatible, but Chandra's model does not fit into available VRAM. GTX 1070 has 8 GB VRAM, and Chandra may need more depending on driver, fragmentation, and page size. In the GUI, UniScan shows a question asking whether to install CPU PyTorch into the Chandra venv and restart in Chandra CPU mode. If you click Yes, this happens automatically.
-
-Manual runtime policies are also available:
-
-```powershell
-$env:UNISCAN_CHANDRA_DEVICE_POLICY = "auto"
-.\run_basic_gui.cmd
-
-$env:UNISCAN_CHANDRA_DEVICE_POLICY = "cpu"
-.\run_basic_gui.cmd
-
-$env:UNISCAN_CHANDRA_DEVICE_POLICY = "cuda"
-.\run_basic_gui.cmd
-```
-
-`auto` is the recommended default. `cpu` is slower but avoids VRAM limits. `cuda` is useful when you know your GPU has enough VRAM and want a hard failure instead of fallback behavior.
+The CUDA wheel is compatible, but Chandra's model does not fit into available VRAM. OCR does not fall back to CPU. Free VRAM, move the OCR service to a larger GPU, reduce concurrent GPU workloads outside OCR, or resubmit later through the external orchestrator.
 
 `pip's dependency resolver does not currently take into account all the packages that are installed`:
 This can appear during the forced CUDA PyTorch reinstall. In the Surya venv, PyTorch may temporarily pull `pillow 12.x`, which conflicts with `surya-ocr==0.17.1`; the setup script immediately pins Surya back to `pillow>=10.2,<11.0` after the torch install. Treat the final verification as authoritative: Surya should end on `pillow 10.4.0` or another `<11.0` build, while Chandra can stay on `pillow 12.x`.

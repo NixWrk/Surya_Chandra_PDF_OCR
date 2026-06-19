@@ -689,6 +689,46 @@ def test_configure_chandra_runtime_device_raises_when_gpu_required_without_cuda(
         ocr_benchmark_mod._configure_chandra_runtime_device()
 
 
+def test_configure_chandra_runtime_device_rejects_cpu_when_gpu_required(monkeypatch) -> None:
+    monkeypatch.setenv("TORCH_DEVICE", "cpu")
+    monkeypatch.delenv("UNISCAN_CHANDRA_REQUIRE_GPU", raising=False)
+
+    with pytest.raises(RuntimeError, match="TORCH_DEVICE='cpu'"):
+        ocr_benchmark_mod._configure_chandra_runtime_device()
+
+
+def test_configure_surya_runtime_device_requires_cuda_by_default(monkeypatch) -> None:
+    class _Cuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    fake_torch = SimpleNamespace(__version__="9.9.9", cuda=_Cuda())
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.delenv("TORCH_DEVICE", raising=False)
+    monkeypatch.delenv("UNISCAN_SURYA_REQUIRE_GPU", raising=False)
+
+    with pytest.raises(RuntimeError, match="CUDA is unavailable"):
+        ocr_benchmark_mod._configure_surya_runtime_device()
+
+
+def test_configure_surya_runtime_device_sets_cuda_when_required(monkeypatch) -> None:
+    class _Cuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+    fake_torch = SimpleNamespace(__version__="9.9.9", cuda=_Cuda())
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.delenv("TORCH_DEVICE", raising=False)
+    monkeypatch.setenv("UNISCAN_SURYA_REQUIRE_GPU", "1")
+
+    device = ocr_benchmark_mod._configure_surya_runtime_device()
+
+    assert device == "cuda:0"
+    assert os.environ.get("TORCH_DEVICE") == "cuda:0"
+
+
 def test_chandra_chunk_lines_preserves_explicit_breaks() -> None:
     raw = "<p>FIRST LINE<br/>SECOND LINE</p><div>THIRD LINE</div>"
     lines = ocr_benchmark_mod._chandra_chunk_lines(raw)
@@ -778,6 +818,7 @@ def test_run_surya_direct_disables_text_fallback_by_default(monkeypatch, tmp_pat
     monkeypatch.setattr(ocr_benchmark_mod, "_run_text_engine_from_cli", fail_if_called)
     monkeypatch.setattr(ocr_benchmark_mod, "_ensure_surya_cache_ready", lambda: None)
     monkeypatch.delenv("UNISCAN_SURYA_ALLOW_TEXT_FALLBACK", raising=False)
+    monkeypatch.setenv("UNISCAN_SURYA_REQUIRE_GPU", "0")
 
     with pytest.raises(RuntimeError, match="Text-only fallback is disabled"):
         ocr_benchmark_mod._run_surya_direct(
@@ -804,6 +845,7 @@ def test_run_surya_direct_allows_text_fallback_when_enabled(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(ocr_benchmark_mod, "_ensure_surya_cache_ready", lambda: None)
     monkeypatch.setenv("UNISCAN_SURYA_ALLOW_TEXT_FALLBACK", "1")
+    monkeypatch.setenv("UNISCAN_SURYA_REQUIRE_GPU", "0")
 
     text, chars = ocr_benchmark_mod._run_surya_direct(
         [image_path],

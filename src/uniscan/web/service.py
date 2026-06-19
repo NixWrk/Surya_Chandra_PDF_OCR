@@ -33,8 +33,8 @@ UNISCAN_OCR_WORKER_CONCURRENCY = 1
 _DEFAULT_PRIORITY = "normal"
 _KNOWN_PRIORITIES = {"interactive", "normal", "batch", "low"}
 _PRIORITY_RANK = {"interactive": 0, "normal": 10, "batch": 20, "low": 30}
-_DEFAULT_GPU_POLICY = "auto"
-_KNOWN_GPU_POLICIES = {"auto", "cuda", "cpu", "none"}
+_DEFAULT_GPU_POLICY = "cuda"
+_KNOWN_GPU_POLICIES = {"auto", "cuda"}
 _TERMINAL_JOB_STATUSES = {"done", "error", "interrupted", "cancelled"}
 
 
@@ -698,7 +698,7 @@ def _parse_priority(raw: str | None) -> str:
 
 def _parse_gpu_policy(raw: str | None) -> str:
     value = (raw or _DEFAULT_GPU_POLICY).strip().lower()
-    aliases = {"gpu": "cuda", "off": "none"}
+    aliases = {"gpu": "cuda"}
     value = aliases.get(value, value)
     if value not in _KNOWN_GPU_POLICIES:
         known = ", ".join(sorted(_KNOWN_GPU_POLICIES))
