@@ -1,123 +1,83 @@
-# OCR Orchestrator And GPU Contract
+# External Orchestrator Responsibility
 
 Last updated: 2026-06-19
 
 ## Purpose
 
-Surya Chandra PDF OCR is a universal OCR service. It should be callable by any
-Elvis project, not only Zotero automation. Callers submit PDF OCR jobs through
-the HTTP job API and track durable job metadata; they do not run Chandra or
-Surya directly unless they are doing local manual/debug work.
+Surya Chandra PDF OCR is a universal OCR service. Its responsibility is narrow:
+accept OCR jobs, persist them durably, process PDFs, and expose status/results.
 
-The canonical cross-container task protocol is now documented in
-[UniScan OCR Job Protocol](UNISCAN_JOB_PROTOCOL.md). This document keeps the
-GPU and ownership rules that sit around that protocol.
+The OCR service does not coordinate GPU ownership with local LLM services. It
+does not reserve GPU slots, preempt LLM work, inspect LLM backends, or decide
+which project is globally more important.
 
-## Canonical OCR Job Request
+The canonical OCR task protocol is documented in
+[UniScan OCR Job Protocol](UNISCAN_JOB_PROTOCOL.md).
+
+## OCR Responsibility
+
+OCR owns accepted OCR job state:
+
+1. accept or reject incoming OCR jobs;
+2. persist `input.pdf`, metadata, event log, and job index before returning
+   `202 Accepted`;
+3. accept jobs from multiple projects, workers, containers, and manual tools;
+4. process no more than one OCR document at a time;
+5. expose `queued`, `running`, `done`, `error`, `interrupted`, and `cancelled`
+   status;
+6. requeue durable `queued` jobs after restart;
+7. mark interrupted `running` jobs clearly after restart;
+8. keep completed results discoverable until OCR-owned retention cleanup removes
+   them.
+
+## External Orchestrator Responsibility
+
+Any coordination between OCR, LLM inference, translation, ingestion, and other
+GPU-heavy work belongs outside this repository.
+
+External orchestrators should:
+
+1. decide when to submit OCR jobs;
+2. decide whether GPU/CPU capacity is available before submission;
+3. choose caller metadata, priority, `gpu_policy`, `estimated_vram_gb`, and
+   `estimated_pages`;
+4. call `POST /api/jobs` only when OCR should accept and process the task;
+5. poll OCR status/result endpoints after acceptance;
+6. retry from their own durable source queue when OCR reports `error` or
+   `interrupted`.
+
+Once OCR returns `202 Accepted`, OCR will process the job according to its own
+single-worker queue. OCR will not call back to an external scheduler for
+permission.
+
+## Stable OCR Boundary
 
 ```http
-POST http://localhost:8000/api/jobs?mode=chandra+surya&lang=rus+eng&strict=1&filename=input.pdf
-Content-Type: application/pdf
-X-UniScan-Protocol: uniscan-ocr-job.v1
-X-Project-ID: zotero
-X-Service-ID: zotero-worker
-X-Task-ID: zotero:item:ABCD1234:ocr
-X-Request-ID: <uuid-or-deterministic-id>
-X-Idempotency-Key: zotero:item:ABCD1234:ocr:v1
-X-Priority: batch
-X-GPU-Policy: auto
-X-Estimated-VRAM-GB: 8
-X-Estimated-Pages: 42
-```
-
-The PDF bytes are sent as the request body. The response returns a job id and a
-serialized job summary. Callers then poll:
-
-```http
+POST /api/jobs
+GET /api/jobs
 GET /api/jobs/<job_id>
 GET /api/jobs/<job_id>/metadata
 GET /api/jobs/<job_id>/result
+POST /api/jobs/<job_id>/cancel
+GET /health
 ```
 
-## Queue Ownership Rule
+## Resource Metadata
 
-The OCR container owns OCR job state:
-
-1. accept or reject incoming OCR jobs;
-2. persist job metadata before long processing starts;
-3. accept jobs from multiple projects, workers, containers, and manual tools;
-4. process no more than one OCR document at a time;
-5. expose queued/running/done/error/interrupted status;
-6. keep completed results discoverable until retention cleanup;
-7. report interrupted jobs clearly after restart.
-
-Large projects may keep their own higher-level queues, but they should treat the
-OCR service as the source of truth for an accepted OCR job. Retrying after
-network timeouts must use `X-Idempotency-Key`. Reusing the same idempotency key
-with the same PDF bytes and OCR parameters returns the existing OCR job; reusing
-it for different bytes or parameters returns `409 Conflict`.
-
-## GPU Coordination With LLM Orchestrator
-
-OCR and local LLM inference both use GPU memory. They must not behave as two
-independent GPU-heavy systems that only discover conflicts through CUDA OOM.
-
-Target integration:
-
-1. OCR exposes current queued/running jobs, estimated page count, selected mode,
-   coarse GPU need, and `worker_concurrency: 1`.
-2. LLM orchestrator exposes GPU inventory, running LLM backends, active request
-   counts, reserved VRAM, and draining state.
-3. Before starting a large OCR job, a project-level orchestrator can check
-   whether a GPU slot is available.
-4. Before starting or scaling an LLM backend, the LLM lifecycle service should
-   consider external OCR reservations when available.
-5. Priority policy decides conflicts: interactive work may preempt batch work;
-   long batch translation and long OCR should normally queue rather than fight
-   for the same VRAM.
-
-The OCR service keeps OCR-specific scheduling. The LLM orchestrator keeps
-LLM-specific scheduling. Shared GPU visibility and reservation metadata are the
-coordination layer between them.
-
-## OCR Resource Metadata
-
-`POST /api/jobs` accepts orchestration metadata through headers or query
-fallbacks. The persisted job metadata includes the equivalent of:
+OCR persists and exposes resource hints for external schedulers:
 
 ```json
 {
-  "protocol_version": "uniscan-ocr-job.v1",
-  "project_id": "zotero",
-  "service_id": "zotero-worker",
-  "task_id": "zotero:item:ABCD1234:ocr",
-  "request_id": "<uuid-per-submission>",
-  "idempotency_key": "zotero:item:ABCD1234:ocr:v1",
   "priority": "batch",
   "gpu_policy": "auto",
   "estimated_vram_gb": 8,
   "estimated_pages": 42,
-  "ttl_seconds": 86400
+  "worker_concurrency": 1
 }
 ```
 
-This metadata is stored with `metadata.json` and surfaced through
-`GET /api/jobs/<job_id>/metadata`.
-
-`GET /api/jobs` and `GET /api/queue` expose queue counts, active jobs, recent
-jobs, `worker_concurrency: 1`, and the same coarse GPU metadata for schedulers.
-
-The OCR service supports an optional reservation hook:
-
-```env
-UNISCAN_GPU_RESERVATION_URL=http://llm-orchestrator:8080/gpu/reservations
-UNISCAN_GPU_RESERVATION_REQUIRED=0
-UNISCAN_GPU_RESERVATION_TIMEOUT_MS=3000
-```
-
-When configured, OCR sends `reserve` before processing and `release` after
-processing. Without this URL, the OCR service still serializes its own jobs and
-exposes resource metadata for external schedulers.
+These fields are informational inside OCR except that `priority` orders waiting
+OCR jobs. GPU arbitration remains an external responsibility.
 
 ## Elvis Projects Layout
 
@@ -138,11 +98,9 @@ D:/Elvis_projects/
 folders. Product folders such as `Zotero_Automation` call them through HTTP APIs
 and should not vendor their runtime logic.
 
-## Implementation Tasks
+## Remaining External Work
 
-1. Point `UNISCAN_GPU_RESERVATION_URL` at the real LLM orchestrator once its
-   reservation endpoint is available.
-2. Add a live cross-container smoke test that exercises OCR reserve/release
-   against that endpoint.
+1. Define the real LLM/GPU orchestrator scheduling policy outside this repo.
+2. Add a live cross-container smoke test from that orchestrator to OCR.
 3. Document project-level priority rules for conflicts outside OCR, such as
    local LLM interactive sessions versus batch translation.

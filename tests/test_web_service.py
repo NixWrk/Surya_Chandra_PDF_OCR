@@ -20,8 +20,6 @@ from uniscan.web.service import (
     _parse_protocol_metadata,
     _query_bool,
     _request_fingerprint,
-    _release_gpu_for_job,
-    _reserve_gpu_for_job,
 )
 
 
@@ -333,54 +331,6 @@ def test_job_store_cleanup_expired_removes_terminal_jobs_only(tmp_path: Path, mo
     assert not (root / "DONE").exists()
     assert not (root / "ERR").exists()
     assert (root / "ACTIVE").exists()
-
-
-def test_gpu_reservation_hook_reserves_and_releases(tmp_path: Path, monkeypatch) -> None:
-    root = tmp_path / "jobs"
-    store = _JobStore(root)
-    store.create(
-        _JobState(
-            job_id="GPU1",
-            status="running",
-            progress=1,
-            message="Starting",
-            mode="chandra+surya",
-            pages="",
-            lang="rus+eng",
-            strict=True,
-            delete_original_text_layer=True,
-            filename="input.pdf",
-            input_bytes=10,
-            project_id="zotero",
-            service_id="worker",
-            task_id="task-1",
-            priority="interactive",
-            gpu_policy="auto",
-            estimated_vram_gb=8,
-        )
-    )
-    calls: list[dict] = []
-
-    def fake_post(payload):
-        calls.append(payload)
-        if payload["action"] == "reserve":
-            return {"ok": True, "reservation_id": "RES1"}
-        return {"ok": True}
-
-    monkeypatch.setenv("UNISCAN_GPU_RESERVATION_URL", "http://gpu.local/reservations")
-    monkeypatch.setattr("uniscan.web.service._post_gpu_reservation", fake_post)
-
-    reservation_id = _reserve_gpu_for_job(store, "GPU1")
-    _release_gpu_for_job(store, "GPU1", reservation_id)
-    metadata = store.metadata("GPU1")
-
-    assert reservation_id == "RES1"
-    assert [call["action"] for call in calls] == ["reserve", "release"]
-    assert calls[0]["estimated_vram_gb"] == 8
-    assert calls[1]["reservation_id"] == "RES1"
-    assert metadata is not None
-    assert metadata["gpu_reservation_id"] == "RES1"
-    assert metadata["gpu_reservation_status"] == "released"
 
 
 def test_http_jobs_are_processed_one_document_at_a_time(tmp_path: Path, monkeypatch) -> None:

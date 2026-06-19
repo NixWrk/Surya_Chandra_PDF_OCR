@@ -165,8 +165,7 @@ New job response:
   "estimated_pages": 42,
   "ttl_seconds": 86400,
   "input_sha256": "<sha256>",
-  "request_fingerprint": "<sha256>",
-  "gpu_reservation_status": "reserve_ok"
+  "request_fingerprint": "<sha256>"
 }
 ```
 
@@ -263,23 +262,15 @@ UNISCAN_FAILED_JOB_RETENTION_DAYS=90
 Per-job `ttl_seconds` overrides the default retention window for terminal jobs.
 Cleanup never removes `queued` or `running` jobs.
 
-## GPU Reservation Hook
+## GPU Resource Metadata
 
-If `UNISCAN_GPU_RESERVATION_URL` is set, the OCR worker sends JSON `reserve` and
-`release` requests around OCR processing for jobs whose `gpu_policy` is not
-`cpu` or `none`.
+OCR does not reserve, lease, or arbitrate GPU resources with other systems. It
+only stores and exposes resource hints supplied by the caller:
+`gpu_policy`, `estimated_vram_gb`, and `estimated_pages`.
 
-```env
-UNISCAN_GPU_RESERVATION_URL=http://llm-orchestrator:8080/gpu/reservations
-UNISCAN_GPU_RESERVATION_REQUIRED=0
-UNISCAN_GPU_RESERVATION_TIMEOUT_MS=3000
-```
-
-The reserve payload includes `job_id`, caller metadata, `priority`,
-`gpu_policy`, `estimated_vram_gb`, `estimated_pages`, and OCR `mode`. A
-successful response may include `reservation_id`; if present, it is sent back on
-release. When `UNISCAN_GPU_RESERVATION_REQUIRED=1`, reservation failure marks
-the OCR job as `error`.
+An external orchestrator may use those fields before submitting OCR work. Once a
+job is accepted, the OCR service processes it according to its own single-worker
+queue and does not call back to an LLM/GPU orchestrator.
 
 ## Ownership Rules
 
@@ -289,8 +280,8 @@ the OCR job as `error`.
    retrying `error` or `interrupted` jobs.
 3. Other services should call the HTTP job API and should not import or run
    Chandra/Surya internals directly.
-4. Long OCR and local LLM inference must coordinate through exposed queue/GPU
-   metadata instead of racing until CUDA runs out of memory.
+4. External orchestrators own coordination between OCR and local LLM inference.
+   OCR only reports queue/resource metadata and processes accepted jobs.
 5. Interactive tasks should use `priority=interactive`; background ingestion
    should use `priority=batch` or `priority=low`.
 

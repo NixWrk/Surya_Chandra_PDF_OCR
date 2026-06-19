@@ -8,8 +8,6 @@ import queue
 import shutil
 import sqlite3
 import threading
-import urllib.error
-import urllib.request
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -81,8 +79,6 @@ class _JobState:
     ttl_seconds: int | None = None
     input_sha256: str | None = None
     request_fingerprint: str | None = None
-    gpu_reservation_id: str | None = None
-    gpu_reservation_status: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -485,10 +481,6 @@ def _serialize_job(job: _JobState) -> dict[str, Any]:
         payload["input_sha256"] = job.input_sha256
     if job.request_fingerprint:
         payload["request_fingerprint"] = job.request_fingerprint
-    if job.gpu_reservation_id:
-        payload["gpu_reservation_id"] = job.gpu_reservation_id
-    if job.gpu_reservation_status:
-        payload["gpu_reservation_status"] = job.gpu_reservation_status
     if job.result_path is not None:
         payload["result_path"] = str(job.result_path)
     if job.result_path is not None and job.result_path.exists() and job.status == "done":
@@ -547,14 +539,6 @@ def _job_from_metadata(payload: dict[str, Any]) -> _JobState:
         input_sha256=str(payload["input_sha256"]) if payload.get("input_sha256") else None,
         request_fingerprint=(
             str(payload["request_fingerprint"]) if payload.get("request_fingerprint") else None
-        ),
-        gpu_reservation_id=(
-            str(payload["gpu_reservation_id"]) if payload.get("gpu_reservation_id") else None
-        ),
-        gpu_reservation_status=(
-            str(payload["gpu_reservation_status"])
-            if payload.get("gpu_reservation_status")
-            else None
         ),
     )
 
@@ -889,135 +873,6 @@ def _request_fingerprint(
     }
     body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
-
-
-def _gpu_reservation_enabled_for(job: _JobState) -> bool:
-    if job.gpu_policy in {"cpu", "none"}:
-        return False
-    return bool((os.environ.get("UNISCAN_GPU_RESERVATION_URL") or "").strip())
-
-
-def _gpu_reservation_payload(
-    *,
-    action: str,
-    job: _JobState,
-    reservation_id: str | None = None,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "action": action,
-        "protocol_version": UNISCAN_JOB_PROTOCOL_VERSION,
-        "job_id": job.job_id,
-        "project_id": job.project_id,
-        "service_id": job.service_id,
-        "task_id": job.task_id,
-        "request_id": job.request_id,
-        "priority": job.priority,
-        "gpu_policy": job.gpu_policy,
-        "estimated_vram_gb": job.estimated_vram_gb,
-        "estimated_pages": job.estimated_pages,
-        "mode": job.mode,
-    }
-    if reservation_id:
-        payload["reservation_id"] = reservation_id
-    return payload
-
-
-def _post_gpu_reservation(payload: dict[str, Any]) -> dict[str, Any]:
-    url = (os.environ.get("UNISCAN_GPU_RESERVATION_URL") or "").strip()
-    if not url:
-        return {"ok": True, "skipped": True}
-    timeout_ms = _env_int("UNISCAN_GPU_RESERVATION_TIMEOUT_MS", default=3000)
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=max(0.1, timeout_ms / 1000.0)) as response:
-            body = response.read().decode("utf-8", errors="replace")
-            if not body.strip():
-                return {"ok": True}
-            parsed = json.loads(body)
-            if not isinstance(parsed, dict):
-                return {"ok": True, "response": parsed}
-            return parsed
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GPU reservation {payload.get('action')} failed: HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"GPU reservation {payload.get('action')} failed: {exc}") from exc
-
-
-def _reserve_gpu_for_job(job_store: _JobStore, job_id: str) -> str | None:
-    job = job_store.get(job_id)
-    if job is None or not _gpu_reservation_enabled_for(job):
-        return None
-    required = _env_bool("UNISCAN_GPU_RESERVATION_REQUIRED", default=False)
-    try:
-        response = _post_gpu_reservation(_gpu_reservation_payload(action="reserve", job=job))
-    except Exception as exc:
-        job_store.update(
-            job_id,
-            {"gpu_reservation_status": f"reserve_failed: {exc}"},
-            event="gpu_reservation_failed",
-            message="GPU reservation failed.",
-        )
-        if required:
-            raise
-        return None
-    if response.get("ok") is False:
-        detail = response.get("error") or response.get("message") or "reservation denied"
-        job_store.update(
-            job_id,
-            {"gpu_reservation_status": f"reserve_denied: {detail}"},
-            event="gpu_reservation_denied",
-            message=str(detail),
-        )
-        if required:
-            raise RuntimeError(f"GPU reservation denied: {detail}")
-        return None
-    reservation_id = str(response.get("reservation_id") or "").strip() or None
-    job_store.update(
-        job_id,
-        {
-            "gpu_reservation_id": reservation_id,
-            "gpu_reservation_status": "reserved" if reservation_id else "reserve_ok",
-        },
-        event="gpu_reserved",
-        message="GPU reservation accepted.",
-    )
-    return reservation_id
-
-
-def _release_gpu_for_job(
-    job_store: _JobStore,
-    job_id: str,
-    reservation_id: str | None,
-) -> None:
-    job = job_store.get(job_id)
-    if job is None or not _gpu_reservation_enabled_for(job):
-        return
-    if reservation_id is None and job.gpu_reservation_status not in {"reserve_ok", "reserved"}:
-        return
-    try:
-        _post_gpu_reservation(
-            _gpu_reservation_payload(action="release", job=job, reservation_id=reservation_id)
-        )
-    except Exception as exc:
-        job_store.update(
-            job_id,
-            {"gpu_reservation_status": f"release_failed: {exc}"},
-            event="gpu_release_failed",
-            message="GPU reservation release failed.",
-        )
-        return
-    job_store.update(
-        job_id,
-        {"gpu_reservation_status": "released"},
-        event="gpu_released",
-        message="GPU reservation released.",
-    )
 
 
 def _query_bool(raw: str | None, *, default: bool) -> bool:
@@ -1465,10 +1320,8 @@ def _build_handler(*, work_root: Path, default_lang: str):
         def _progress_cb(value: int, status: str) -> None:
             _set_state(status="running", progress=value, message=status)
 
-        reservation_id: str | None = None
         _set_state(status="running", progress=1, message="Starting")
         try:
-            reservation_id = _reserve_gpu_for_job(job_store, job_id)
             page_numbers = parse_page_numbers(pages_raw)
             summary: SearchablePdfSummary = build_searchable_pdf(
                 pdf_path=input_path,
@@ -1495,8 +1348,6 @@ def _build_handler(*, work_root: Path, default_lang: str):
             )
         except Exception as exc:
             _set_state(status="error", progress=100, message="Failed", error=str(exc))
-        finally:
-            _release_gpu_for_job(job_store, job_id, reservation_id)
 
     def _worker_loop() -> None:
         while True:

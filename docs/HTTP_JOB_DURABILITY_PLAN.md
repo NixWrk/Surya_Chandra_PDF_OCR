@@ -209,7 +209,7 @@ Automated tests:
 5. waiting jobs are priority-ordered without preempting running work;
 6. queued jobs can be cancelled before processing starts;
 7. retention cleanup preserves active jobs and removes expired jobs;
-8. GPU reserve/release hooks preserve reservation metadata.
+8. resource metadata remains visible for external schedulers.
 
 ## Implementation Notes
 

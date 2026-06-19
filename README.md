@@ -294,8 +294,9 @@ UNISCAN_JOB_RETENTION_DAYS=30
 UNISCAN_FAILED_JOB_RETENTION_DAYS=90
 ```
 
-Optional GPU reservation hooks for an external LLM/GPU orchestrator are
-documented in [UniScan OCR Job Protocol](docs/UNISCAN_JOB_PROTOCOL.md).
+GPU/LLM scheduling remains the responsibility of the external orchestrator. OCR
+stores resource hints such as `gpu_policy`, `estimated_vram_gb`, and
+`estimated_pages`, but does not reserve GPU slots itself.
 
 ## Docker
 
