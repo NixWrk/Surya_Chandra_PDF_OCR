@@ -78,8 +78,10 @@ Completed baseline:
    `interrupted` states for external orchestrators.
 
 The HTTP job API is the cross-project integration boundary. For the standard
-request metadata, OCR-owned queue semantics, and GPU coordination with the LLM
-orchestrator, see [OCR Orchestrator And GPU Contract](docs/ORCHESTRATOR_GPU_CONTRACT.md).
+request metadata, idempotency rules, OCR-owned queue semantics, and GPU
+coordination with the LLM orchestrator, see
+[UniScan OCR Job Protocol](docs/UNISCAN_JOB_PROTOCOL.md) and
+[OCR Orchestrator And GPU Contract](docs/ORCHESTRATOR_GPU_CONTRACT.md).
 
 ## Last Verified Versions
 
@@ -236,20 +238,45 @@ Asynchronous API:
 ```bash
 curl -X POST "http://127.0.0.1:8000/api/jobs?mode=chandra+surya&lang=rus+eng&strict=1&filename=input.pdf" \
   -H "Content-Type: application/pdf" \
+  -H "X-UniScan-Protocol: uniscan-ocr-job.v1" \
+  -H "X-Project-ID: zotero" \
+  -H "X-Service-ID: zotero-worker" \
+  -H "X-Task-ID: zotero:item:ABCD1234:ocr" \
+  -H "X-Request-ID: <uuid-per-http-attempt>" \
+  -H "X-Idempotency-Key: zotero:item:ABCD1234:ocr:v1" \
+  -H "X-Priority: batch" \
+  -H "X-GPU-Policy: auto" \
+  -H "X-Estimated-VRAM-GB: 8" \
+  -H "X-Estimated-Pages: 42" \
   --data-binary "@input.pdf"
 
+curl "http://127.0.0.1:8000/api/jobs"
 curl "http://127.0.0.1:8000/api/jobs/<job_id>"
 curl "http://127.0.0.1:8000/api/jobs/<job_id>/metadata"
 curl -L "http://127.0.0.1:8000/api/jobs/<job_id>/result" -o output.searchable.pdf
 ```
 
+`X-Idempotency-Key` is the safe retry key. Repeating the exact same PDF and OCR
+parameters with the same key returns the existing job with
+`idempotent_replay: true`; reusing the key for different bytes or parameters
+returns `409 Conflict`.
+
+Queue model:
+
+The async API accepts jobs from multiple projects, workers, containers, and
+manual tools, but the OCR service runs exactly one OCR document at a time.
+`GET /api/jobs` reports `worker_concurrency: 1` with queue counts and active
+jobs. This keeps Chandra/Surya GPU use predictable while still allowing many
+callers to submit work safely.
+
 Durability:
 
 The async API keeps durable job metadata under `UNISCAN_WORK_ROOT/jobs`.
 Each job directory contains `metadata.json`, `events.jsonl`, and, after
-completion, `result.pdf`. `GET /api/jobs/<job_id>` returns the current job
-summary, `GET /api/jobs/<job_id>/metadata` returns the persisted metadata file,
-and `GET /api/jobs/<job_id>/result` downloads the completed searchable PDF.
+completion, `result.pdf`. `GET /api/jobs` returns queue counts plus active and
+recent jobs, `GET /api/jobs/<job_id>` returns the current job summary,
+`GET /api/jobs/<job_id>/metadata` returns the persisted metadata file, and
+`GET /api/jobs/<job_id>/result` downloads the completed searchable PDF.
 Completed results remain discoverable after a service restart. Jobs that were
 `queued` or `running` during a restart are marked `interrupted` instead of
 disappearing, so callers can fail fast and retry at the orchestrator layer.

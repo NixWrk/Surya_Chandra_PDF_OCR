@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import queue
 import shutil
 import threading
 import uuid
@@ -23,6 +25,13 @@ from uniscan.app import (
 )
 
 DEFAULT_DELETE_ORIGINAL_TEXT_LAYER = True
+UNISCAN_JOB_PROTOCOL_VERSION = "uniscan-ocr-job.v1"
+UNISCAN_OCR_WORKER_CONCURRENCY = 1
+
+_DEFAULT_PRIORITY = "normal"
+_KNOWN_PRIORITIES = {"interactive", "normal", "batch", "low"}
+_DEFAULT_GPU_POLICY = "auto"
+_KNOWN_GPU_POLICIES = {"auto", "cuda", "cpu", "none"}
 
 
 def _utc_now() -> str:
@@ -46,9 +55,51 @@ class _JobState:
     input_bytes: int = 0
     result_bytes: int = 0
     completed_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    heartbeat_at: str | None = None
     run_dir: str | None = None
     result_path: Path | None = None
     error: str | None = None
+    protocol_version: str = UNISCAN_JOB_PROTOCOL_VERSION
+    request_id: str | None = None
+    project_id: str | None = None
+    service_id: str | None = None
+    task_id: str | None = None
+    idempotency_key: str | None = None
+    priority: str = _DEFAULT_PRIORITY
+    gpu_policy: str = _DEFAULT_GPU_POLICY
+    estimated_vram_gb: float | None = None
+    estimated_pages: int | None = None
+    ttl_seconds: int | None = None
+    input_sha256: str | None = None
+    request_fingerprint: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class _ProtocolMetadata:
+    protocol_version: str = UNISCAN_JOB_PROTOCOL_VERSION
+    request_id: str | None = None
+    project_id: str | None = None
+    service_id: str | None = None
+    task_id: str | None = None
+    idempotency_key: str | None = None
+    priority: str = _DEFAULT_PRIORITY
+    gpu_policy: str = _DEFAULT_GPU_POLICY
+    estimated_vram_gb: float | None = None
+    estimated_pages: int | None = None
+    ttl_seconds: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class _QueuedJob:
+    job_id: str
+    payload: bytes
+    mode: str
+    pages_raw: str
+    lang: str
+    strict: bool
+    delete_original_text_layer: bool
 
 
 _ACTIVE_JOB_STATUSES = {"queued", "running"}
@@ -76,6 +127,16 @@ class _JobStore:
     def get(self, job_id: str) -> _JobState | None:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def find_by_idempotency_key(self, idempotency_key: str | None) -> _JobState | None:
+        key = (idempotency_key or "").strip()
+        if not key:
+            return None
+        with self._lock:
+            matches = [job for job in self._jobs.values() if job.idempotency_key == key]
+            if not matches:
+                return None
+            return sorted(matches, key=lambda job: job.created_at)[0]
 
     def update(
         self,
@@ -121,6 +182,26 @@ class _JobStore:
                 "jobs": len(self._jobs),
                 "counts": counts,
                 "durable": True,
+                "worker_concurrency": UNISCAN_OCR_WORKER_CONCURRENCY,
+            }
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            counts: dict[str, int] = {}
+            jobs = sorted(self._jobs.values(), key=lambda job: job.created_at)
+            for job in jobs:
+                counts[job.status] = counts.get(job.status, 0) + 1
+            active_jobs = [job for job in jobs if job.status in _ACTIVE_JOB_STATUSES]
+            recent_jobs = jobs[-20:]
+            return {
+                "ok": True,
+                "protocol_version": UNISCAN_JOB_PROTOCOL_VERSION,
+                "root": str(self.jobs_root),
+                "jobs": len(jobs),
+                "counts": counts,
+                "worker_concurrency": UNISCAN_OCR_WORKER_CONCURRENCY,
+                "active_jobs": [_serialize_job(job) for job in active_jobs],
+                "recent_jobs": [_serialize_job(job) for job in recent_jobs],
             }
 
     def _load_existing_jobs(self) -> None:
@@ -142,10 +223,15 @@ class _JobStore:
                     job.progress = 100
                     job.message = "Recovered completed OCR result."
                     job.completed_at = job.completed_at or _utc_now()
+                    job.finished_at = job.finished_at or job.completed_at
+                    job.heartbeat_at = job.heartbeat_at or job.completed_at
             elif job.status in _ACTIVE_JOB_STATUSES:
+                interrupted_at = _utc_now()
                 job.status = "interrupted"
                 job.message = "OCR API restarted before this job finished."
                 job.error = job.error or "Interrupted by OCR API restart."
+                job.finished_at = job.finished_at or interrupted_at
+                job.heartbeat_at = job.heartbeat_at or interrupted_at
             job.updated_at = _utc_now()
             self._jobs[job.job_id] = job
             self._write_metadata_locked(job)
@@ -202,13 +288,42 @@ def _serialize_job(job: _JobState) -> dict[str, Any]:
         "updated_at": job.updated_at,
         "input_bytes": job.input_bytes,
         "result_bytes": job.result_bytes,
+        "protocol_version": job.protocol_version,
+        "priority": job.priority,
+        "gpu_policy": job.gpu_policy,
     }
     if job.completed_at:
         payload["completed_at"] = job.completed_at
+    if job.started_at:
+        payload["started_at"] = job.started_at
+    if job.finished_at:
+        payload["finished_at"] = job.finished_at
+    if job.heartbeat_at:
+        payload["heartbeat_at"] = job.heartbeat_at
     if job.run_dir:
         payload["run_dir"] = job.run_dir
     if job.error:
         payload["error"] = job.error
+    if job.request_id:
+        payload["request_id"] = job.request_id
+    if job.project_id:
+        payload["project_id"] = job.project_id
+    if job.service_id:
+        payload["service_id"] = job.service_id
+    if job.task_id:
+        payload["task_id"] = job.task_id
+    if job.idempotency_key:
+        payload["idempotency_key"] = job.idempotency_key
+    if job.estimated_vram_gb is not None:
+        payload["estimated_vram_gb"] = job.estimated_vram_gb
+    if job.estimated_pages is not None:
+        payload["estimated_pages"] = job.estimated_pages
+    if job.ttl_seconds is not None:
+        payload["ttl_seconds"] = job.ttl_seconds
+    if job.input_sha256:
+        payload["input_sha256"] = job.input_sha256
+    if job.request_fingerprint:
+        payload["request_fingerprint"] = job.request_fingerprint
     if job.result_path is not None:
         payload["result_path"] = str(job.result_path)
     if job.result_path is not None and job.result_path.exists() and job.status == "done":
@@ -239,9 +354,33 @@ def _job_from_metadata(payload: dict[str, Any]) -> _JobState:
             if payload.get("completed_at") is not None
             else None
         ),
+        started_at=str(payload["started_at"]) if payload.get("started_at") else None,
+        finished_at=str(payload["finished_at"]) if payload.get("finished_at") else None,
+        heartbeat_at=str(payload["heartbeat_at"]) if payload.get("heartbeat_at") else None,
         run_dir=str(payload["run_dir"]) if payload.get("run_dir") else None,
         result_path=Path(str(result_path_raw)) if result_path_raw else None,
         error=str(payload["error"]) if payload.get("error") else None,
+        protocol_version=str(payload.get("protocol_version") or UNISCAN_JOB_PROTOCOL_VERSION),
+        request_id=str(payload["request_id"]) if payload.get("request_id") else None,
+        project_id=str(payload["project_id"]) if payload.get("project_id") else None,
+        service_id=str(payload["service_id"]) if payload.get("service_id") else None,
+        task_id=str(payload["task_id"]) if payload.get("task_id") else None,
+        idempotency_key=str(payload["idempotency_key"]) if payload.get("idempotency_key") else None,
+        priority=str(payload.get("priority") or _DEFAULT_PRIORITY),
+        gpu_policy=str(payload.get("gpu_policy") or _DEFAULT_GPU_POLICY),
+        estimated_vram_gb=(
+            float(payload["estimated_vram_gb"])
+            if payload.get("estimated_vram_gb") is not None
+            else None
+        ),
+        estimated_pages=(
+            int(payload["estimated_pages"]) if payload.get("estimated_pages") is not None else None
+        ),
+        ttl_seconds=int(payload["ttl_seconds"]) if payload.get("ttl_seconds") is not None else None,
+        input_sha256=str(payload["input_sha256"]) if payload.get("input_sha256") else None,
+        request_fingerprint=(
+            str(payload["request_fingerprint"]) if payload.get("request_fingerprint") else None
+        ),
     )
 
 
@@ -263,6 +402,243 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _first_query_value(query: dict[str, list[str]], *names: str) -> str | None:
+    for name in names:
+        values = query.get(name)
+        if not values:
+            continue
+        value = str(values[0] or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _first_header_value(headers: Any, *names: str) -> str | None:
+    for name in names:
+        value = headers.get(name) if headers is not None else None
+        normalized = str(value or "").strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _first_request_value(
+    *,
+    query: dict[str, list[str]],
+    headers: Any,
+    query_names: tuple[str, ...],
+    header_names: tuple[str, ...],
+) -> str | None:
+    return _first_header_value(headers, *header_names) or _first_query_value(query, *query_names)
+
+
+def _clean_protocol_text(
+    raw: str | None,
+    *,
+    field: str,
+    max_length: int = 256,
+) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if len(value) > max_length:
+        raise ValueError(f"{field} is too long; maximum is {max_length} characters.")
+    if any(ord(char) < 32 for char in value):
+        raise ValueError(f"{field} must not contain control characters.")
+    return value
+
+
+def _parse_priority(raw: str | None) -> str:
+    value = (raw or _DEFAULT_PRIORITY).strip().lower()
+    aliases = {"high": "interactive", "background": "batch"}
+    value = aliases.get(value, value)
+    if value not in _KNOWN_PRIORITIES:
+        known = ", ".join(sorted(_KNOWN_PRIORITIES))
+        raise ValueError(f"priority must be one of: {known}.")
+    return value
+
+
+def _parse_gpu_policy(raw: str | None) -> str:
+    value = (raw or _DEFAULT_GPU_POLICY).strip().lower()
+    aliases = {"gpu": "cuda", "off": "none"}
+    value = aliases.get(value, value)
+    if value not in _KNOWN_GPU_POLICIES:
+        known = ", ".join(sorted(_KNOWN_GPU_POLICIES))
+        raise ValueError(f"gpu_policy must be one of: {known}.")
+    return value
+
+
+def _parse_optional_float(raw: str | None, *, field: str) -> float | None:
+    value = (raw or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a number.") from exc
+    if parsed < 0:
+        raise ValueError(f"{field} must be non-negative.")
+    return parsed
+
+
+def _parse_optional_int(raw: str | None, *, field: str) -> int | None:
+    value = (raw or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an integer.") from exc
+    if parsed < 0:
+        raise ValueError(f"{field} must be non-negative.")
+    return parsed
+
+
+def _parse_protocol_metadata(parsed, headers: Any) -> _ProtocolMetadata:
+    query = parse_qs(parsed.query, keep_blank_values=True)
+
+    protocol_version = _clean_protocol_text(
+        _first_request_value(
+            query=query,
+            headers=headers,
+            query_names=("protocol_version", "schema_version"),
+            header_names=("X-UniScan-Protocol", "X-OCR-Protocol-Version"),
+        ),
+        field="protocol_version",
+        max_length=80,
+    ) or UNISCAN_JOB_PROTOCOL_VERSION
+    project_id = _clean_protocol_text(
+        _first_request_value(
+            query=query,
+            headers=headers,
+            query_names=("project_id", "project"),
+            header_names=("X-Project-ID", "X-UniScan-Project-ID"),
+        ),
+        field="project_id",
+        max_length=120,
+    )
+    service_id = _clean_protocol_text(
+        _first_request_value(
+            query=query,
+            headers=headers,
+            query_names=("service_id", "service"),
+            header_names=("X-Service-ID", "X-UniScan-Service-ID"),
+        ),
+        field="service_id",
+        max_length=120,
+    )
+    task_id = _clean_protocol_text(
+        _first_request_value(
+            query=query,
+            headers=headers,
+            query_names=("task_id", "task", "caller_job_id"),
+            header_names=("X-Task-ID", "X-UniScan-Task-ID"),
+        ),
+        field="task_id",
+        max_length=512,
+    )
+    request_id = _clean_protocol_text(
+        _first_request_value(
+            query=query,
+            headers=headers,
+            query_names=("request_id",),
+            header_names=("X-Request-ID", "X-UniScan-Request-ID"),
+        ),
+        field="request_id",
+        max_length=256,
+    ) or uuid.uuid4().hex
+    idempotency_key = _clean_protocol_text(
+        _first_request_value(
+            query=query,
+            headers=headers,
+            query_names=("idempotency_key",),
+            header_names=("X-Idempotency-Key", "X-UniScan-Idempotency-Key"),
+        ),
+        field="idempotency_key",
+        max_length=512,
+    )
+    priority = _parse_priority(
+        _first_request_value(
+            query=query,
+            headers=headers,
+            query_names=("priority",),
+            header_names=("X-Priority", "X-UniScan-Priority"),
+        )
+    )
+    gpu_policy = _parse_gpu_policy(
+        _first_request_value(
+            query=query,
+            headers=headers,
+            query_names=("gpu_policy", "gpu"),
+            header_names=("X-GPU-Policy", "X-UniScan-GPU-Policy"),
+        )
+    )
+    estimated_vram_gb = _parse_optional_float(
+        _first_request_value(
+            query=query,
+            headers=headers,
+            query_names=("estimated_vram_gb", "vram_gb"),
+            header_names=("X-Estimated-VRAM-GB", "X-UniScan-Estimated-VRAM-GB"),
+        ),
+        field="estimated_vram_gb",
+    )
+    estimated_pages = _parse_optional_int(
+        _first_request_value(
+            query=query,
+            headers=headers,
+            query_names=("estimated_pages",),
+            header_names=("X-Estimated-Pages", "X-UniScan-Estimated-Pages"),
+        ),
+        field="estimated_pages",
+    )
+    ttl_seconds = _parse_optional_int(
+        _first_request_value(
+            query=query,
+            headers=headers,
+            query_names=("ttl_seconds",),
+            header_names=("X-TTL-Seconds", "X-UniScan-TTL-Seconds"),
+        ),
+        field="ttl_seconds",
+    )
+
+    return _ProtocolMetadata(
+        protocol_version=protocol_version,
+        request_id=request_id,
+        project_id=project_id,
+        service_id=service_id,
+        task_id=task_id,
+        idempotency_key=idempotency_key,
+        priority=priority,
+        gpu_policy=gpu_policy,
+        estimated_vram_gb=estimated_vram_gb,
+        estimated_pages=estimated_pages,
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def _request_fingerprint(
+    *,
+    input_sha256: str,
+    mode: str,
+    pages: str,
+    lang: str,
+    strict: bool,
+    delete_original_text_layer: bool,
+) -> str:
+    payload = {
+        "delete_original_text_layer": bool(delete_original_text_layer),
+        "input_sha256": input_sha256,
+        "lang": lang,
+        "mode": mode,
+        "pages": pages,
+        "strict": bool(strict),
+    }
+    body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def _query_bool(raw: str | None, *, default: bool) -> bool:
@@ -581,7 +957,7 @@ def _html_ui() -> bytes:
         }
         lastJobId = data.job_id;
         jobIdEl.textContent = `job: ${lastJobId}`;
-        setLine("Job created, OCR is running...");
+        setLine("Job created, queued or running...");
         pollTimer = setTimeout(pollJob, 300);
       } catch (err) {
         setLine("Request error: " + err, true);
@@ -624,6 +1000,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
     pipeline_root.mkdir(parents=True, exist_ok=True)
 
     job_store = _JobStore(jobs_root)
+    job_queue: queue.Queue[_QueuedJob] = queue.Queue()
 
     def _run_job(
         job_id: str,
@@ -645,6 +1022,8 @@ def _build_handler(*, work_root: Path, default_lang: str):
             error: str | None = None,
         ) -> None:
             updates: dict[str, Any] = {}
+            now = _utc_now()
+            current = job_store.get(job_id)
             if status is not None:
                 updates["status"] = status
             if progress is not None:
@@ -658,8 +1037,15 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 updates["result_bytes"] = result_path.stat().st_size if result_path.exists() else 0
             if error is not None:
                 updates["error"] = error
+            if status == "running":
+                updates["heartbeat_at"] = now
+                if current is not None and current.started_at is None:
+                    updates["started_at"] = now
             if status == "done":
-                updates["completed_at"] = _utc_now()
+                updates["completed_at"] = now
+            if status in {"done", "error", "interrupted", "cancelled"}:
+                updates["finished_at"] = now
+                updates["heartbeat_at"] = now
             event = status or "progress"
             job_store.update(
                 job_id,
@@ -700,6 +1086,29 @@ def _build_handler(*, work_root: Path, default_lang: str):
             )
         except Exception as exc:
             _set_state(status="error", progress=100, message="Failed", error=str(exc))
+
+    def _worker_loop() -> None:
+        while True:
+            queued_job = job_queue.get()
+            try:
+                _run_job(
+                    queued_job.job_id,
+                    payload=queued_job.payload,
+                    mode=queued_job.mode,
+                    pages_raw=queued_job.pages_raw,
+                    lang=queued_job.lang,
+                    strict=queued_job.strict,
+                    delete_original_text_layer=queued_job.delete_original_text_layer,
+                )
+            finally:
+                job_queue.task_done()
+
+    worker = threading.Thread(
+        target=_worker_loop,
+        name="uniscan-ocr-job-worker",
+        daemon=True,
+    )
+    worker.start()
 
     class SearchablePdfApiHandler(BaseHTTPRequestHandler):
         server_version = "UniScanHTTP/0.2"
@@ -799,8 +1208,45 @@ def _build_handler(*, work_root: Path, default_lang: str):
                     default_lang=default_lang,
                 )
                 parse_page_numbers(pages_raw)
+                protocol = _parse_protocol_metadata(parsed, self.headers)
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+
+            input_sha256 = hashlib.sha256(payload).hexdigest()
+            request_fingerprint = _request_fingerprint(
+                input_sha256=input_sha256,
+                mode=mode,
+                pages=pages_raw,
+                lang=lang,
+                strict=strict,
+                delete_original_text_layer=delete_original_text_layer,
+            )
+            existing = job_store.find_by_idempotency_key(protocol.idempotency_key)
+            if existing is not None:
+                existing_payload = _serialize_job(existing)
+                existing_payload["idempotent_replay"] = True
+                has_fingerprint_conflict = (
+                    existing.request_fingerprint is not None
+                    and existing.request_fingerprint != request_fingerprint
+                )
+                has_input_conflict = (
+                    existing.request_fingerprint is None
+                    and existing.input_sha256 is not None
+                    and existing.input_sha256 != input_sha256
+                )
+                if has_fingerprint_conflict or has_input_conflict:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": (
+                                "Idempotency key already belongs to a different OCR request."
+                            ),
+                            "job": existing_payload,
+                        },
+                    )
+                    return
+                self._send_json(HTTPStatus.OK, existing_payload)
                 return
 
             job_id = uuid.uuid4().hex[:12]
@@ -816,23 +1262,33 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 delete_original_text_layer=bool(delete_original_text_layer),
                 filename=filename,
                 input_bytes=len(payload),
+                protocol_version=protocol.protocol_version,
+                request_id=protocol.request_id,
+                project_id=protocol.project_id,
+                service_id=protocol.service_id,
+                task_id=protocol.task_id,
+                idempotency_key=protocol.idempotency_key,
+                priority=protocol.priority,
+                gpu_policy=protocol.gpu_policy,
+                estimated_vram_gb=protocol.estimated_vram_gb,
+                estimated_pages=protocol.estimated_pages,
+                ttl_seconds=protocol.ttl_seconds,
+                input_sha256=input_sha256,
+                request_fingerprint=request_fingerprint,
             )
             job_store.create(job)
 
-            worker = threading.Thread(
-                target=_run_job,
-                kwargs={
-                    "job_id": job_id,
-                    "payload": payload,
-                    "mode": mode,
-                    "pages_raw": pages_raw,
-                    "lang": lang,
-                    "strict": strict,
-                    "delete_original_text_layer": delete_original_text_layer,
-                },
-                daemon=True,
+            job_queue.put(
+                _QueuedJob(
+                    job_id=job_id,
+                    payload=payload,
+                    mode=mode,
+                    pages_raw=pages_raw,
+                    lang=lang,
+                    strict=strict,
+                    delete_original_text_layer=delete_original_text_layer,
+                )
             )
-            worker.start()
             self._send_json(HTTPStatus.ACCEPTED, _serialize_job(job))
 
         def _handle_get_job(self, job_id: str) -> None:
@@ -841,6 +1297,9 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Job not found: {job_id}"})
                 return
             self._send_json(HTTPStatus.OK, _serialize_job(job))
+
+        def _handle_get_jobs_summary(self) -> None:
+            self._send_json(HTTPStatus.OK, job_store.summary())
 
         def _handle_get_job_metadata(self, job_id: str) -> None:
             metadata = job_store.metadata(job_id)
@@ -874,12 +1333,17 @@ def _build_handler(*, work_root: Path, default_lang: str):
                         "status": "ok",
                         "service": "uniscan",
                         "mode_default": PDF_MODE_HYBRID,
+                        "job_protocol_version": UNISCAN_JOB_PROTOCOL_VERSION,
+                        "ocr_worker_concurrency": UNISCAN_OCR_WORKER_CONCURRENCY,
                         "job_store": job_store.health(),
                     },
                 )
                 return
 
             parts = [part for part in parsed.path.split("/") if part]
+            if parsed.path in {"/api/jobs", "/api/queue"}:
+                self._handle_get_jobs_summary()
+                return
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "jobs":
                 self._handle_get_job(parts[2])
                 return
@@ -923,7 +1387,10 @@ def run_http_server(
     server = ThreadingHTTPServer((host, int(port)), handler)
     print(f"UniScan HTTP API listening on http://{host}:{port}")
     print("GUI: GET /")
-    print("Async API: POST /api/jobs, GET /api/jobs/{job_id}, GET /api/jobs/{job_id}/result")
+    print(
+        "Async API: POST /api/jobs, GET /api/jobs, "
+        "GET /api/jobs/{job_id}, GET /api/jobs/{job_id}/result"
+    )
     print("Sync API: POST /searchable-pdf")
     try:
         server.serve_forever()

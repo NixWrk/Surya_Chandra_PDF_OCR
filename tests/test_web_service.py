@@ -1,9 +1,25 @@
 from __future__ import annotations
 
+import http.client
+import json
+import threading
+from http import HTTPStatus
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from uniscan.web.service import _JobState, _JobStore, _parse_job_request, _query_bool
+from uniscan.web.service import (
+    UNISCAN_OCR_WORKER_CONCURRENCY,
+    UNISCAN_JOB_PROTOCOL_VERSION,
+    _build_handler,
+    _JobState,
+    _JobStore,
+    _parse_job_request,
+    _parse_protocol_metadata,
+    _query_bool,
+    _request_fingerprint,
+)
 
 
 def test_query_bool_parsing() -> None:
@@ -52,6 +68,35 @@ def test_parse_job_request_accepts_legacy_delete_text_layer_name() -> None:
     assert delete_original_text_layer is False
 
 
+def test_parse_protocol_metadata_from_headers_and_query() -> None:
+    parsed = urlparse(
+        "/api/jobs?project_id=query-project&priority=batch&estimated_pages=12&ttl_seconds=3600"
+    )
+    headers = {
+        "X-Project-ID": "zotero",
+        "X-Service-ID": "zotero-worker",
+        "X-Task-ID": "zotero:item:ABCD1234:ocr",
+        "X-Request-ID": "request-1",
+        "X-Idempotency-Key": "zotero:item:ABCD1234:ocr:v1",
+        "X-GPU-Policy": "auto",
+        "X-Estimated-VRAM-GB": "8",
+    }
+
+    metadata = _parse_protocol_metadata(parsed, headers)
+
+    assert metadata.protocol_version == UNISCAN_JOB_PROTOCOL_VERSION
+    assert metadata.project_id == "zotero"
+    assert metadata.service_id == "zotero-worker"
+    assert metadata.task_id == "zotero:item:ABCD1234:ocr"
+    assert metadata.request_id == "request-1"
+    assert metadata.idempotency_key == "zotero:item:ABCD1234:ocr:v1"
+    assert metadata.priority == "batch"
+    assert metadata.gpu_policy == "auto"
+    assert metadata.estimated_vram_gb == 8
+    assert metadata.estimated_pages == 12
+    assert metadata.ttl_seconds == 3600
+
+
 def test_job_store_persists_done_result_metadata(tmp_path: Path) -> None:
     root = tmp_path / "jobs"
     store = _JobStore(root)
@@ -67,6 +112,24 @@ def test_job_store_persists_done_result_metadata(tmp_path: Path) -> None:
         delete_original_text_layer=True,
         filename="input.pdf",
         input_bytes=10,
+        project_id="zotero",
+        service_id="zotero-worker",
+        task_id="zotero:item:ABCD1234:ocr",
+        idempotency_key="zotero:item:ABCD1234:ocr:v1",
+        priority="batch",
+        gpu_policy="auto",
+        estimated_vram_gb=8,
+        estimated_pages=42,
+        ttl_seconds=86400,
+        input_sha256="abc",
+        request_fingerprint=_request_fingerprint(
+            input_sha256="abc",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+        ),
     )
 
     store.create(job)
@@ -94,6 +157,15 @@ def test_job_store_persists_done_result_metadata(tmp_path: Path) -> None:
     assert metadata["result_bytes"] == len(b"%PDF result")
     assert metadata["result_url"] == "/api/jobs/JOB1/result"
     assert metadata["metadata_url"] == "/api/jobs/JOB1/metadata"
+    assert metadata["project_id"] == "zotero"
+    assert metadata["service_id"] == "zotero-worker"
+    assert metadata["task_id"] == "zotero:item:ABCD1234:ocr"
+    assert metadata["idempotency_key"] == "zotero:item:ABCD1234:ocr:v1"
+    assert metadata["priority"] == "batch"
+    assert metadata["estimated_vram_gb"] == 8
+    assert metadata["estimated_pages"] == 42
+    assert metadata["ttl_seconds"] == 86400
+    assert reloaded.find_by_idempotency_key("zotero:item:ABCD1234:ocr:v1") is not None
     assert (root / "JOB1" / "metadata.json").exists()
     assert (root / "JOB1" / "events.jsonl").exists()
 
@@ -123,3 +195,238 @@ def test_job_store_marks_active_jobs_interrupted_after_restart(tmp_path: Path) -
     assert metadata is not None
     assert metadata["status"] == "interrupted"
     assert metadata["error"] == "Interrupted by OCR API restart."
+    assert metadata["finished_at"]
+
+
+def test_job_store_summary_reports_counts_and_active_jobs(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    store.create(
+        _JobState(
+            job_id="JOB3",
+            status="running",
+            progress=55,
+            message="OCR is running",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+            priority="interactive",
+        )
+    )
+
+    summary = store.summary()
+
+    assert summary["protocol_version"] == UNISCAN_JOB_PROTOCOL_VERSION
+    assert summary["counts"] == {"running": 1}
+    assert summary["worker_concurrency"] == UNISCAN_OCR_WORKER_CONCURRENCY
+    assert summary["active_jobs"][0]["job_id"] == "JOB3"
+    assert summary["active_jobs"][0]["priority"] == "interactive"
+
+
+def test_http_jobs_are_processed_one_document_at_a_time(tmp_path: Path, monkeypatch) -> None:
+    result_pdf = tmp_path / "result.pdf"
+    result_pdf.write_bytes(b"%PDF result")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    lock = threading.Lock()
+    call_count = 0
+    active_count = 0
+    max_active = 0
+
+    def fake_build_searchable_pdf(**_kwargs):
+        nonlocal active_count, call_count, max_active
+        with lock:
+            call_count += 1
+            call_index = call_count
+            active_count += 1
+            max_active = max(max_active, active_count)
+        try:
+            if call_index == 1:
+                first_started.set()
+                if not release_first.wait(timeout=5):
+                    raise RuntimeError("Timed out waiting to release first OCR job.")
+            elif call_index == 2:
+                second_started.set()
+            return SimpleNamespace(output_pdf_path=result_pdf, run_dir=run_dir)
+        finally:
+            with lock:
+                active_count -= 1
+
+    monkeypatch.setattr("uniscan.web.service.build_searchable_pdf", fake_build_searchable_pdf)
+    handler = _build_handler(work_root=tmp_path / "work", default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        port = server.server_address[1]
+
+        first_conn = http.client.HTTPConnection("127.0.0.1", port)
+        first_conn.request(
+            "POST",
+            "/api/jobs?filename=first.pdf",
+            body=b"%PDF first",
+            headers={
+                "Content-Type": "application/pdf",
+                "X-Project-ID": "project-a",
+                "X-Service-ID": "worker-a",
+            },
+        )
+        first_response = first_conn.getresponse()
+        first_payload = json.loads(first_response.read().decode("utf-8"))
+        first_conn.close()
+
+        assert first_response.status == HTTPStatus.ACCEPTED
+        assert first_started.wait(timeout=2)
+
+        second_conn = http.client.HTTPConnection("127.0.0.1", port)
+        second_conn.request(
+            "POST",
+            "/api/jobs?filename=second.pdf",
+            body=b"%PDF second",
+            headers={
+                "Content-Type": "application/pdf",
+                "X-Project-ID": "project-b",
+                "X-Service-ID": "worker-b",
+            },
+        )
+        second_response = second_conn.getresponse()
+        second_payload = json.loads(second_response.read().decode("utf-8"))
+        second_conn.close()
+
+        assert second_response.status == HTTPStatus.ACCEPTED
+        assert first_payload["job_id"] != second_payload["job_id"]
+        assert not second_started.wait(timeout=0.2)
+
+        status_conn = http.client.HTTPConnection("127.0.0.1", port)
+        status_conn.request("GET", f"/api/jobs/{second_payload['job_id']}")
+        status_response = status_conn.getresponse()
+        status_payload = json.loads(status_response.read().decode("utf-8"))
+        status_conn.close()
+
+        assert status_response.status == HTTPStatus.OK
+        assert status_payload["status"] == "queued"
+
+        summary_conn = http.client.HTTPConnection("127.0.0.1", port)
+        summary_conn.request("GET", "/api/jobs")
+        summary_response = summary_conn.getresponse()
+        summary_payload = json.loads(summary_response.read().decode("utf-8"))
+        summary_conn.close()
+
+        assert summary_response.status == HTTPStatus.OK
+        assert summary_payload["worker_concurrency"] == UNISCAN_OCR_WORKER_CONCURRENCY
+        assert summary_payload["counts"] == {"queued": 1, "running": 1}
+
+        release_first.set()
+        assert second_started.wait(timeout=2)
+        with lock:
+            assert max_active == 1
+    finally:
+        release_first.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_job_idempotency_replays_existing_job(tmp_path: Path, monkeypatch) -> None:
+    result_pdf = tmp_path / "result.pdf"
+    result_pdf.write_bytes(b"%PDF result")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    def fake_build_searchable_pdf(**_kwargs):
+        return SimpleNamespace(output_pdf_path=result_pdf, run_dir=run_dir)
+
+    monkeypatch.setattr("uniscan.web.service.build_searchable_pdf", fake_build_searchable_pdf)
+    handler = _build_handler(work_root=tmp_path / "work", default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        port = server.server_address[1]
+        body = b"%PDF-1.4\n"
+        headers = {
+            "Content-Type": "application/pdf",
+            "X-Project-ID": "zotero",
+            "X-Service-ID": "zotero-worker",
+            "X-Task-ID": "zotero:item:ABCD1234:ocr",
+            "X-Idempotency-Key": "zotero:item:ABCD1234:ocr:v1",
+            "X-Priority": "batch",
+        }
+
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request("POST", "/api/jobs?filename=input.pdf", body=body, headers=headers)
+        first_response = conn.getresponse()
+        first_payload = json.loads(first_response.read().decode("utf-8"))
+        conn.close()
+
+        assert first_response.status == HTTPStatus.ACCEPTED
+
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request("POST", "/api/jobs?filename=input.pdf", body=body, headers=headers)
+        second_response = conn.getresponse()
+        second_payload = json.loads(second_response.read().decode("utf-8"))
+        conn.close()
+
+        assert second_response.status == HTTPStatus.OK
+        assert second_payload["idempotent_replay"] is True
+        assert second_payload["job_id"] == first_payload["job_id"]
+        assert second_payload["project_id"] == "zotero"
+        assert second_payload["priority"] == "batch"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_job_idempotency_rejects_conflicting_request(tmp_path: Path, monkeypatch) -> None:
+    result_pdf = tmp_path / "result.pdf"
+    result_pdf.write_bytes(b"%PDF result")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    def fake_build_searchable_pdf(**_kwargs):
+        return SimpleNamespace(output_pdf_path=result_pdf, run_dir=run_dir)
+
+    monkeypatch.setattr("uniscan.web.service.build_searchable_pdf", fake_build_searchable_pdf)
+    handler = _build_handler(work_root=tmp_path / "work", default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        port = server.server_address[1]
+        headers = {
+            "Content-Type": "application/pdf",
+            "X-Idempotency-Key": "same-key",
+        }
+
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request("POST", "/api/jobs?mode=chandra+surya", body=b"%PDF A", headers=headers)
+        first_response = conn.getresponse()
+        first_response.read()
+        conn.close()
+
+        assert first_response.status == HTTPStatus.ACCEPTED
+
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request("POST", "/api/jobs?mode=surya", body=b"%PDF A", headers=headers)
+        second_response = conn.getresponse()
+        second_payload = json.loads(second_response.read().decode("utf-8"))
+        conn.close()
+
+        assert second_response.status == HTTPStatus.CONFLICT
+        assert "different OCR request" in second_payload["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

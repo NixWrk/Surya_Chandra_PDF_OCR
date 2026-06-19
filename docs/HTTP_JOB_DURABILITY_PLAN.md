@@ -20,9 +20,15 @@ orchestrator, see [OCR Orchestrator And GPU Contract](ORCHESTRATOR_GPU_CONTRACT.
 Current status: the HTTP service now writes durable per-job metadata under
 `UNISCAN_WORK_ROOT/jobs/<job_id>/metadata.json`, appends progress events to
 `events.jsonl`, and keeps completed `result.pdf` files discoverable after
-restart. Active in-memory work cannot be resumed yet; `queued` or `running`
-jobs are restored as `interrupted`, which lets external orchestrators fail fast
-and retry from their own durable queues.
+restart. Job metadata now includes the shared
+`uniscan-ocr-job.v1` protocol fields described in
+[UniScan OCR Job Protocol](UNISCAN_JOB_PROTOCOL.md), including caller identity,
+idempotency, priority, and coarse GPU estimates. `GET /api/jobs` exposes queue
+counts, active jobs, recent jobs, and `worker_concurrency: 1`. The service may
+accept jobs from multiple callers, but only one OCR document is processed at a
+time. Active in-memory work cannot be resumed yet; `queued` or `running` jobs
+are restored as `interrupted`, which lets external orchestrators fail fast and
+retry from their own durable queues.
 
 ## Goal
 
@@ -67,6 +73,19 @@ Future SQLite-backed scheduling can add:
 18. `finished_at`
 19. `worker_pid` or process identity
 20. `heartbeat_at`
+21. `protocol_version`
+22. `project_id`
+23. `service_id`
+24. `task_id`
+25. `request_id`
+26. `idempotency_key`
+27. `priority`
+28. `gpu_policy`
+29. `estimated_vram_gb`
+30. `estimated_pages`
+31. `ttl_seconds`
+32. `input_sha256`
+33. `request_fingerprint`
 
 Optional future work: store request input bytes as `input.pdf` before returning
 `202 Accepted`, so a job can be resumed by the OCR container itself instead of
@@ -114,6 +133,8 @@ Keep the existing API stable:
 
 Extend serialized jobs with:
 
+Implemented baseline fields:
+
 1. `created_at`
 2. `started_at`
 3. `updated_at`
@@ -121,12 +142,20 @@ Extend serialized jobs with:
 5. `heartbeat_at`
 6. `input_bytes`
 7. `result_bytes`
-8. `metadata_url` if a separate metadata endpoint is added.
+8. protocol metadata from `uniscan-ocr-job.v1`
+9. `metadata_url` for completed jobs
 
-Optional future endpoint:
+Implemented endpoint:
 
 ```http
 GET /api/jobs/<job_id>/metadata
+```
+
+Implemented queue summary endpoints:
+
+```http
+GET /api/jobs
+GET /api/queue
 ```
 
 ## Retention And Cleanup
@@ -177,5 +206,5 @@ Keep the initial implementation conservative:
 2. use SQLite from the standard library;
 3. use atomic writes for `metadata.json` and `events.jsonl` appends;
 4. keep in-memory locks around job updates, but make SQLite the source of truth;
-5. avoid automatic concurrent OCR after restart until scheduling semantics are
-   explicit and tested.
+5. keep OCR execution serialized unless a future GPU reservation layer provides
+   explicit, tested multi-document scheduling.
