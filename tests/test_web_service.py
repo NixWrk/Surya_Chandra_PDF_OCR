@@ -49,7 +49,7 @@ def test_parse_job_request_defaults() -> None:
 
 def test_parse_job_request_applies_filename_extension() -> None:
     parsed = urlparse(
-        "/api/jobs?mode=surya&pages=1-3&lang=eng&strict=0&filename=my_file&delete_text_layer=0"
+        "/api/jobs?mode=surya&pages=1-3&lang=eng&strict=0&filename=my_file"
     )
     mode, pages_raw, lang, strict, filename, delete_original_text_layer = _parse_job_request(
         parsed,
@@ -60,13 +60,17 @@ def test_parse_job_request_applies_filename_extension() -> None:
     assert lang == "eng"
     assert strict is False
     assert filename == "my_file.pdf"
-    assert delete_original_text_layer is False
+    assert delete_original_text_layer is True
 
 
-def test_parse_job_request_accepts_legacy_delete_text_layer_name() -> None:
+def test_parse_job_request_rejects_disabled_text_layer_cleanup() -> None:
     parsed = urlparse("/api/jobs?delete_original_text_layer=false")
-    *_, delete_original_text_layer = _parse_job_request(parsed, default_lang="rus+eng")
-    assert delete_original_text_layer is False
+    try:
+        _parse_job_request(parsed, default_lang="rus+eng")
+    except ValueError as exc:
+        assert "delete_text_layer cannot be disabled" in str(exc)
+    else:
+        raise AssertionError("Expected disabled text layer cleanup to be rejected")
 
 
 def test_parse_protocol_metadata_from_headers_and_query() -> None:

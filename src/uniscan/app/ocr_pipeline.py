@@ -466,7 +466,7 @@ def build_searchable_pdf(
     return_bytes: bool | None = None,
     strict: bool = True,
     progress: ProgressCallback | None = None,
-    delete_original_text_layer: bool = False,
+    delete_original_text_layer: bool = True,
 ) -> SearchablePdfSummary:
     """Build one searchable PDF from file-path or in-memory PDF input."""
     if (pdf_path is None and pdf_bytes is None) or (pdf_path is not None and pdf_bytes is not None):
@@ -493,9 +493,25 @@ def build_searchable_pdf(
         input_path = staged_dir / "input.pdf"
         input_path.write_bytes(pdf_bytes)
 
+    processing_input_path = input_path
+    source_pdf_root = input_path.parent
+    if delete_original_text_layer:
+        _emit_progress(progress, 1, "Removing original text layer...")
+        textless_root = (
+            resolved_work_root
+            / f"_source_pdf_without_text_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        ).resolve()
+        textless_pdf = textless_root / input_path.name
+        processing_input_path = _build_textless_source_pdf(
+            source_pdf=input_path,
+            out_pdf=textless_pdf,
+            dpi=_resolve_textless_dpi(),
+        )
+        source_pdf_root = textless_root
+
     _emit_progress(progress, 2, "OCR benchmarking...")
     benchmark = run_basic_ocr_benchmark(
-        pdf_path=input_path,
+        pdf_path=processing_input_path,
         mode_key=benchmark_mode_key,
         page_numbers=page_numbers,
         lang=lang,
@@ -521,17 +537,6 @@ def build_searchable_pdf(
         geometry_override_dir = benchmark.run_dir / "surya"
     else:
         geometry_override_dir = None
-    source_pdf_root = input_path.parent
-    if delete_original_text_layer:
-        _emit_progress(progress, 84, "Removing original text layer...")
-        textless_root = benchmark.run_dir / "_source_pdf_without_text"
-        textless_pdf = textless_root / input_path.name
-        _build_textless_source_pdf(
-            source_pdf=input_path,
-            out_pdf=textless_pdf,
-            dpi=_resolve_textless_dpi(),
-        )
-        source_pdf_root = textless_root
 
     with _temporary_env(
         "UNISCAN_CHANDRA_GEOMETRY_DIR",

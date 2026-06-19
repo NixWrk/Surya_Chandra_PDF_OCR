@@ -900,6 +900,10 @@ def _parse_job_request(parsed, *, default_lang: str) -> tuple[str, str, str, boo
         )[0],
         default=DEFAULT_DELETE_ORIGINAL_TEXT_LAYER,
     )
+    if not delete_original_text_layer:
+        raise ValueError(
+            "delete_text_layer cannot be disabled; OCR always removes the existing text layer."
+        )
     filename = (query.get("filename", ["document.pdf"])[0] or "document.pdf").strip()
     if not filename.lower().endswith(".pdf"):
         filename = f"{filename}.pdf"
@@ -1068,9 +1072,8 @@ def _html_ui() -> bytes:
       </div>
       <div class="field">
         <label>Existing text layer</label>
-        <select id="deleteTextLayer">
-          <option value="1" selected>remove</option>
-          <option value="0">keep</option>
+        <select id="deleteTextLayer" disabled>
+          <option value="1" selected>remove before OCR</option>
         </select>
       </div>
     </div>

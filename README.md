@@ -147,7 +147,10 @@ After setup, the GUI lets you:
 1. Choose a PDF.
 2. Pick `chandra+surya`, `chandra`, or `surya`.
 3. Optionally limit OCR to pages such as `1,3,5-8`.
-4. Optionally remove an existing text layer before building the new searchable PDF.
+
+Before OCR starts, UniScan always creates an image-only copy of the source PDF
+and removes any existing text layer. Chandra/Surya run against that cleaned copy,
+and the final searchable PDF is built over the cleaned copy as well.
 
 By default, the GUI overwrites the selected input PDF with the searchable version. Intermediate artifacts are written under `outputs/`.
 
@@ -219,7 +222,8 @@ GPU smoke/prewarm:
 
 The smoke script copies the input into `outputs/gpu_hybrid_smoke`, sets the
 CUDA-only Chandra/Surya runtime variables, uses the persistent local model
-caches, and runs `chandra+surya` without modifying the original PDF.
+caches, removes the original text layer before OCR, and runs `chandra+surya`
+without modifying the original PDF.
 
 ## HTTP Service
 
@@ -309,6 +313,9 @@ GPU/LLM scheduling remains the responsibility of the external orchestrator. OCR
 stores resource hints such as `gpu_policy`, `estimated_vram_gb`, and
 `estimated_pages`, but does not reserve GPU slots itself. The OCR runtime itself
 requires CUDA and fails loudly instead of falling back to CPU.
+
+Existing text layers are always removed before OCR. `delete_text_layer=0` and
+`delete_original_text_layer=false` are rejected by the HTTP API.
 
 ## Docker
 

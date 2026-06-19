@@ -21,13 +21,15 @@ OCR owns accepted OCR job state:
 1. accept or reject incoming OCR jobs;
 2. persist `input.pdf`, metadata, event log, and job index before returning
    `202 Accepted`;
-3. accept jobs from multiple projects, workers, containers, and manual tools;
-4. process no more than one OCR document at a time;
-5. expose `queued`, `running`, `done`, `error`, `interrupted`, and `cancelled`
+3. remove the existing text layer by creating an image-only source PDF before
+   OCR starts;
+4. accept jobs from multiple projects, workers, containers, and manual tools;
+5. process no more than one OCR document at a time;
+6. expose `queued`, `running`, `done`, `error`, `interrupted`, and `cancelled`
    status;
-6. requeue durable `queued` jobs after restart;
-7. mark interrupted `running` jobs clearly after restart;
-8. keep completed results discoverable until OCR-owned retention cleanup removes
+7. requeue durable `queued` jobs after restart;
+8. mark interrupted `running` jobs clearly after restart;
+9. keep completed results discoverable until OCR-owned retention cleanup removes
    them.
 
 ## External Orchestrator Responsibility

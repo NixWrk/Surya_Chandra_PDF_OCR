@@ -56,9 +56,18 @@ def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     produced_pdf = tmp_path / "produced.pdf"
     produced_pdf.write_bytes(b"SEARCHABLE")
+    seen: dict[str, Path] = {}
+
+    def fake_build_textless_source_pdf(*, source_pdf: Path, out_pdf: Path, dpi: int = 300) -> Path:
+        assert source_pdf == input_pdf.resolve()
+        assert dpi == 300
+        out_pdf.parent.mkdir(parents=True, exist_ok=True)
+        out_pdf.write_bytes(b"TEXTLESS")
+        seen["textless_pdf"] = out_pdf
+        return out_pdf
 
     def fake_run_basic_ocr_benchmark(**kwargs) -> BasicOcrRunSummary:
-        assert kwargs["pdf_path"] == input_pdf.resolve()
+        assert kwargs["pdf_path"] == seen["textless_pdf"]
         return BasicOcrRunSummary(
             run_dir=run_dir,
             results=tuple(),
@@ -72,12 +81,14 @@ def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
 
     def fake_run_artifact_searchable_package(**kwargs):
         assert kwargs["engines"] == ("chandra",)
+        assert kwargs["pdf_root"] == seen["textless_pdf"].parent
         expected_geometry = str((run_dir / "surya").resolve())
         assert os.environ.get("UNISCAN_CHANDRA_GEOMETRY_DIR") == expected_geometry
         return [_ok_artifact_result(produced_pdf, engine="chandra")]
 
     monkeypatch.setattr(ocr_pipeline, "run_basic_ocr_benchmark", fake_run_basic_ocr_benchmark)
     monkeypatch.setattr(ocr_pipeline, "build_compare_txt_from_benchmark", fake_build_compare_txt_from_benchmark)
+    monkeypatch.setattr(ocr_pipeline, "_build_textless_source_pdf", fake_build_textless_source_pdf)
     monkeypatch.setattr(ocr_pipeline, "run_artifact_searchable_package", fake_run_artifact_searchable_package)
 
     summary = build_searchable_pdf(
@@ -101,12 +112,22 @@ def test_build_searchable_pdf_from_bytes_returns_bytes(monkeypatch) -> None:
     produced_pdf = tmp_path / "produced_bytes.pdf"
     produced_pdf.write_bytes(b"PDF-BYTES-RESULT")
     seen_pdf_path: dict[str, Path] = {}
+    seen_textless_path: dict[str, Path] = {}
+
+    def fake_build_textless_source_pdf(*, source_pdf: Path, out_pdf: Path, dpi: int = 300) -> Path:
+        assert source_pdf.exists()
+        assert source_pdf.read_bytes() == b"INLINE-PDF"
+        assert dpi == 300
+        out_pdf.parent.mkdir(parents=True, exist_ok=True)
+        out_pdf.write_bytes(b"TEXTLESS-INLINE-PDF")
+        seen_textless_path["value"] = out_pdf
+        return out_pdf
 
     def fake_run_basic_ocr_benchmark(**kwargs) -> BasicOcrRunSummary:
         staged_pdf = Path(kwargs["pdf_path"])
         seen_pdf_path["value"] = staged_pdf
         assert staged_pdf.exists()
-        assert staged_pdf.read_bytes() == b"INLINE-PDF"
+        assert staged_pdf.read_bytes() == b"TEXTLESS-INLINE-PDF"
 
         run_dir = tmp_path / "inline_run"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -123,11 +144,13 @@ def test_build_searchable_pdf_from_bytes_returns_bytes(monkeypatch) -> None:
 
     def fake_run_artifact_searchable_package(**kwargs):
         assert kwargs["engines"] == ("surya",)
+        assert kwargs["pdf_root"] == seen_textless_path["value"].parent
         assert os.environ.get("UNISCAN_CHANDRA_GEOMETRY_DIR") is None
         return [_ok_artifact_result(produced_pdf, engine="surya")]
 
     monkeypatch.setattr(ocr_pipeline, "run_basic_ocr_benchmark", fake_run_basic_ocr_benchmark)
     monkeypatch.setattr(ocr_pipeline, "build_compare_txt_from_benchmark", fake_build_compare_txt_from_benchmark)
+    monkeypatch.setattr(ocr_pipeline, "_build_textless_source_pdf", fake_build_textless_source_pdf)
     monkeypatch.setattr(ocr_pipeline, "run_artifact_searchable_package", fake_run_artifact_searchable_package)
 
     summary = build_searchable_pdf(
@@ -159,7 +182,7 @@ def test_build_searchable_pdf_uses_textless_source_when_delete_enabled(monkeypat
     seen: dict[str, Path] = {}
 
     def fake_run_basic_ocr_benchmark(**kwargs) -> BasicOcrRunSummary:
-        assert kwargs["pdf_path"] == input_pdf.resolve()
+        assert kwargs["pdf_path"] == seen["textless_pdf"]
         return BasicOcrRunSummary(
             run_dir=run_dir,
             results=tuple(),
@@ -181,7 +204,7 @@ def test_build_searchable_pdf_uses_textless_source_when_delete_enabled(monkeypat
 
     def fake_run_artifact_searchable_package(**kwargs):
         assert kwargs["engines"] == ("surya",)
-        assert kwargs["pdf_root"] == (run_dir / "_source_pdf_without_text")
+        assert kwargs["pdf_root"] == seen["textless_pdf"].parent
         assert seen["textless_pdf"].exists()
         return [_ok_artifact_result(produced_pdf, engine="surya")]
 

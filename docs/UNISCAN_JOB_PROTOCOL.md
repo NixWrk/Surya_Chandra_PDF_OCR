@@ -83,8 +83,8 @@ Query parameters:
 | `pages` | all pages | Optional page selection such as `1,3,5-8`. |
 | `strict` | `1` | Fail the job if required OCR artifacts are missing. |
 | `filename` | `document.pdf` | Original filename used for metadata and result download name. |
-| `delete_text_layer` | `1` | Remove the existing text layer before building the output. |
-| `delete_original_text_layer` | same as `delete_text_layer` | Legacy alias accepted by the service. |
+| `delete_text_layer` | `1` | Must stay enabled. OCR removes the existing text layer before processing. |
+| `delete_original_text_layer` | same as `delete_text_layer` | Legacy alias accepted only when true. |
 
 ## Protocol Metadata
 
@@ -272,6 +272,15 @@ An external orchestrator may use those fields before submitting OCR work. Once a
 job is accepted, the OCR service processes it according to its own single-worker
 queue and does not call back to an LLM/GPU orchestrator. Accepted OCR execution
 is CUDA-only: `cpu` and `none` are not valid `gpu_policy` values for this API.
+
+## Source PDF Normalization
+
+Accepted OCR work is always normalized to an image-only source PDF before OCR
+starts. Any existing text layer is removed first, then Chandra and Surya process
+the cleaned copy. The final searchable PDF is built over that cleaned copy.
+
+Requests that try to disable cleanup with `delete_text_layer=0` or
+`delete_original_text_layer=false` are rejected with `400 Bad Request`.
 
 ## Ownership Rules
 
