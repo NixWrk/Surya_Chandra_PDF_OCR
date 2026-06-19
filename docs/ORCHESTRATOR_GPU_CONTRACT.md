@@ -98,20 +98,18 @@ The expected local grouping is:
 
 ```text
 D:/Elvis_projects/
-  zotero/
+  Zotero_Automation/
     Zotero_automatization/
     zotero-ingest-worker/
     zotero-html-translate-worker/
     zotero-file-relay/
-  ocr/
-    Surya_Chandra_PDF_OCR/
-  orcestrator/
-    LLM_Orcestration/
+  Surya_Chandra_PDF_OCR/
+  LLM_Orchestrator/
 ```
 
-`ocr` and `orcestrator` are universal infrastructure folders. Product folders
-such as `zotero` call them through HTTP APIs and should not vendor their runtime
-logic.
+`Surya_Chandra_PDF_OCR` and `LLM_Orchestrator` are universal infrastructure
+folders. Product folders such as `Zotero_Automation` call them through HTTP APIs
+and should not vendor their runtime logic.
 
 ## Implementation Tasks
 
