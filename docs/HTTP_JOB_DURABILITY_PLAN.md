@@ -14,6 +14,9 @@ This is now the preferred integration path for external orchestrators such as
 `zotero-worker`, because long OCR runs can be observed through polling instead
 of one silent synchronous response.
 
+For the cross-project OCR request shape and GPU coordination rules with the LLM
+orchestrator, see [OCR Orchestrator And GPU Contract](ORCHESTRATOR_GPU_CONTRACT.md).
+
 Current status: the HTTP service now writes durable per-job metadata under
 `UNISCAN_WORK_ROOT/jobs/<job_id>/metadata.json`, appends progress events to
 `events.jsonl`, and keeps completed `result.pdf` files discoverable after

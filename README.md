@@ -77,6 +77,10 @@ Completed baseline:
 7. Durable async HTTP job metadata with restart-visible `done` and
    `interrupted` states for external orchestrators.
 
+The HTTP job API is the cross-project integration boundary. For the standard
+request metadata, OCR-owned queue semantics, and GPU coordination with the LLM
+orchestrator, see [OCR Orchestrator And GPU Contract](docs/ORCHESTRATOR_GPU_CONTRACT.md).
+
 ## Last Verified Versions
 
 Last checked on 2026-04-21 with Python 3.11 on Windows. The setup script now auto-selects the PyTorch CUDA wheel from GPU compute capability. GTX 1070 / `sm_61` requires `cu126`; `cu128` is not compatible with that card because current PyTorch `cu128` wheels start at `sm_75`.
