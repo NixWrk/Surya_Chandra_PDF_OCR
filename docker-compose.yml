@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
     image: surya-chandra-ocr:latest
     container_name: surya-chandra-ocr-api
+    profiles: ["ocr"]
     ports:
       - "${UNISCAN_HOST_PORT:-8000}:8000"
     environment:
@@ -31,7 +32,7 @@ services:
           - surya-chandra-ocr-api
           - ocr-api
     gpus: all
-    restart: unless-stopped
+    restart: "no"
 
 networks:
   zotero-automation:
