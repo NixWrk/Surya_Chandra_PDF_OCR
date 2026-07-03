@@ -4,6 +4,8 @@ import http.client
 import json
 import sqlite3
 import threading
+import time
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -218,6 +220,38 @@ def test_job_store_marks_active_jobs_interrupted_after_restart(tmp_path: Path) -
     assert metadata is not None
     assert metadata["status"] == "interrupted"
     assert metadata["error"] == "Interrupted by OCR API restart."
+    assert metadata["finished_at"]
+
+
+def test_job_store_reclaims_stale_running_job_by_heartbeat_timeout(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    old_time = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+    store.create(
+        _JobState(
+            job_id="STALE",
+            status="running",
+            progress=42,
+            message="OCR is running",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+            started_at=old_time,
+            heartbeat_at=old_time,
+        )
+    )
+
+    reclaimed = store.reclaim_stale_running_jobs(timeout_seconds=60)
+    metadata = store.metadata("STALE")
+
+    assert reclaimed == ["STALE"]
+    assert metadata is not None
+    assert metadata["status"] == "interrupted"
+    assert metadata["error"] == "Recovered stale OCR running job after 60 seconds without heartbeat."
     assert metadata["finished_at"]
 
 
@@ -457,6 +491,97 @@ def test_http_jobs_are_processed_one_document_at_a_time(tmp_path: Path, monkeypa
         assert second_started.wait(timeout=2)
         with lock:
             assert max_active == 1
+    finally:
+        release_first.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_watchdog_reclaims_stale_running_job_and_starts_next(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OCR_WORKER_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("OCR_WORKER_WATCHDOG_INTERVAL_SECONDS", "1")
+    result_pdf = tmp_path / "result.pdf"
+    result_pdf.write_bytes(b"%PDF result")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    lock = threading.Lock()
+    call_count = 0
+
+    def fake_build_searchable_pdf(**_kwargs):
+        nonlocal call_count
+        with lock:
+            call_count += 1
+            call_index = call_count
+        if call_index == 1:
+            first_started.set()
+            if not release_first.wait(timeout=10):
+                raise RuntimeError("Timed out waiting to release first OCR job.")
+        elif call_index == 2:
+            second_started.set()
+        return SimpleNamespace(output_pdf_path=result_pdf, run_dir=run_dir)
+
+    monkeypatch.setattr("uniscan.web.service.build_searchable_pdf", fake_build_searchable_pdf)
+    handler = _build_handler(work_root=tmp_path / "work", default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        port = server.server_address[1]
+
+        first_conn = http.client.HTTPConnection("127.0.0.1", port)
+        first_conn.request(
+            "POST",
+            "/api/jobs?filename=first.pdf",
+            body=b"%PDF first",
+            headers={"Content-Type": "application/pdf"},
+        )
+        first_response = first_conn.getresponse()
+        first_payload = json.loads(first_response.read().decode("utf-8"))
+        first_conn.close()
+
+        assert first_response.status == HTTPStatus.ACCEPTED
+        assert first_started.wait(timeout=2)
+
+        second_conn = http.client.HTTPConnection("127.0.0.1", port)
+        second_conn.request(
+            "POST",
+            "/api/jobs?filename=second.pdf",
+            body=b"%PDF second",
+            headers={"Content-Type": "application/pdf"},
+        )
+        second_response = second_conn.getresponse()
+        second_payload = json.loads(second_response.read().decode("utf-8"))
+        second_conn.close()
+
+        assert second_response.status == HTTPStatus.ACCEPTED
+        assert first_payload["job_id"] != second_payload["job_id"]
+        assert second_started.wait(timeout=5)
+
+        first_status = None
+        for _ in range(20):
+            status_conn = http.client.HTTPConnection("127.0.0.1", port)
+            status_conn.request("GET", f"/api/jobs/{first_payload['job_id']}")
+            status_response = status_conn.getresponse()
+            first_status = json.loads(status_response.read().decode("utf-8"))
+            status_conn.close()
+            if first_status.get("status") == "interrupted":
+                break
+            time.sleep(0.1)
+
+        assert first_status is not None
+        assert first_status["status"] == "interrupted"
+        assert first_status["error"] == (
+            "Recovered stale OCR running job after 1 seconds without heartbeat."
+        )
     finally:
         release_first.set()
         server.shutdown()

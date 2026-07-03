@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import threading
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,8 @@ from uniscan.app import (
 DEFAULT_DELETE_ORIGINAL_TEXT_LAYER = True
 UNISCAN_JOB_PROTOCOL_VERSION = "uniscan-ocr-job.v1"
 UNISCAN_OCR_WORKER_CONCURRENCY = 1
+_DEFAULT_WORKER_TIMEOUT_SECONDS = 8 * 60 * 60
+_DEFAULT_WORKER_WATCHDOG_INTERVAL_SECONDS = 30
 
 _DEFAULT_PRIORITY = "normal"
 _KNOWN_PRIORITIES = {"interactive", "normal", "batch", "low"}
@@ -170,6 +173,50 @@ class _JobStore:
             if event:
                 self._append_event_locked(job, event, message or event, metadata or updates)
             return job
+
+    def reclaim_stale_running_jobs(
+        self,
+        *,
+        timeout_seconds: int,
+        now: datetime | None = None,
+    ) -> list[str]:
+        if timeout_seconds <= 0:
+            return []
+        current = now or datetime.now(timezone.utc)
+        reclaimed: list[str] = []
+        with self._lock:
+            for job in self._jobs.values():
+                if job.status != "running":
+                    continue
+                heartbeat = (
+                    _parse_datetime(job.heartbeat_at)
+                    or _parse_datetime(job.updated_at)
+                    or _parse_datetime(job.started_at)
+                    or _parse_datetime(job.created_at)
+                )
+                if heartbeat is not None and (current - heartbeat).total_seconds() < timeout_seconds:
+                    continue
+                job.status = "interrupted"
+                job.progress = 100
+                job.message = "OCR worker heartbeat timed out."
+                job.error = (
+                    "Recovered stale OCR running job after "
+                    f"{int(timeout_seconds)} seconds without heartbeat."
+                )
+                now_raw = current.isoformat()
+                job.finished_at = job.finished_at or now_raw
+                job.heartbeat_at = now_raw
+                job.updated_at = now_raw
+                self._write_metadata_locked(job)
+                self._upsert_sqlite_locked(job)
+                self._append_event_locked(
+                    job,
+                    "interrupted",
+                    "OCR running job was interrupted after heartbeat timeout.",
+                    {"timeout_seconds": int(timeout_seconds)},
+                )
+                reclaimed.append(job.job_id)
+        return reclaimed
 
     def cancel(self, job_id: str) -> tuple[_JobState | None, bool, str | None]:
         with self._lock:
@@ -1302,6 +1349,8 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 updates["result_bytes"] = result_path.stat().st_size if result_path.exists() else 0
             if error is not None:
                 updates["error"] = error
+            if current is not None and current.status in _TERMINAL_JOB_STATUSES and current.status != status:
+                return
             if status == "running":
                 updates["heartbeat_at"] = now
                 if current is not None and current.started_at is None:
@@ -1371,12 +1420,54 @@ def _build_handler(*, work_root: Path, default_lang: str):
             finally:
                 job_queue.task_done()
 
-    worker = threading.Thread(
-        target=_worker_loop,
-        name="uniscan-ocr-job-worker",
+    worker_threads: list[threading.Thread] = []
+    worker_threads_lock = threading.Lock()
+
+    def _start_worker() -> None:
+        with worker_threads_lock:
+            worker_index = len(worker_threads) + 1
+            worker = threading.Thread(
+                target=_worker_loop,
+                name=f"uniscan-ocr-job-worker-{worker_index}",
+                daemon=True,
+            )
+            worker_threads.append(worker)
+            worker.start()
+
+    _start_worker()
+
+    worker_timeout_seconds = max(
+        0,
+        _env_int(
+            "OCR_WORKER_TIMEOUT_SECONDS",
+            default=_DEFAULT_WORKER_TIMEOUT_SECONDS,
+        ),
+    )
+    watchdog_interval_seconds = max(
+        1,
+        _env_int(
+            "OCR_WORKER_WATCHDOG_INTERVAL_SECONDS",
+            default=_DEFAULT_WORKER_WATCHDOG_INTERVAL_SECONDS,
+        ),
+    )
+
+    def _watchdog_loop() -> None:
+        if worker_timeout_seconds <= 0:
+            return
+        while True:
+            time.sleep(watchdog_interval_seconds)
+            reclaimed = job_store.reclaim_stale_running_jobs(
+                timeout_seconds=worker_timeout_seconds,
+            )
+            if reclaimed:
+                _start_worker()
+
+    watchdog = threading.Thread(
+        target=_watchdog_loop,
+        name="uniscan-ocr-job-watchdog",
         daemon=True,
     )
-    worker.start()
+    watchdog.start()
 
     for recovered_job in job_store.requeueable_jobs():
         _queue_job(recovered_job)
