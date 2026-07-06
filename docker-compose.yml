@@ -18,6 +18,8 @@ services:
       UNISCAN_SURYA_REQUIRE_GPU: "1"
       UNISCAN_SURYA_ALLOW_TEXT_FALLBACK: "0"
       UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON: "1"
+      OCR_WORKER_TIMEOUT_SECONDS: "${OCR_WORKER_TIMEOUT_SECONDS:-1800}"
+      OCR_WORKER_WATCHDOG_INTERVAL_SECONDS: "${OCR_WORKER_WATCHDOG_INTERVAL_SECONDS:-30}"
     volumes:
       - ./.hf_cache_chandra:/cache/hf_chandra
       - ./.hf_cache_surya:/cache/hf_surya

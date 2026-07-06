@@ -255,6 +255,37 @@ def test_job_store_reclaims_stale_running_job_by_heartbeat_timeout(tmp_path: Pat
     assert metadata["finished_at"]
 
 
+def test_job_store_keeps_running_job_with_fresh_heartbeat(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    now = datetime.now(timezone.utc).isoformat()
+    store.create(
+        _JobState(
+            job_id="FRESH",
+            status="running",
+            progress=42,
+            message="OCR is running",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+            started_at=now,
+            heartbeat_at=now,
+        )
+    )
+
+    reclaimed = store.reclaim_stale_running_jobs(timeout_seconds=60)
+    metadata = store.metadata("FRESH")
+
+    assert reclaimed == []
+    assert metadata is not None
+    assert metadata["status"] == "running"
+    assert metadata["heartbeat_at"] == now
+
+
 def test_job_store_keeps_queued_job_with_input_requeueable_after_restart(tmp_path: Path) -> None:
     root = tmp_path / "jobs"
     store = _JobStore(root)
