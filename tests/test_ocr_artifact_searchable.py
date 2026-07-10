@@ -14,6 +14,7 @@ from uniscan.ocr.artifact_searchable import (
     _PlacementCandidate,
     _align_token_indices,
     _assign_lines_to_boxes,
+    _bbox_reading_order_details,
     _bbox_reading_order_indices,
     _blend_placements_vertical,
     _build_searchable_pdf_from_text,
@@ -44,6 +45,7 @@ from uniscan.ocr.artifact_searchable import (
     build_compare_txt_from_benchmark,
     run_artifact_searchable_package,
 )
+from uniscan.ocr.pdf_utils import _build_textless_source_pdf
 
 
 def _build_sample_pdf(tmp_path: Path, name: str, page_values: list[int]) -> Path:
@@ -117,6 +119,20 @@ def test_split_text_to_pages_with_markers() -> None:
     )
     pages = _split_text_to_pages(text, 2)
     assert pages == ["Page one text", "Page two text"]
+
+
+def test_split_text_to_pages_moves_out_of_range_marker_to_last_page() -> None:
+    warnings: list[str] = []
+    pages = _split_text_to_pages(
+        "[SOURCE PAGE 1]\nPage one\n[SOURCE PAGE 99]\nOverflow line\n",
+        3,
+        warnings=warnings,
+    )
+
+    assert pages == ["Page one", "", "Overflow line"]
+    assert warnings == [
+        "moved 1 text lines from out-of-range source page marker(s) 99 to page 3"
+    ]
 
 
 def test_split_lines_to_pages_by_weights() -> None:
@@ -207,6 +223,7 @@ def test_split_line_to_token_boxes_keeps_token_count() -> None:
 def test_normalize_alignment_token_folds_latin_cyrillic_ocr_noise() -> None:
     assert _normalize_alignment_token("FOCT") == _normalize_alignment_token("ГОСТ")
     assert _normalize_alignment_token("СЭВ") == _normalize_alignment_token("CEB")
+    assert _normalize_alignment_token("fate") != _normalize_alignment_token("gate")
 
 
 def test_align_token_indices_matches_monotonic_sequence() -> None:
@@ -216,6 +233,18 @@ def test_align_token_indices_matches_monotonic_sequence() -> None:
     assert coverage == pytest.approx(1.0)
     assert aligned == [0, 1, 2, 3]
     assert score > 0
+
+
+def test_banded_alignment_matches_full_alignment_for_dense_page(monkeypatch) -> None:
+    source = [f"token-{idx % 40}" for idx in range(800)]
+    target = list(source)
+
+    monkeypatch.setenv("UNISCAN_ALIGN_BAND", "0")
+    full_result = _align_token_indices(source_tokens=source, target_tokens=target)
+    monkeypatch.delenv("UNISCAN_ALIGN_BAND", raising=False)
+    banded_result = _align_token_indices(source_tokens=source, target_tokens=target)
+
+    assert banded_result == full_result
 
 
 def test_normalize_hybrid_policy_accepts_aliases() -> None:
@@ -548,6 +577,31 @@ def test_bbox_reading_order_handles_four_columns_on_one_spread() -> None:
     order = _bbox_reading_order_indices(boxes, page_width=900.0)
 
     assert [labels[idx] for idx in order] == ["C1A", "C1B", "C2A", "C2B", "C3A", "C3B", "C4A", "C4B"]
+
+
+def test_coalesce_does_not_join_fragments_across_column_gutter() -> None:
+    column_boxes = [
+        (20.0, 10.0, 100.0, 22.0),
+        (116.0, 10.0, 196.0, 22.0),
+        (20.0, 30.0, 100.0, 42.0),
+        (116.0, 30.0, 196.0, 42.0),
+        (20.0, 50.0, 100.0, 62.0),
+        (116.0, 50.0, 196.0, 62.0),
+    ]
+    order, split_positions = _bbox_reading_order_details(column_boxes, page_width=220.0)
+
+    assert order == [0, 2, 4, 1, 3, 5]
+    assert split_positions
+
+    coalesced = _coalesce_text_layer_placements(
+        [
+            ((20.0, 10.0, 100.0, 22.0), "LEFT COLUMN"),
+            ((116.0, 10.0, 196.0, 22.0), "RIGHT COLUMN"),
+        ],
+        page_width=220.0,
+        split_positions=split_positions,
+    )
+    assert [text for _bbox, text in coalesced] == ["LEFT COLUMN", "RIGHT COLUMN"]
 
 
 def test_should_center_overlay_line_only_for_centered_heading_like_text() -> None:
@@ -1015,6 +1069,30 @@ def test_run_artifact_searchable_package_builds_pdfs(tmp_path: Path) -> None:
     assert (output_dir / "artifact_searchable_summary.csv").exists()
 
 
+def test_run_artifact_searchable_package_reports_duplicate_pdf_stems(tmp_path: Path) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    (pdf_root / "a").mkdir(parents=True)
+    (pdf_root / "b").mkdir(parents=True)
+
+    _build_sample_pdf(pdf_root / "a", "duplicate", [30])
+    _build_sample_pdf(pdf_root / "b", "duplicate", [90])
+    (compare_dir / "duplicate__chandra.txt").write_text("text", encoding="utf-8")
+
+    rows = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=output_dir,
+        engines=("chandra",),
+    )
+
+    assert len(rows) == 1
+    assert rows[0].status == "error"
+    assert "multiple source pdfs" in (rows[0].error or "").lower()
+
+
 def test_run_artifact_searchable_package_uses_chandra_sidecar_geometry(tmp_path: Path) -> None:
     compare_dir = tmp_path / "compare"
     pdf_root = tmp_path / "pdf_root"
@@ -1208,6 +1286,82 @@ def test_run_artifact_searchable_package_uses_chandra_geometry_on_pdf_name_misma
     assert "GEOMETRY STILL APPLIED" in extracted
 
 
+def test_run_artifact_searchable_package_rejects_geometry_from_another_document(
+    tmp_path: Path,
+) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+
+    _build_sample_pdf(pdf_root, "first_doc", [40])
+    _build_sample_pdf(pdf_root, "second_doc", [80])
+    (compare_dir / "first_doc__chandra.txt").write_text("", encoding="utf-8")
+    (compare_dir / "second_doc__chandra.txt").write_text(
+        "SECOND DOCUMENT OWN TEXT",
+        encoding="utf-8",
+    )
+
+    chandra_dir = compare_dir.parent / "chandra"
+    chandra_dir.mkdir()
+    (chandra_dir / "pages.json").write_text(
+        json.dumps(
+            {
+                "pdf_path": str(pdf_root / "first_doc.pdf"),
+                "engine": "chandra",
+                "pages": [
+                    {
+                        "source_page": 1,
+                        "geometry_file": "page_0001.chandra.json",
+                        "geometry_type": "chandra_text_lines",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (chandra_dir / "page_0001.chandra.json").write_text(
+        json.dumps(
+            {
+                "images": [
+                    {
+                        "image_name": "00001.png",
+                        "pages": [
+                            {
+                                "image_bbox": [0, 0, 300, 200],
+                                "text_lines": [
+                                    {"text": "FIRST DOCUMENT GEOMETRY", "bbox": [20, 20, 280, 60]}
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=output_dir,
+        engines=("chandra",),
+        geometry_debug_log=True,
+    )
+
+    second = next(row for row in rows if row.document == "second_doc")
+    assert second.status == "ok"
+    assert second.searchable_pdf_path is not None
+    assert any("geometry rejected" in warning for warning in second.warnings)
+    extracted = _extract_pdf_text(Path(second.searchable_pdf_path))
+    assert "SECOND DOCUMENT OWN TEXT" in extracted
+    assert "FIRST DOCUMENT GEOMETRY" not in extracted
+    assert second.geometry_log_path is not None
+    geometry_log = json.loads(Path(second.geometry_log_path).read_text(encoding="utf-8"))
+    assert any("geometry rejected" in warning for warning in geometry_log["warnings"])
+
+
 def test_run_artifact_searchable_package_writes_geometry_debug_log(tmp_path: Path) -> None:
     compare_dir = tmp_path / "compare"
     pdf_root = tmp_path / "pdf_root"
@@ -1374,6 +1528,28 @@ def test_run_artifact_searchable_package_delete_original_text_layer(tmp_path: Pa
     delete_text = _normalize_ws(_extract_pdf_text(Path(delete_rows[0].searchable_pdf_path)))
     assert "NEW PAGE ONE OCR" in delete_text
     assert "BASE PAGE TWO SHOULD DISAPPEAR" not in delete_text
+
+
+def test_build_textless_source_pdf_jpeg_is_smaller_than_lossless(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    rng = np.random.default_rng(42)
+    source_pdf = tmp_path / "noisy_source.pdf"
+    pages = [rng.integers(0, 256, size=(500, 700, 3), dtype=np.uint8) for _ in range(2)]
+    export_pages_as_pdf(pages, out_pdf=source_pdf, dpi=120)
+
+    lossless_pdf = tmp_path / "lossless.pdf"
+    jpeg_pdf = tmp_path / "jpeg.pdf"
+    monkeypatch.setenv("UNISCAN_TEXTLESS_JPEG_QUALITY", "0")
+    _build_textless_source_pdf(source_pdf=source_pdf, out_pdf=lossless_pdf, dpi=120)
+    monkeypatch.setenv("UNISCAN_TEXTLESS_JPEG_QUALITY", "75")
+    _build_textless_source_pdf(source_pdf=source_pdf, out_pdf=jpeg_pdf, dpi=120)
+
+    from pypdf import PdfReader
+
+    assert len(PdfReader(str(jpeg_pdf)).pages) == len(PdfReader(str(lossless_pdf)).pages) == 2
+    assert jpeg_pdf.stat().st_size < lossless_pdf.stat().st_size
 
 
 def test_build_compare_txt_from_benchmark(tmp_path: Path) -> None:

@@ -8,11 +8,14 @@ import json
 import math
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from time import perf_counter
 from typing import Sequence
+
+from .pdf_utils import _build_textless_source_pdf
 
 
 @dataclass(slots=True)
@@ -28,6 +31,7 @@ class ArtifactSearchableResult:
     elapsed_seconds: float
     error: str | None = None
     geometry_log_path: str | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -110,8 +114,6 @@ _ALIGN_CHAR_FOLD = {
     "э": "e",
     "ю": "io",
     "я": "ya",
-    # Latin OCR confusions
-    "f": "g",  # FOCT is a common Latin OCR rendering of GOST.
 }
 
 
@@ -147,10 +149,15 @@ def _parse_artifact_filename(path: Path) -> tuple[str, str]:
     return document, engine
 
 
-def _split_text_to_pages(text: str, page_count: int) -> list[str]:
+def _split_text_to_pages(
+    text: str,
+    page_count: int,
+    *,
+    warnings: list[str] | None = None,
+) -> list[str]:
     if page_count <= 0:
         return []
-    if page_count == 1:
+    if page_count == 1 and not _PAGE_MARKER_RE.search(text):
         return [text]
 
     marker_pages: dict[int, list[str]] = {}
@@ -176,6 +183,23 @@ def _split_text_to_pages(text: str, page_count: int) -> list[str]:
             else:
                 source = marker_pages.get(page_idx, [])
             pages.append("\n".join(source).strip())
+        overflow_page_numbers = sorted(page_no for page_no in marker_pages if page_no > page_count)
+        overflow_lines = [
+            line
+            for page_no in overflow_page_numbers
+            for line in marker_pages.get(page_no, [])
+        ]
+        if overflow_lines:
+            overflow_text = "\n".join(overflow_lines).strip()
+            if overflow_text:
+                pages[-1] = f"{pages[-1]}\n{overflow_text}".strip() if pages[-1] else overflow_text
+            moved_line_count = sum(1 for line in overflow_lines if line.strip())
+            if moved_line_count and warnings is not None:
+                marker_list = ", ".join(str(page_no) for page_no in overflow_page_numbers)
+                warnings.append(
+                    f"moved {moved_line_count} text lines from out-of-range source page "
+                    f"marker(s) {marker_list} to page {page_count}"
+                )
         return pages
 
     # Many OCR tools emit form-feed as page separator.
@@ -626,16 +650,16 @@ def _split_page_text_lines(text: str) -> list[str]:
     return _dehyphenate_line_breaks(lines)
 
 
-def _bbox_reading_order_indices(
+def _bbox_reading_order_details(
     boxes: Sequence[tuple[float, float, float, float]],
     *,
     page_width: float,
-) -> list[int]:
+) -> tuple[list[int], list[float]]:
     if not boxes:
-        return []
+        return [], []
     default_order = sorted(range(len(boxes)), key=lambda idx: (boxes[idx][1], boxes[idx][0]))
     if len(boxes) < 4:
-        return default_order
+        return default_order, []
 
     normalized: list[tuple[int, float, float, float, float]] = []
     for idx, box in enumerate(boxes):
@@ -644,7 +668,7 @@ def _bbox_reading_order_indices(
             continue
         normalized.append((idx, float(x0), float(y0), float(x1), float(y1)))
     if len(normalized) < 4:
-        return default_order
+        return default_order, []
 
     content_x0 = min(item[1] for item in normalized)
     content_x1 = max(item[3] for item in normalized)
@@ -658,7 +682,7 @@ def _bbox_reading_order_indices(
     by_center = sorted(candidates, key=lambda item: ((item[1] + item[3]) * 0.5, item[2]))
     min_side = max(2, int(len(by_center) * 0.15))
     if len(by_center) < min_side * 2:
-        return default_order
+        return default_order, []
 
     heights = sorted(max(item[4] - item[2], 1.0) for item in by_center)
     median_h = heights[len(heights) // 2] if heights else 10.0
@@ -713,7 +737,7 @@ def _bbox_reading_order_indices(
         split_candidates.append(((left_x1 + right_x0) * 0.5, score))
 
     if not split_candidates and center_split is None:
-        return default_order
+        return default_order, []
 
     split_candidates.sort(key=lambda item: item[1], reverse=True)
     split_positions: list[float] = []
@@ -754,7 +778,16 @@ def _bbox_reading_order_indices(
         prefix_rank = 0 if idx in prefix_indices else 1
         return (column, prefix_rank, y0, x0)
 
-    return sorted(range(len(boxes)), key=reading_key)
+    return sorted(range(len(boxes)), key=reading_key), split_positions
+
+
+def _bbox_reading_order_indices(
+    boxes: Sequence[tuple[float, float, float, float]],
+    *,
+    page_width: float,
+) -> list[int]:
+    order, _split_positions = _bbox_reading_order_details(boxes, page_width=page_width)
+    return order
 
 
 def _split_line_to_word_fragments(
@@ -834,9 +867,16 @@ def _split_line_to_token_boxes(
     return placements
 
 
+@lru_cache(maxsize=32768)
 def _normalize_alignment_token(token: str) -> str:
-    clean = _clean_overlay_line(token).lower().replace("ё", "е")
+    raw_clean = _clean_overlay_line(token)
+    fold_latin_f = bool(re.search(r"[\u0400-\u04ff]", raw_clean)) or bool(
+        re.fullmatch(r"[A-Z]+", raw_clean)
+    )
+    clean = raw_clean.lower().replace("ё", "е")
     folded = "".join(_ALIGN_CHAR_FOLD.get(ch, ch) for ch in clean)
+    if fold_latin_f:
+        folded = folded.replace("f", "g")
     folded = re.sub(r"[^0-9a-zа-я]+", "", folded)
     return folded
 
@@ -861,7 +901,7 @@ def _token_match_score(left: str, right: str) -> float:
     return -0.7
 
 
-def _align_token_indices(
+def _align_token_indices_full(
     *,
     source_tokens: Sequence[str],
     target_tokens: Sequence[str],
@@ -927,6 +967,117 @@ def _align_token_indices(
     return aligned, coverage, dp[n][m]
 
 
+def _align_token_indices_banded(
+    *,
+    source_tokens: Sequence[str],
+    target_tokens: Sequence[str],
+    band: int,
+) -> tuple[list[int | None], float, float] | None:
+    n = len(source_tokens)
+    m = len(target_tokens)
+    if n == 0 or m == 0:
+        return ([None] * n, 0.0, float("-inf"))
+
+    gap_penalty = -0.45
+    negative_infinity = float("-inf")
+    back_rows: list[dict[int, int]] = [{} for _ in range(n + 1)]
+    previous: dict[int, float] = {}
+    for j in range(0, min(m, band) + 1):
+        previous[j] = float(j) * gap_penalty
+        if j > 0:
+            back_rows[0][j] = 2
+
+    score_cache: dict[tuple[str, str], float] = {}
+    for i in range(1, n + 1):
+        center = int(round((float(i) / float(n)) * float(m)))
+        start = max(0, center - band)
+        end = min(m, center + band)
+        current: dict[int, float] = {}
+        for j in range(start, end + 1):
+            if j == 0:
+                current[j] = float(i) * gap_penalty
+                back_rows[i][j] = 1
+                continue
+
+            key = (source_tokens[i - 1], target_tokens[j - 1])
+            if key not in score_cache:
+                score_cache[key] = _token_match_score(*key)
+            match_score = score_cache[key]
+
+            diag = previous.get(j - 1, negative_infinity) + match_score
+            up = previous.get(j, negative_infinity) + gap_penalty
+            left = current.get(j - 1, negative_infinity) + gap_penalty
+            if diag >= up and diag >= left:
+                current[j] = diag
+                back_rows[i][j] = 0
+            elif up >= left:
+                current[j] = up
+                back_rows[i][j] = 1
+            else:
+                current[j] = left
+                back_rows[i][j] = 2
+        previous = current
+
+    final_score = previous.get(m, negative_infinity)
+    if not math.isfinite(final_score):
+        return None
+
+    aligned: list[int | None] = [None] * n
+    i = n
+    j = m
+    while i > 0 and j > 0:
+        step = back_rows[i].get(j)
+        if step is None:
+            return None
+        if step == 0:
+            key = (source_tokens[i - 1], target_tokens[j - 1])
+            match_score = score_cache.get(key)
+            if match_score is None:
+                match_score = _token_match_score(*key)
+            if match_score >= 0.6:
+                aligned[i - 1] = j - 1
+            i -= 1
+            j -= 1
+        elif step == 1:
+            i -= 1
+        else:
+            j -= 1
+
+    matched = sum(1 for item in aligned if item is not None)
+    coverage = float(matched) / float(max(1, n))
+    return aligned, coverage, final_score
+
+
+def _align_token_indices(
+    *,
+    source_tokens: Sequence[str],
+    target_tokens: Sequence[str],
+) -> tuple[list[int | None], float, float]:
+    max_size = max(len(source_tokens), len(target_tokens))
+    raw_band = os.getenv("UNISCAN_ALIGN_BAND", "").strip()
+    if raw_band == "0":
+        return _align_token_indices_full(
+            source_tokens=source_tokens,
+            target_tokens=target_tokens,
+        )
+    try:
+        configured_band = int(raw_band) if raw_band else 0
+    except ValueError:
+        configured_band = 0
+    band = configured_band if configured_band > 0 else max(64, int(math.ceil(max_size * 0.20)))
+    banded = _align_token_indices_banded(
+        source_tokens=source_tokens,
+        target_tokens=target_tokens,
+        band=band,
+    )
+    if banded is not None:
+        return banded
+    return _align_token_indices_full(
+        source_tokens=source_tokens,
+        target_tokens=target_tokens,
+    )
+
+
 def _interpolate_bbox(
     left_bbox: tuple[float, float, float, float],
     right_bbox: tuple[float, float, float, float],
@@ -986,13 +1137,27 @@ def _placements_from_chandra_text_aligned_to_geometry(
     best_geo_bboxes: list[tuple[float, float, float, float]] = []
     best_coverage = -1.0
     best_score = float("-inf")
+    seen_geometry_sequences: set[tuple[str, ...]] = set()
     for geometry_rows in geometry_row_candidates:
+        geometry_lines = [row_text for _row_bbox, row_text in geometry_rows]
+        if (
+            _token_bag_coverage_between_line_sets(
+                source_lines=page_lines,
+                target_lines=geometry_lines,
+            )
+            < 0.25
+        ):
+            continue
         geometry_tokens: list[tuple[tuple[float, float, float, float], str]] = []
         for row_bbox, row_text in geometry_rows:
             geometry_tokens.extend(_split_line_to_token_boxes(row_text, bbox=row_bbox))
         if not geometry_tokens:
             continue
         normalized_geo = [_normalize_alignment_token(token) for _, token in geometry_tokens]
+        geometry_sequence = tuple(normalized_geo)
+        if geometry_sequence in seen_geometry_sequences:
+            continue
+        seen_geometry_sequences.add(geometry_sequence)
         aligned_indices, coverage, score = _align_token_indices(
             source_tokens=normalized_src,
             target_tokens=normalized_geo,
@@ -1303,26 +1468,31 @@ def _build_geometry_candidates(
             source_line_count=source_line_count,
             geometry_line_count=len(geometry_boxes),
         )
-        geometry_sequence_coverage = _coverage_between_line_sets(
+        bag_coverage = _token_bag_coverage_between_line_sets(
             source_lines=page_lines,
             target_lines=geometry_lines,
         )
+        geometry_sequence_coverage = (
+            _coverage_between_line_sets(
+                source_lines=page_lines,
+                target_lines=geometry_lines,
+            )
+            if bag_coverage >= 0.25
+            else 0.0
+        )
         geometry_text_coverage = geometry_sequence_coverage
         if line_fit >= 0.85:
-            geometry_text_coverage = max(
-                geometry_text_coverage,
-                _token_bag_coverage_between_line_sets(
-                    source_lines=page_lines,
-                    target_lines=geometry_lines,
-                ),
-            )
+            geometry_text_coverage = max(geometry_text_coverage, bag_coverage)
 
-        placements_align, align_coverage = _placements_from_chandra_text_aligned_to_geometry(
-            page_lines=page_lines,
-            page_data=page_data,
-            page_width=page_width,
-            page_height=page_height,
-        )
+        if bag_coverage >= 0.25:
+            placements_align, align_coverage = _placements_from_chandra_text_aligned_to_geometry(
+                page_lines=page_lines,
+                page_data=page_data,
+                page_width=page_width,
+                page_height=page_height,
+            )
+        else:
+            placements_align, align_coverage = [], 0.0
         if placements_align:
             token_ratio = min(1.0, float(_count_tokens_in_placements(placements_align)) / float(token_count))
             coverage = max(align_coverage, geometry_sequence_coverage)
@@ -1551,6 +1721,7 @@ def _load_surya_page_geometry(
     engine: str = "surya",
     geometry_types: Sequence[str] = ("surya_text_lines",),
     engine_dir_override: Path | None = None,
+    warnings: list[str] | None = None,
 ) -> dict[int, dict[str, object]]:
     if engine_dir_override is not None:
         root_engine_dir = Path(engine_dir_override)
@@ -1593,11 +1764,44 @@ def _load_surya_page_geometry(
     if isinstance(pdf_path, str) and pdf_path.strip():
         source_stem = Path(pdf_path).stem
         if _normalize_key(source_stem) != _normalize_key(document):
-            # Keep best-effort behavior: some benchmark runs may preserve
-            # mojibake file names in JSON paths, while compare_txt already
-            # uses normalized UTF-8 names. In that case geometry is still
-            # valid for this engine folder and should not be dropped.
-            pass
+            compare_documents: set[str] = set()
+            for artifact_path in compare_dir.glob("*.txt"):
+                if artifact_path.name.lower() == "sources_map.txt":
+                    continue
+                try:
+                    artifact_document, artifact_engine = _parse_artifact_filename(artifact_path)
+                except ValueError:
+                    continue
+                if artifact_engine == engine.strip().lower():
+                    compare_documents.add(_normalize_key(artifact_document))
+
+            if compare_documents:
+                unique_document_count = len(compare_documents)
+            else:
+                pages_documents: set[str] = set()
+                for candidate in root_engine_dir.rglob("pages.json"):
+                    try:
+                        candidate_payload = json.loads(
+                            candidate.read_text(encoding="utf-8", errors="ignore")
+                        )
+                    except Exception:
+                        continue
+                    if not isinstance(candidate_payload, dict):
+                        continue
+                    candidate_pdf_path = candidate_payload.get("pdf_path")
+                    if isinstance(candidate_pdf_path, str) and candidate_pdf_path.strip():
+                        pages_documents.add(_normalize_key(Path(candidate_pdf_path).stem))
+                unique_document_count = len(pages_documents)
+
+            if unique_document_count != 1:
+                reason = (
+                    "geometry rejected: pages.json pdf_path stem "
+                    f"'{source_stem}' does not match document '{document}' and engine directory "
+                    f"contains {unique_document_count} documents"
+                )
+                if warnings is not None:
+                    warnings.append(reason)
+                return {}
 
     pages = payload.get("pages")
     if not isinstance(pages, list):
@@ -1960,6 +2164,9 @@ def _normalize_source_page_rotation(source_page) -> None:
 
 def _coalesce_text_layer_placements(
     placements: Sequence[tuple[tuple[float, float, float, float], str]],
+    *,
+    page_width: float | None = None,
+    split_positions: Sequence[float] = (),
 ) -> list[tuple[tuple[float, float, float, float], str]]:
     groups: list[tuple[list[tuple[float, float, float, float]], list[str]]] = []
 
@@ -1975,6 +2182,10 @@ def _coalesce_text_layer_placements(
             return False
         gap = nx0 - px1
         max_gap = max(min_h * 3.5, (px1 - px0) * 0.25, 3.0)
+        if page_width is not None and page_width > 0.0:
+            max_gap = min(max_gap, page_width * 0.045)
+        if gap >= 0.0 and any(px1 <= split_x <= nx0 for split_x in split_positions):
+            return False
         return -min_h <= gap <= max_gap
 
     for bbox, text in placements:
@@ -2211,8 +2422,16 @@ def _build_overlay_page(
         text_obj.textLine(line)
         pdf_canvas.drawText(text_obj)
 
-    sorted_placements = _sort_text_layer_placements(placements, page_width=page_width)
-    for bbox, text in _coalesce_text_layer_placements(sorted_placements):
+    order, split_positions = _bbox_reading_order_details(
+        [bbox for bbox, _text in placements],
+        page_width=page_width,
+    )
+    sorted_placements = [placements[idx] for idx in order]
+    for bbox, text in _coalesce_text_layer_placements(
+        sorted_placements,
+        page_width=page_width,
+        split_positions=split_positions,
+    ):
         if not text.strip():
             continue
         x0, y0, x1, y1 = bbox
@@ -2244,6 +2463,7 @@ def _build_searchable_pdf_from_text(
     hybrid_policy: str = _HYBRID_POLICY_AUTO,
     blend_primary_y_weight: float | None = None,
     geometry_debug_rows: list[dict[str, object]] | None = None,
+    warnings: list[str] | None = None,
 ) -> tuple[int, int]:
     from pypdf import PdfReader, PdfWriter
     import fitz  # type: ignore
@@ -2263,7 +2483,7 @@ def _build_searchable_pdf_from_text(
         page_line_boxes.append(_estimate_page_line_bboxes(page=layout_page))
         page_layout_sizes.append((float(layout_page.rect.width), float(layout_page.rect.height)))
 
-    page_texts = _split_text_to_pages(text, page_count)
+    page_texts = _split_text_to_pages(text, page_count, warnings=warnings)
     marker_pages_detected = bool(_PAGE_MARKER_RE.search(text)) or ("\f" in text)
     if not marker_pages_detected:
         geometry_weight_candidates: list[float] = []
@@ -2513,32 +2733,6 @@ def _build_searchable_pdf_from_text(
     return page_count, len(text)
 
 
-def _build_textless_source_pdf(*, source_pdf: Path, out_pdf: Path, dpi: int = 300) -> Path:
-    """Render pages into an image-only PDF, stripping any existing text layer."""
-    import fitz  # type: ignore
-
-    scale = max(float(dpi), 72.0) / 72.0
-    matrix = fitz.Matrix(scale, scale)
-    out_pdf.parent.mkdir(parents=True, exist_ok=True)
-
-    src_doc = fitz.open(str(source_pdf))
-    dst_doc = fitz.open()
-    try:
-        for src_page in src_doc:
-            pix = src_page.get_pixmap(matrix=matrix, alpha=False)
-            dst_page = dst_doc.new_page(
-                width=float(src_page.rect.width),
-                height=float(src_page.rect.height),
-            )
-            dst_page.insert_image(dst_page.rect, pixmap=pix, keep_proportion=False)
-        dst_doc.save(str(out_pdf), garbage=4, deflate=True)
-    finally:
-        src_doc.close()
-        dst_doc.close()
-
-    return out_pdf
-
-
 def _resolve_textless_dpi() -> int:
     raw = os.getenv("UNISCAN_TEXTLESS_DPI", "").strip()
     if not raw:
@@ -2600,10 +2794,10 @@ def run_artifact_searchable_package(
     artifact_files = sorted(path for path in resolved_compare.glob("*.txt") if path.name.lower() != "sources_map.txt")
     textless_cache: dict[Path, Path] = {}
 
-    pdf_index: dict[str, Path] = {}
-    for pdf_path in resolved_pdf_root.rglob("*.pdf"):
+    pdf_index: dict[str, list[Path]] = {}
+    for pdf_path in sorted(resolved_pdf_root.rglob("*.pdf")):
         key = _normalize_key(pdf_path.stem)
-        pdf_index.setdefault(key, pdf_path)
+        pdf_index.setdefault(key, []).append(pdf_path)
 
     results: list[ArtifactSearchableResult] = []
 
@@ -2631,8 +2825,8 @@ def run_artifact_searchable_package(
         if allowed_engines is not None and engine not in allowed_engines:
             continue
 
-        source_pdf = pdf_index.get(_normalize_key(document))
-        if source_pdf is None:
+        source_matches = pdf_index.get(_normalize_key(document), [])
+        if not source_matches:
             results.append(
                 ArtifactSearchableResult(
                     document=document,
@@ -2648,6 +2842,28 @@ def run_artifact_searchable_package(
                 )
             )
             continue
+        if len(source_matches) > 1:
+            collision_paths = ", ".join(str(path) for path in source_matches)
+            results.append(
+                ArtifactSearchableResult(
+                    document=document,
+                    engine=engine,
+                    status="error",
+                    source_pdf_path=None,
+                    text_artifact_path=str(artifact_path),
+                    searchable_pdf_path=None,
+                    page_count=0,
+                    text_chars=0,
+                    elapsed_seconds=perf_counter() - start,
+                    error=(
+                        f"Multiple source PDFs share normalized stem '{document}': "
+                        f"{collision_paths}"
+                    ),
+                )
+            )
+            continue
+
+        source_pdf = source_matches[0]
 
         source_pdf_for_build = source_pdf
         if delete_original_text_layer:
@@ -2667,6 +2883,7 @@ def run_artifact_searchable_package(
                 textless_cache[source_key] = source_pdf_for_build
 
         try:
+            result_warnings: list[str] = []
             text = artifact_path.read_text(encoding="utf-8", errors="ignore")
             if require_page_markers and not _has_explicit_page_markers(text):
                 raise ValueError(
@@ -2681,6 +2898,7 @@ def run_artifact_searchable_package(
                     document=document,
                     engine="surya",
                     geometry_types=("surya_text_lines",),
+                    warnings=result_warnings,
                 )
             if engine == "chandra":
                 chandra_geometry_dir = os.getenv("UNISCAN_CHANDRA_GEOMETRY_DIR", "").strip()
@@ -2694,6 +2912,7 @@ def run_artifact_searchable_package(
                     engine="chandra",
                     geometry_types=geometry_types,
                     engine_dir_override=geometry_override,
+                    warnings=result_warnings,
                 )
                 if geometry_override is not None:
                     fallback_geometry_by_page = _load_surya_page_geometry(
@@ -2701,6 +2920,7 @@ def run_artifact_searchable_package(
                         document=document,
                         engine="chandra",
                         geometry_types=("chandra_text_lines",),
+                        warnings=result_warnings,
                     )
             geometry_debug_rows: list[dict[str, object]] | None = [] if (debug_enabled and engine == "chandra") else None
             out_pdf = resolved_output / document / f"{document}__{engine}_searchable.pdf"
@@ -2714,13 +2934,14 @@ def run_artifact_searchable_package(
                 hybrid_policy=effective_hybrid_policy,
                 blend_primary_y_weight=blend_weight,
                 geometry_debug_rows=geometry_debug_rows,
+                warnings=result_warnings,
             )
             extracted = _extract_pdf_text(out_pdf)
             if not extracted.strip():
                 raise RuntimeError("Output PDF has empty extracted text layer.")
 
             geometry_log_path: Path | None = None
-            if geometry_debug_rows:
+            if geometry_debug_rows or (debug_enabled and result_warnings):
                 geometry_log_path = resolved_output / document / f"{document}__{engine}_geometry_log.json"
                 geometry_log_path.write_text(
                     json.dumps(
@@ -2729,7 +2950,8 @@ def run_artifact_searchable_package(
                             "engine": engine,
                             "policy": effective_hybrid_policy,
                             "blend_primary_weight": effective_debug_blend_weight,
-                            "pages": geometry_debug_rows,
+                            "warnings": result_warnings,
+                            "pages": geometry_debug_rows or [],
                         },
                         indent=2,
                         ensure_ascii=False,
@@ -2749,6 +2971,7 @@ def run_artifact_searchable_package(
                     text_chars=text_chars,
                     elapsed_seconds=perf_counter() - start,
                     geometry_log_path=(str(geometry_log_path) if geometry_log_path is not None else None),
+                    warnings=result_warnings,
                 )
             )
         except Exception as exc:
@@ -2765,6 +2988,7 @@ def run_artifact_searchable_package(
                     elapsed_seconds=perf_counter() - start,
                     error=str(exc),
                     geometry_log_path=None,
+                    warnings=result_warnings,
                 )
             )
 
@@ -2789,6 +3013,7 @@ def run_artifact_searchable_package(
                 "elapsed_seconds",
                 "error",
                 "geometry_log_path",
+                "warnings",
             ],
         )
         writer.writeheader()
@@ -2801,16 +3026,18 @@ def run_artifact_searchable_package(
 def summarize_artifact_searchable_package(results: Sequence[ArtifactSearchableResult]) -> str:
     lines: list[str] = []
     for row in results:
+        warnings_part = f" warnings={'; '.join(row.warnings)}" if row.warnings else ""
         if row.status == "ok":
             geometry_part = f" geometry_log={row.geometry_log_path}" if row.geometry_log_path else ""
             lines.append(
                 f"{row.document} [{row.engine}]: ok {row.elapsed_seconds:.2f}s "
-                f"pages={row.page_count} text={row.text_chars} pdf={row.searchable_pdf_path}{geometry_part}"
+                f"pages={row.page_count} text={row.text_chars} pdf={row.searchable_pdf_path}"
+                f"{geometry_part}{warnings_part}"
             )
         else:
             lines.append(
                 f"{row.document} [{row.engine}]: error {row.elapsed_seconds:.2f}s "
-                f"{row.error or 'unknown error'}"
+                f"{row.error or 'unknown error'}{warnings_part}"
             )
     return "\n".join(lines)
 
