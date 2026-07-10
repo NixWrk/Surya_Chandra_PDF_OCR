@@ -22,6 +22,7 @@ from uniscan.ocr import (
     run_artifact_searchable_package,
     run_ocr_benchmark,
 )
+from uniscan.ocr.pdf_utils import _build_textless_source_pdf
 
 
 DEFAULT_BASIC_GUI_LANG = "rus+eng"
@@ -90,6 +91,7 @@ class SearchablePdfSummary:
     benchmark: BasicOcrRunSummary
     compare_results: tuple[CompareTxtBuildResult, ...]
     artifact_results: tuple[ArtifactSearchableResult, ...]
+    partial_page_failures: int = 0
 
 
 def _emit_progress(cb: ProgressCallback | None, percent: int, status: str) -> None:
@@ -133,6 +135,30 @@ def _build_engine_subprocess_env(*, engine: str, repo_root: Path) -> dict[str, s
     return env
 
 
+def _engine_subprocess_timeout_seconds() -> float | None:
+    raw = (os.environ.get("UNISCAN_ENGINE_SUBPROCESS_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def _resolve_ocr_render_dpi() -> int:
+    raw = (os.environ.get("UNISCAN_OCR_RENDER_DPI") or "").strip()
+    if not raw:
+        return 220
+    try:
+        value = int(raw)
+    except ValueError:
+        return 220
+    return max(72, min(400, value))
+
+
 def _load_engine_result_from_report(*, report_path: Path, expected_engine: str) -> OcrBenchmarkResult:
     try:
         payload = json.loads(report_path.read_text(encoding="utf-8"))
@@ -160,6 +186,7 @@ def _run_engine_benchmark_subprocess(
     sample_size: int,
     page_numbers: tuple[int, ...] | None,
     lang: str,
+    dpi: int,
 ) -> OcrBenchmarkResult:
     repo_root = Path(__file__).resolve().parents[3]
     cmd = [
@@ -177,21 +204,30 @@ def _run_engine_benchmark_subprocess(
         str(int(sample_size)),
         "--lang",
         lang,
+        "--dpi",
+        str(int(dpi)),
     ]
     if page_numbers:
         page_arg = ",".join(str(int(page)) for page in page_numbers)
         cmd.extend(["--pages", page_arg])
 
     env = _build_engine_subprocess_env(engine=engine, repo_root=repo_root)
-    proc = subprocess.run(
-        cmd,
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-    )
+    timeout_seconds = _engine_subprocess_timeout_seconds()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Engine '{engine}' subprocess timed out after {timeout_seconds:g} seconds."
+        ) from exc
     report_path = output_dir / f"{pdf_path.stem}_ocr_benchmark.json"
     if not report_path.exists():
         stderr = (proc.stderr or "").strip()
@@ -276,37 +312,6 @@ def _pick_ok_pdf(results: tuple[ArtifactSearchableResult, ...]) -> Path:
     raise RuntimeError("No successful searchable PDF output was produced.")
 
 
-def _build_textless_source_pdf(*, source_pdf: Path, out_pdf: Path, dpi: int = 300) -> Path:
-    """Render PDF pages into an image-only PDF to remove existing text layer."""
-    try:
-        import fitz  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(
-            "Removing original text layer requires PyMuPDF. Install with: pip install pymupdf"
-        ) from exc
-
-    scale = max(float(dpi), 72.0) / 72.0
-    matrix = fitz.Matrix(scale, scale)
-    out_pdf.parent.mkdir(parents=True, exist_ok=True)
-
-    src_doc = fitz.open(str(source_pdf))
-    dst_doc = fitz.open()
-    try:
-        for src_page in src_doc:
-            pix = src_page.get_pixmap(matrix=matrix, alpha=False)
-            dst_page = dst_doc.new_page(
-                width=float(src_page.rect.width),
-                height=float(src_page.rect.height),
-            )
-            dst_page.insert_image(dst_page.rect, pixmap=pix, keep_proportion=False)
-        dst_doc.save(str(out_pdf), garbage=4, deflate=True)
-    finally:
-        src_doc.close()
-        dst_doc.close()
-
-    return out_pdf
-
-
 def _resolve_textless_dpi() -> int:
     raw = os.getenv("UNISCAN_TEXTLESS_DPI", "").strip()
     if not raw:
@@ -373,6 +378,7 @@ def run_basic_ocr_benchmark(
     failed_engines: list[str] = []
     total = max(1, len(ready_engines))
     sample_size = 999999 if page_numbers is None else max(len(page_numbers), 1)
+    render_dpi = _resolve_ocr_render_dpi()
     runtime_tmp = (Path.cwd() / ".tmp_runtime").resolve()
     runtime_tmp.mkdir(parents=True, exist_ok=True)
     with _temporary_env("TEMP", str(runtime_tmp)), _temporary_env("TMP", str(runtime_tmp)):
@@ -403,6 +409,7 @@ def run_basic_ocr_benchmark(
                         sample_size=sample_size,
                         page_numbers=page_numbers,
                         lang=lang,
+                        dpi=render_dpi,
                     )
                 except Exception as exc:
                     failed_engines.append(f"{engine}: {exc}")
@@ -416,6 +423,7 @@ def run_basic_ocr_benchmark(
                     engines=(engine,),
                     sample_size=sample_size,
                     page_numbers=page_numbers,
+                    dpi=render_dpi,
                     lang=lang,
                     progress=_engine_progress,
                 )
@@ -579,6 +587,9 @@ def build_searchable_pdf(
         benchmark=benchmark,
         compare_results=compare_results,
         artifact_results=artifact_results,
+        partial_page_failures=sum(
+            max(0, int(result.page_error_count)) for result in benchmark.results
+        ),
     )
 
 

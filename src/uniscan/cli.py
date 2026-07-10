@@ -58,13 +58,16 @@ def main(argv: list[str] | None = None) -> int:
     ocr_benchmark_parser.add_argument(
         "--dpi",
         type=int,
-        default=160,
+        default=220,
         help="Render DPI for sampled pages.",
     )
     ocr_benchmark_parser.add_argument(
         "--lang",
         default="eng",
-        help="OCR language code.",
+        help=(
+            "OCR language for engines that support explicit language selection; "
+            "Surya and Chandra detect language automatically."
+        ),
     )
     ocr_benchmark_parser.add_argument(
         "--engines",
@@ -107,7 +110,10 @@ def main(argv: list[str] | None = None) -> int:
     ocr_canonical_parser.add_argument(
         "--lang",
         default="eng",
-        help="OCR language code.",
+        help=(
+            "OCR language for engines that support explicit language selection; "
+            "Surya and Chandra detect language automatically."
+        ),
     )
     ocr_canonical_parser.add_argument(
         "--engines",
@@ -307,7 +313,10 @@ def main(argv: list[str] | None = None) -> int:
     searchable_pdf_parser.add_argument(
         "--lang",
         default="rus+eng",
-        help="OCR language code passed to benchmark stage.",
+        help=(
+            "Language hint for legacy/Tesseract-style engines; Surya and Chandra "
+            "detect language automatically."
+        ),
     )
     searchable_pdf_parser.add_argument(
         "--work-root",
@@ -345,7 +354,10 @@ def main(argv: list[str] | None = None) -> int:
     serve_http_parser.add_argument(
         "--lang",
         default="rus+eng",
-        help="Default OCR language code for incoming HTTP requests.",
+        help=(
+            "Default language hint for incoming requests; Surya and Chandra "
+            "detect language automatically."
+        ),
     )
 
     args = parser.parse_args(argv)

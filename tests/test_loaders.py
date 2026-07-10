@@ -3,7 +3,13 @@ from __future__ import annotations
 import fitz
 import numpy as np
 
-from uniscan.io.loaders import imwrite_unicode, list_supported_in_folder, load_input_items
+from uniscan.io.loaders import (
+    imwrite_unicode,
+    iter_render_pdf_page_indices,
+    list_supported_in_folder,
+    load_input_items,
+    render_pdf_page_indices,
+)
 
 
 def _img(value: int) -> np.ndarray:
@@ -46,3 +52,19 @@ def test_load_input_items_preserves_input_order_and_pdf_page_names(tmp_path) -> 
         "doc_b.pdf [p0002]",
         "image_a.png",
     ]
+
+
+def test_iter_render_pdf_page_indices_matches_compatibility_wrapper(tmp_path) -> None:
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+
+    streamed = list(iter_render_pdf_page_indices(pdf_path, [1, 0], dpi=72))
+    materialized = render_pdf_page_indices(pdf_path, [1, 0], dpi=72)
+
+    assert [name for name, _image in streamed] == [
+        "doc.pdf [p0002]",
+        "doc.pdf [p0001]",
+    ]
+    assert [name for name, _image in materialized] == [name for name, _image in streamed]
+    for (_name_a, image_a), (_name_b, image_b) in zip(streamed, materialized, strict=True):
+        assert np.array_equal(image_a, image_b)

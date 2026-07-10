@@ -13,7 +13,7 @@ from uniscan.app.ocr_pipeline import (
     build_searchable_pdf,
     run_basic_ocr_benchmark,
 )
-from uniscan.ocr import ArtifactSearchableResult, CompareTxtBuildResult
+from uniscan.ocr import ArtifactSearchableResult, CompareTxtBuildResult, OcrBenchmarkResult
 
 
 def _ok_compare_result(engine: str, compare_path: Path) -> CompareTxtBuildResult:
@@ -70,7 +70,17 @@ def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
         assert kwargs["pdf_path"] == seen["textless_pdf"]
         return BasicOcrRunSummary(
             run_dir=run_dir,
-            results=tuple(),
+            results=(
+                OcrBenchmarkResult(
+                    engine="chandra",
+                    status="ok",
+                    sample_pages=[1],
+                    elapsed_seconds=0.1,
+                    artifact_path="chandra.txt",
+                    text_chars=100,
+                    page_error_count=2,
+                ),
+            ),
             result_files=tuple(),
             failed_engines=tuple(),
             skipped_engines=tuple(),
@@ -104,6 +114,7 @@ def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
     assert summary.mode == "chandra+surya"
     assert summary.overwritten_input_path == input_pdf.resolve()
     assert summary.output_pdf_path == input_pdf.resolve()
+    assert summary.partial_page_failures == 2
     assert input_pdf.read_bytes() == b"SEARCHABLE"
 
 
@@ -239,17 +250,20 @@ def test_run_basic_ocr_benchmark_supports_engine_python_override(monkeypatch) ->
     fake_surya_python = tmp_path / "surya_python.exe"
     fake_surya_python.write_text("python", encoding="utf-8")
     monkeypatch.setenv("UNISCAN_SURYA_PYTHON", str(fake_surya_python))
+    monkeypatch.setenv("UNISCAN_OCR_RENDER_DPI", "275")
 
     def fake_detect_status(_engine: str):
         # Local venv may be incomplete; override should bypass this.
         return SimpleNamespace(ready=False, missing=["local deps missing"])
 
-    def fake_subprocess_run(cmd, cwd, capture_output, text, encoding, errors, env):
+    def fake_subprocess_run(cmd, cwd, capture_output, text, encoding, errors, env, timeout):
         assert capture_output is True
         assert text is True
         assert encoding == "utf-8"
         assert errors == "replace"
+        assert timeout is None
         assert cmd[0] == str(fake_surya_python)
+        assert cmd[cmd.index("--dpi") + 1] == "275"
         output_dir = Path(cmd[cmd.index("--output") + 1])
         engine = cmd[cmd.index("--engines") + 1]
         report_path = output_dir / f"{pdf_path.stem}_ocr_benchmark.json"
@@ -295,6 +309,43 @@ def test_run_basic_ocr_benchmark_supports_engine_python_override(monkeypatch) ->
     assert summary.results[0].engine == "surya"
     assert summary.results[0].status == "ok"
     assert summary.failed_engines == tuple()
+
+
+def test_engine_subprocess_timeout_raises_runtime_error(monkeypatch) -> None:
+    tmp_path = _new_test_dir()
+    pdf_path = tmp_path / "input.pdf"
+    output_dir = tmp_path / "engine"
+    monkeypatch.setenv("UNISCAN_ENGINE_SUBPROCESS_TIMEOUT_SECONDS", "12.5")
+
+    def fake_subprocess_run(cmd, **kwargs):
+        raise ocr_pipeline.subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(ocr_pipeline.subprocess, "run", fake_subprocess_run)
+
+    try:
+        ocr_pipeline._run_engine_benchmark_subprocess(
+            python_exe=tmp_path / "python.exe",
+            engine="surya",
+            pdf_path=pdf_path,
+            output_dir=output_dir,
+            sample_size=1,
+            page_numbers=(1,),
+            lang="rus+eng",
+            dpi=220,
+        )
+    except RuntimeError as exc:
+        assert "subprocess timed out after 12.5 seconds" in str(exc)
+    else:
+        raise AssertionError("Expected timeout to become a RuntimeError")
+
+
+def test_ocr_render_dpi_defaults_and_clamps(monkeypatch) -> None:
+    monkeypatch.delenv("UNISCAN_OCR_RENDER_DPI", raising=False)
+    assert ocr_pipeline._resolve_ocr_render_dpi() == 220
+    monkeypatch.setenv("UNISCAN_OCR_RENDER_DPI", "999")
+    assert ocr_pipeline._resolve_ocr_render_dpi() == 400
+    monkeypatch.setenv("UNISCAN_OCR_RENDER_DPI", "bad")
+    assert ocr_pipeline._resolve_ocr_render_dpi() == 220
 
 
 def test_engine_python_override_accepts_relative_path(monkeypatch) -> None:

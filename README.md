@@ -15,7 +15,9 @@ Use this project if you need:
 
 1. Searchable PDFs from scanned PDF files.
 2. Local processing with Python, Docker, or a simple desktop GUI.
-3. Russian/English OCR by default (`rus+eng`), with other language codes passed through where supported.
+3. Russian/English OCR hint by default (`rus+eng`) for engines with explicit
+   language selection. Surya and Chandra detect language automatically and
+   ignore this hint.
 4. Strict geometry behavior: hybrid output should fail loudly if the geometry sidecar is missing instead of silently producing a low-quality text layer.
 
 This project is probably not the right fit if you need:
@@ -275,7 +277,9 @@ curl -X POST "http://127.0.0.1:8000/api/jobs/<job_id>/cancel"
 `X-Idempotency-Key` is the safe retry key. Repeating the exact same PDF and OCR
 parameters with the same key returns the existing job with
 `idempotent_replay: true`; reusing the key for different bytes or parameters
-returns `409 Conflict`.
+returns `409 Conflict`. If the previous matching job ended as `error`,
+`interrupted`, or `cancelled`, the same request creates a new job while the
+failed job remains in history.
 
 Queue model:
 
@@ -287,11 +291,18 @@ jobs. Waiting jobs are ordered by priority (`interactive`, `normal`, `batch`,
 Chandra/Surya GPU use predictable while still allowing many callers to submit
 work safely.
 
+The synchronous `/searchable-pdf` endpoint uses the same internal OCR pipeline
+lock as the async worker. A synchronous request may wait behind OCR work already
+in progress; this avoids concurrent mutation of process-wide OCR environment
+variables and keeps GPU use serialized.
+
 Durability:
 
 The async API keeps durable job metadata under `UNISCAN_WORK_ROOT/jobs`.
 Each job directory contains `input.pdf`, `metadata.json`, `events.jsonl`, and,
-after completion, `result.pdf`; `jobs.sqlite3` keeps a service-owned job index.
+after completion, `result.pdf`; `jobs.sqlite3` keeps a service-owned write-side
+index. Restart recovery is driven by the per-job `metadata.json` files, not by
+using SQLite as the source of truth.
 `GET /api/jobs` returns queue counts plus active and recent jobs,
 `GET /api/jobs/<job_id>` returns the current job summary,
 `GET /api/jobs/<job_id>/metadata` returns the persisted metadata file, and
@@ -305,6 +316,7 @@ Retention cleanup can be enabled with:
 
 ```env
 UNISCAN_JOB_CLEANUP_ON_START=1
+UNISCAN_JOB_CLEANUP_INTERVAL_SECONDS=3600
 UNISCAN_JOB_RETENTION_DAYS=30
 UNISCAN_FAILED_JOB_RETENTION_DAYS=90
 ```
@@ -317,6 +329,23 @@ requires CUDA and fails loudly instead of falling back to CPU.
 Existing text layers are always removed before OCR. `delete_text_layer=0` and
 `delete_original_text_layer=false` are rejected by the HTTP API.
 
+OCR quality/performance tuning:
+
+```env
+# Require Chandra's page-aware geometry sidecar instead of using page-1 fallback.
+UNISCAN_CHANDRA_REQUIRE_SIDECAR=0
+# OCR input render DPI used by the basic/web workflow (clamped to 72..400).
+UNISCAN_OCR_RENDER_DPI=220
+# Set to 0 to disable banded token alignment and use the full dynamic program.
+UNISCAN_ALIGN_BAND=
+# JPEG quality for image-only source PDFs; 0 restores lossless pixmap embedding.
+UNISCAN_TEXTLESS_JPEG_QUALITY=85
+```
+
+When `UNISCAN_ALIGN_BAND` is unset, alignment uses an automatic band of
+`max(64, 20% of the longer token sequence)` and falls back to full alignment if
+the band cannot form a complete path.
+
 ## Docker
 
 Docker is useful when you want a repeatable GPU runtime with persistent model caches.
@@ -324,6 +353,13 @@ Docker is useful when you want a repeatable GPU runtime with persistent model ca
 ```powershell
 docker compose build
 docker compose up -d
+```
+
+`docker-compose.yml` attaches the service to the external `zotero-automation`
+network. Create it once first if it does not already exist:
+
+```powershell
+docker network create zotero-automation
 ```
 
 The Dockerfile defaults to `TORCH_CUDA_FLAVOR=cu126` because that is the safer wheel for older GPUs such as GTX 1070. For newer `sm_75+` GPUs, you can build with `cu128`:

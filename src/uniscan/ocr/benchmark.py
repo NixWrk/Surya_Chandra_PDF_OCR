@@ -16,7 +16,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Sequence
 
-from uniscan.io import imwrite_unicode, render_pdf_page_indices
+from uniscan.io import imwrite_unicode, iter_render_pdf_page_indices
 
 from .engine import (
     OCR_ENGINE_LABELS,
@@ -59,6 +59,7 @@ class OcrBenchmarkResult:
     memory_delta_mb: float | None = None
     error: str | None = None
     note: str | None = None
+    page_error_count: int = 0
 
     @property
     def label(self) -> str:
@@ -213,9 +214,11 @@ def _render_sample_paths(
     dpi: int,
     tmp_dir: Path,
 ) -> list[Path]:
-    rendered = render_pdf_page_indices(pdf_path, sample_pages, dpi=dpi)
     image_paths: list[Path] = []
-    for idx, (_name, image) in enumerate(rendered, start=1):
+    for idx, (_name, image) in enumerate(
+        iter_render_pdf_page_indices(pdf_path, sample_pages, dpi=dpi),
+        start=1,
+    ):
         out_path = tmp_dir / f"{idx:05d}.png"
         if not imwrite_unicode(out_path, image):
             raise RuntimeError(f"Failed to write sampled page image: {out_path}")
@@ -699,6 +702,10 @@ def _surya_require_geometry_sidecar() -> bool:
     return _env_bool("UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON", default=True)
 
 
+def _chandra_require_sidecar() -> bool:
+    return _env_bool("UNISCAN_CHANDRA_REQUIRE_SIDECAR", default=False)
+
+
 def _markerized_pages_text(
     *,
     page_texts: Sequence[str],
@@ -894,6 +901,85 @@ def _collect_chandra_batch_outputs(
     return page_texts, total_chars, page_metadata
 
 
+def _collect_surya_batch_outputs(
+    *,
+    sidecar_path: Path,
+    image_paths: Sequence[Path],
+    source_pages_1based: Sequence[int],
+    work_dir: Path,
+) -> tuple[list[str], int, list[dict[str, Any]], list[dict[str, Any]]]:
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Surya sidecar payload has unexpected format.")
+    images = payload.get("images")
+    if not isinstance(images, list):
+        raise RuntimeError("Surya sidecar payload has no 'images' list.")
+
+    by_name = {
+        str(item.get("image_name")): item
+        for item in images
+        if isinstance(item, dict) and str(item.get("image_name") or "")
+    }
+    execution_path = str(payload.get("execution_path") or "").strip()
+    page_texts: list[str] = []
+    total_chars = 0
+    page_errors: list[dict[str, Any]] = []
+    page_metadata: list[dict[str, Any]] = []
+    multi_image = len(image_paths) > 1
+
+    for image_index, (image_path, source_page) in enumerate(
+        zip(image_paths, source_pages_1based, strict=True),
+        start=1,
+    ):
+        staged_name = f"{image_index:04d}_{image_path.name}" if multi_image else image_path.name
+        image_payload = by_name.get(staged_name) or by_name.get(image_path.name)
+        text_lines: list[str] = []
+        if isinstance(image_payload, dict):
+            for page in image_payload.get("pages", []):
+                if not isinstance(page, dict):
+                    continue
+                for line in page.get("text_lines", []):
+                    if not isinstance(line, dict):
+                        continue
+                    text = _clean_overlay_line(str(line.get("text") or ""))
+                    if text:
+                        text_lines.append(text)
+
+        page_text = "\n".join(_dehyphenate_line_breaks(text_lines))
+        page_texts.append(page_text)
+        total_chars += len(page_text)
+        if not text_lines or not isinstance(image_payload, dict):
+            page_errors.append(
+                {
+                    "source_page": source_page,
+                    "image": str(image_path),
+                    "error": f"Surya geometry sidecar has no text_lines for source page {source_page}",
+                }
+            )
+            continue
+
+        per_page_image_payload = dict(image_payload)
+        per_page_image_payload["image_name"] = image_path.name
+        per_page_payload: dict[str, Any] = {"images": [per_page_image_payload]}
+        if execution_path:
+            per_page_payload["execution_path"] = execution_path
+        page_dir = work_dir / f"page_{source_page:04d}"
+        page_dir.mkdir(parents=True, exist_ok=True)
+        page_sidecar_path = page_dir / "surya_page_lines.json"
+        page_sidecar_path.write_text(
+            json.dumps(per_page_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        page_metadata.append(
+            {
+                "source_page": source_page,
+                "surya_page_lines_path": str(page_sidecar_path),
+            }
+        )
+
+    return page_texts, total_chars, page_errors, page_metadata
+
+
 def _run_extraction_engine_pagewise(
     engine: str,
     image_paths: Sequence[Path],
@@ -907,6 +993,67 @@ def _run_extraction_engine_pagewise(
 ) -> tuple[list[str], int, list[dict[str, Any]], list[dict[str, Any]]]:
     if len(image_paths) != len(source_pages_1based):
         raise ValueError("image_paths and source_pages_1based lengths must match.")
+
+    if engine == OCR_ENGINE_SURYA and len(image_paths) > 0:
+        batch_work_dir = work_dir / "batch"
+        try:
+            aggregate_text, aggregate_chars = _run_surya_direct(
+                image_paths,
+                lang=lang,
+                work_dir=batch_work_dir,
+                which_fn=which_fn,
+                run_cmd=run_cmd,
+            )
+        except Exception as exc:
+            preview = "; ".join(f"p{page}: {exc}" for page in source_pages_1based[:3])
+            raise RuntimeError(f"all sampled pages failed for {engine}: {preview}") from exc
+
+        sidecar_path = batch_work_dir / "surya_page_lines.json"
+        if sidecar_path.exists():
+            page_texts, total_chars, page_errors, page_metadata = _collect_surya_batch_outputs(
+                sidecar_path=sidecar_path,
+                image_paths=image_paths,
+                source_pages_1based=source_pages_1based,
+                work_dir=work_dir,
+            )
+        else:
+            page_texts = [aggregate_text] + [""] * (len(image_paths) - 1)
+            total_chars = int(aggregate_chars)
+            page_errors = [
+                {
+                    "source_page": source_page,
+                    "image": str(image_path),
+                    "error": f"Surya geometry sidecar is missing for source page {source_page}",
+                }
+                for image_path, source_page in zip(
+                    image_paths,
+                    source_pages_1based,
+                    strict=True,
+                )
+            ]
+            page_metadata = []
+
+        successful_pages = {int(item["source_page"]) for item in page_metadata}
+        if progress_cb is not None:
+            done = 0
+            total_pages = len(source_pages_1based)
+            for source_page in source_pages_1based:
+                if source_page not in successful_pages:
+                    continue
+                done += 1
+                progress_cb(done, total_pages, source_page)
+
+        if page_errors and not any(text.strip() for text in page_texts):
+            preview = "; ".join(
+                f"p{item['source_page']}: {item['error']}" for item in page_errors[:3]
+            )
+            raise RuntimeError(f"all sampled pages failed for {engine}: {preview}")
+        if _surya_require_geometry_sidecar() and page_errors:
+            preview = "; ".join(
+                f"p{item['source_page']}: {item['error']}" for item in page_errors[:3]
+            )
+            raise RuntimeError(f"surya geometry sidecar is required for each page: {preview}")
+        return page_texts, total_chars, page_errors, page_metadata
 
     if engine == OCR_ENGINE_CHANDRA and len(image_paths) > 0:
         batch_work_dir = work_dir / "batch"
@@ -939,10 +1086,23 @@ def _run_extraction_engine_pagewise(
             )
             if any(page.strip() for page in page_texts):
                 return page_texts, total_chars, [], page_metadata
-        # Sidecar is unexpectedly missing or empty. Keep output usable by
-        # preserving aggregate text in the first page and leaving geometry empty.
+        warning = "chandra sidecar missing; aggregate text on page 1"
+        if _chandra_require_sidecar():
+            raise RuntimeError(warning)
+        # Keep aggregate output usable, but make the degraded page mapping visible.
         fallback_page_texts = [text] + [""] * (len(image_paths) - 1)
-        return fallback_page_texts, int(chars), [], []
+        return (
+            fallback_page_texts,
+            int(chars),
+            [
+                {
+                    "source_page": source_pages_1based[0],
+                    "image": str(image_paths[0]),
+                    "error": warning,
+                }
+            ],
+            [],
+        )
 
     page_texts: list[str] = []
     total_chars = 0
@@ -1097,7 +1257,7 @@ def _run_surya_module_cli(
         output_root: Path,
         input_dir: Path,
         ordered_names: Sequence[str],
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, list[dict[str, Any]]]:
         results_json = output_root / input_dir.name / "results.json"
         if not results_json.exists():
             raise RuntimeError(f"Surya did not produce results file: {results_json}")
@@ -1194,21 +1354,33 @@ def _run_surya_module_cli(
                             text = _clean_overlay_line(str(line.get("text") or ""))
                             if text:
                                 collected.append(text)
+        text = "\n".join(_dehyphenate_line_breaks(collected))
+        return text, len(text), sidecar_images
+
+    def _finalize_results(
+        result: tuple[str, int, list[dict[str, Any]]],
+        *,
+        execution_path: str,
+    ) -> tuple[str, int]:
+        text, chars, sidecar_images = result
         if sidecar_images:
             sidecar_path = work_dir / "surya_page_lines.json"
             sidecar_path.write_text(
-                json.dumps({"images": sidecar_images}, ensure_ascii=False, indent=2),
+                json.dumps(
+                    {"execution_path": execution_path, "images": sidecar_images},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
-
-        text = "\n".join(_dehyphenate_line_breaks(collected))
-        return text, len(text)
+        return text, chars
 
     def _run_cli_with_geometry(
         *,
         input_dir: Path,
         ordered_names: Sequence[str],
         output_root: Path,
+        module_failure: str,
     ) -> tuple[str, int]:
         surya_cmd = which_fn("surya_ocr") or which_fn("surya_ocr.exe")
         if not surya_cmd:
@@ -1228,17 +1400,23 @@ def _run_surya_module_cli(
                 errors.append(details)
                 continue
             try:
-                return _collect_results(
-                    output_root=output_root,
-                    input_dir=input_dir,
-                    ordered_names=ordered_names,
+                return _finalize_results(
+                    _collect_results(
+                        output_root=output_root,
+                        input_dir=input_dir,
+                        ordered_names=ordered_names,
+                    ),
+                    execution_path="cli",
                 )
             except Exception as exc:
                 errors.append(str(exc))
 
         if not errors:
             raise RuntimeError("surya_ocr CLI failed without diagnostic output.")
-        raise RuntimeError(" | ".join(errors))
+        raise RuntimeError(
+            f"Surya module path failed ({module_failure}); "
+            f"Surya CLI path failed: {' | '.join(errors)}"
+        )
 
     input_dir = work_dir / "surya_input"
     ordered_names: list[str]
@@ -1258,11 +1436,12 @@ def _run_surya_module_cli(
         pass
     try:
         from surya.scripts.ocr_text import ocr_text_cli
-    except Exception:
+    except Exception as exc:
         return _run_cli_with_geometry(
             input_dir=input_dir,
             ordered_names=ordered_names,
             output_root=output_root,
+            module_failure=f"import: {exc}",
         )
 
     args = [
@@ -1278,24 +1457,30 @@ def _run_surya_module_cli(
                 input_dir=input_dir,
                 ordered_names=ordered_names,
                 output_root=output_root,
+                module_failure=f"module exit code {exc.code}",
             )
-    except Exception:
+    except Exception as exc:
         return _run_cli_with_geometry(
             input_dir=input_dir,
             ordered_names=ordered_names,
             output_root=output_root,
+            module_failure=f"module exception: {exc}",
         )
     try:
-        return _collect_results(
-            output_root=output_root,
-            input_dir=input_dir,
-            ordered_names=ordered_names,
+        return _finalize_results(
+            _collect_results(
+                output_root=output_root,
+                input_dir=input_dir,
+                ordered_names=ordered_names,
+            ),
+            execution_path="module",
         )
-    except Exception:
+    except Exception as exc:
         return _run_cli_with_geometry(
             input_dir=input_dir,
             ordered_names=ordered_names,
             output_root=output_root,
+            module_failure=f"module result collection: {exc}",
         )
 
 
@@ -2185,6 +2370,7 @@ def _make_result(
     memory_delta_mb: float | None,
     error: str | None = None,
     note: str | None = None,
+    page_error_count: int = 0,
 ) -> OcrBenchmarkResult:
     return OcrBenchmarkResult(
         engine=engine,
@@ -2196,6 +2382,7 @@ def _make_result(
         memory_delta_mb=memory_delta_mb,
         error=error,
         note=note,
+        page_error_count=max(0, int(page_error_count)),
     )
 
 
@@ -2206,7 +2393,7 @@ def run_ocr_benchmark(
     engines: Sequence[str] | None = None,
     sample_size: int = 5,
     page_numbers: Sequence[int] | None = None,
-    dpi: int = 160,
+    dpi: int = 220,
     lang: str = "eng",
     import_module=None,
     which_fn=shutil.which,
@@ -2352,6 +2539,14 @@ def run_ocr_benchmark(
                     page_metadata=page_metadata,
                 )
                 elapsed = perf_counter() - start
+                chandra_sidecar_note = next(
+                    (
+                        str(item.get("error"))
+                        for item in page_errors
+                        if "chandra sidecar missing" in str(item.get("error") or "").lower()
+                    ),
+                    None,
+                )
                 results.append(
                     _make_result(
                         engine=engine,
@@ -2361,11 +2556,13 @@ def run_ocr_benchmark(
                         artifact_path=artifact_path,
                         text_chars=text_chars,
                         memory_delta_mb=_memory_delta_mb(rss_before, _memory_rss_mb()),
-                        note=(
+                        note=chandra_sidecar_note
+                        or (
                             f"partial page failures: {len(page_errors)} / {len(source_pages_1based)}"
                             if page_errors
                             else None
                         ),
+                        page_error_count=len(page_errors),
                     )
                 )
                 _emit_benchmark_progress(progress, engine_end_percent, f"Done: {engine}")
