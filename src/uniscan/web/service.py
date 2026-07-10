@@ -7,6 +7,7 @@ import hashlib
 import queue
 import shutil
 import sqlite3
+import sys
 import threading
 import os
 import time
@@ -17,7 +18,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from uniscan.app import (
     DEFAULT_BASIC_GUI_LANG,
@@ -32,6 +33,8 @@ UNISCAN_JOB_PROTOCOL_VERSION = "uniscan-ocr-job.v1"
 UNISCAN_OCR_WORKER_CONCURRENCY = 1
 _DEFAULT_WORKER_TIMEOUT_SECONDS = 30 * 60
 _DEFAULT_WORKER_WATCHDOG_INTERVAL_SECONDS = 30
+_DEFAULT_JOB_CLEANUP_INTERVAL_SECONDS = 60 * 60
+_DEFAULT_MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 
 _DEFAULT_PRIORITY = "normal"
 _KNOWN_PRIORITIES = {"interactive", "normal", "batch", "low"}
@@ -39,6 +42,11 @@ _PRIORITY_RANK = {"interactive": 0, "normal": 10, "batch": 20, "low": 30}
 _DEFAULT_GPU_POLICY = "cuda"
 _KNOWN_GPU_POLICIES = {"auto", "cuda"}
 _TERMINAL_JOB_STATUSES = {"done", "error", "interrupted", "cancelled"}
+_PIPELINE_LOCK = threading.Lock()
+
+
+class _PayloadTooLarge(ValueError):
+    pass
 
 
 def _utc_now() -> str:
@@ -150,7 +158,7 @@ class _JobStore:
             matches = [job for job in self._jobs.values() if job.idempotency_key == key]
             if not matches:
                 return None
-            return sorted(matches, key=lambda job: job.created_at)[0]
+            return sorted(matches, key=lambda job: job.created_at, reverse=True)[0]
 
     def update(
         self,
@@ -160,10 +168,19 @@ class _JobStore:
         event: str | None = None,
         message: str | None = None,
         metadata: dict[str, Any] | None = None,
+        forbid_terminal_transition: bool = False,
     ) -> _JobState | None:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
+                return None
+            next_status = updates.get("status")
+            if (
+                forbid_terminal_transition
+                and job.status in _TERMINAL_JOB_STATUSES
+                and next_status is not None
+                and next_status != job.status
+            ):
                 return None
             for key, value in updates.items():
                 setattr(job, key, value)
@@ -338,7 +355,11 @@ class _JobStore:
             try:
                 raw = json.loads(metadata_path.read_text(encoding="utf-8"))
                 job = _job_from_metadata(raw)
-            except Exception:
+            except Exception as exc:
+                print(
+                    f"Warning: failed to load OCR job metadata {metadata_path}: {exc}",
+                    file=sys.stderr,
+                )
                 continue
 
             result_candidate = metadata_path.parent / "result.pdf"
@@ -733,6 +754,38 @@ def _clean_protocol_text(
     return value
 
 
+def _sanitize_download_filename(raw: str | None, *, default: str = "document.pdf") -> str:
+    value = (raw or default).strip() or default
+    cleaned = "".join(
+        "_"
+        if ord(char) < 32 or ord(char) == 127 or char in {'"', "\\", "/"}
+        else char
+        for char in value
+    ).strip()
+    if not cleaned:
+        cleaned = default
+    if not cleaned.lower().endswith(".pdf"):
+        cleaned = f"{cleaned}.pdf"
+    if len(cleaned) > 255:
+        stem = cleaned[:-4]
+        cleaned = f"{stem[:251]}.pdf"
+    return cleaned
+
+
+def _content_disposition_attachment(filename: str) -> str:
+    safe_filename = _sanitize_download_filename(filename)
+    fallback = "".join(
+        char
+        if 32 <= ord(char) < 127 and char not in {'"', "\\", ";"}
+        else "_"
+        for char in safe_filename
+    ).strip()
+    if not fallback:
+        fallback = "download.pdf"
+    encoded = quote(safe_filename, safe="")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+
+
 def _parse_priority(raw: str | None) -> str:
     value = (raw or _DEFAULT_PRIORITY).strip().lower()
     aliases = {"high": "interactive", "background": "batch"}
@@ -951,9 +1004,7 @@ def _parse_job_request(parsed, *, default_lang: str) -> tuple[str, str, str, boo
         raise ValueError(
             "delete_text_layer cannot be disabled; OCR always removes the existing text layer."
         )
-    filename = (query.get("filename", ["document.pdf"])[0] or "document.pdf").strip()
-    if not filename.lower().endswith(".pdf"):
-        filename = f"{filename}.pdf"
+    filename = _sanitize_download_filename(query.get("filename", ["document.pdf"])[0])
     return mode, pages_raw, lang, strict, filename, delete_original_text_layer
 
 
@@ -1103,7 +1154,7 @@ def _html_ui() -> bytes:
         </select>
       </div>
       <div class="field">
-        <label>OCR language</label>
+        <label>OCR language (legacy engines; Surya/Chandra auto-detect)</label>
         <input id="lang" value="rus+eng">
       </div>
       <div class="field">
@@ -1186,14 +1237,15 @@ def _html_ui() -> bytes:
         }
         barEl.value = Number(data.progress || 0);
         const msg = data.error ? `${data.message}: ${data.error}` : data.message;
-        setLine(msg || data.status, data.status === "error");
+        const failedStatuses = ["error", "interrupted", "cancelled"];
+        setLine(msg || data.status, failedStatuses.includes(data.status));
         if (data.status === "done") {
           setRunning(false);
           lastResultUrl = data.result_url;
           downloadBtn.disabled = !lastResultUrl;
           return;
         }
-        if (data.status === "error") {
+        if (failedStatuses.includes(data.status)) {
           setRunning(false);
           return;
         }
@@ -1285,6 +1337,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
 
     job_store = _JobStore(jobs_root)
     job_queue: queue.PriorityQueue[tuple[int, str, str, _QueuedJob]] = queue.PriorityQueue()
+    create_job_lock = threading.Lock()
 
     def _queue_job(job: _JobState) -> None:
         if job.input_path is None:
@@ -1349,8 +1402,6 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 updates["result_bytes"] = result_path.stat().st_size if result_path.exists() else 0
             if error is not None:
                 updates["error"] = error
-            if current is not None and current.status in _TERMINAL_JOB_STATUSES and current.status != status:
-                return
             if status == "running":
                 updates["heartbeat_at"] = now
                 if current is not None and current.started_at is None:
@@ -1367,72 +1418,111 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 event=event,
                 message=message or event,
                 metadata=updates,
+                forbid_terminal_transition=True,
             )
 
         def _progress_cb(value: int, status: str) -> None:
             _set_state(status="running", progress=value, message=status)
 
         _set_state(status="running", progress=1, message="Starting")
+        keepalive_stop = threading.Event()
+
+        def _keepalive_loop() -> None:
+            interval = _heartbeat_keepalive_interval()
+            while not keepalive_stop.is_set():
+                try:
+                    job_store.update(job_id, {"heartbeat_at": _utc_now()})
+                except Exception as exc:
+                    print(f"Warning: OCR heartbeat keepalive failed for {job_id}: {exc}", file=sys.stderr)
+                keepalive_stop.wait(interval)
+
+        keepalive = threading.Thread(
+            target=_keepalive_loop,
+            name=f"uniscan-ocr-job-keepalive-{job_id}",
+            daemon=True,
+        )
+        keepalive.start()
         try:
             page_numbers = parse_page_numbers(pages_raw)
-            summary: SearchablePdfSummary = build_searchable_pdf(
-                pdf_path=input_path,
-                mode=mode,
-                lang=lang,
-                page_numbers=page_numbers,
-                work_root=pipeline_root,
-                overwrite_input_path=False,
-                return_bytes=False,
-                strict=strict,
-                progress=_progress_cb,
-                delete_original_text_layer=delete_original_text_layer,
-            )
+            with _PIPELINE_LOCK:
+                summary: SearchablePdfSummary = build_searchable_pdf(
+                    pdf_path=input_path,
+                    mode=mode,
+                    lang=lang,
+                    page_numbers=page_numbers,
+                    work_root=pipeline_root,
+                    overwrite_input_path=False,
+                    return_bytes=False,
+                    strict=strict,
+                    progress=_progress_cb,
+                    delete_original_text_layer=delete_original_text_layer,
+                )
             result_target = jobs_root / job_id / "result.pdf"
             result_target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(summary.output_pdf_path, result_target)
+            partial_page_failures = max(
+                0,
+                int(getattr(summary, "partial_page_failures", 0) or 0),
+            )
+            completion_message = (
+                "Done"
+                if partial_page_failures == 0
+                else f"Done: {partial_page_failures} pages without text"
+            )
             _set_state(
                 status="done",
                 progress=100,
-                message="Done",
+                message=completion_message,
                 run_dir=str(summary.run_dir),
                 result_path=result_target.resolve(),
                 error=None,
             )
         except Exception as exc:
             _set_state(status="error", progress=100, message="Failed", error=str(exc))
+        finally:
+            keepalive_stop.set()
+            keepalive.join(timeout=2)
 
     def _worker_loop() -> None:
         while True:
-            _, _, _, queued_job = job_queue.get()
+            queued_job: _QueuedJob | None = None
             try:
-                current = job_store.get(queued_job.job_id)
-                if current is None or current.status != "queued":
-                    continue
-                _run_job(
-                    queued_job.job_id,
-                    input_path=queued_job.input_path,
-                    mode=queued_job.mode,
-                    pages_raw=queued_job.pages_raw,
-                    lang=queued_job.lang,
-                    strict=queued_job.strict,
-                    delete_original_text_layer=queued_job.delete_original_text_layer,
-                )
-            finally:
-                job_queue.task_done()
+                _, _, _, queued_job = job_queue.get()
+                try:
+                    current = job_store.get(queued_job.job_id)
+                    if current is None or current.status != "queued":
+                        continue
+                    _run_job(
+                        queued_job.job_id,
+                        input_path=queued_job.input_path,
+                        mode=queued_job.mode,
+                        pages_raw=queued_job.pages_raw,
+                        lang=queued_job.lang,
+                        strict=queued_job.strict,
+                        delete_original_text_layer=queued_job.delete_original_text_layer,
+                    )
+                finally:
+                    job_queue.task_done()
+            except Exception as exc:
+                job_label = queued_job.job_id if queued_job is not None else "unknown"
+                print(f"Warning: OCR worker loop recovered after job {job_label}: {exc}", file=sys.stderr)
 
     worker_threads: list[threading.Thread] = []
     worker_threads_lock = threading.Lock()
 
     def _start_worker() -> None:
         with worker_threads_lock:
-            worker_index = len(worker_threads) + 1
-            worker = threading.Thread(
-                target=_worker_loop,
-                name=f"uniscan-ocr-job-worker-{worker_index}",
-                daemon=True,
-            )
-            worker_threads.append(worker)
-            worker.start()
+            alive_workers = [worker for worker in worker_threads if worker.is_alive()]
+            worker_threads[:] = alive_workers
+            while len(worker_threads) < UNISCAN_OCR_WORKER_CONCURRENCY:
+                worker_index = len(worker_threads) + 1
+                worker = threading.Thread(
+                    target=_worker_loop,
+                    name=f"uniscan-ocr-job-worker-{worker_index}",
+                    daemon=True,
+                )
+                worker_threads.append(worker)
+                worker.start()
 
     _start_worker()
 
@@ -1450,17 +1540,50 @@ def _build_handler(*, work_root: Path, default_lang: str):
             default=_DEFAULT_WORKER_WATCHDOG_INTERVAL_SECONDS,
         ),
     )
+    cleanup_interval_seconds = max(
+        0,
+        _env_int(
+            "UNISCAN_JOB_CLEANUP_INTERVAL_SECONDS",
+            default=_DEFAULT_JOB_CLEANUP_INTERVAL_SECONDS,
+        ),
+    )
+
+    def _heartbeat_keepalive_interval() -> float:
+        interval = min(float(watchdog_interval_seconds), 15.0)
+        if worker_timeout_seconds > 0:
+            interval = min(interval, max(0.2, float(worker_timeout_seconds) / 2.0))
+        return max(0.2, interval)
 
     def _watchdog_loop() -> None:
-        if worker_timeout_seconds <= 0:
+        if worker_timeout_seconds <= 0 and cleanup_interval_seconds <= 0:
             return
+        last_cleanup = time.monotonic()
         while True:
-            time.sleep(watchdog_interval_seconds)
-            reclaimed = job_store.reclaim_stale_running_jobs(
-                timeout_seconds=worker_timeout_seconds,
-            )
-            if reclaimed:
-                _start_worker()
+            if worker_timeout_seconds > 0:
+                time.sleep(watchdog_interval_seconds)
+                reclaimed = job_store.reclaim_stale_running_jobs(
+                    timeout_seconds=worker_timeout_seconds,
+                )
+                if reclaimed:
+                    print(
+                        f"Warning: reclaimed stale OCR jobs: {', '.join(reclaimed)}",
+                        file=sys.stderr,
+                    )
+                    _start_worker()
+            else:
+                time.sleep(min(max(cleanup_interval_seconds, 1), 60))
+
+            if cleanup_interval_seconds > 0 and time.monotonic() - last_cleanup >= cleanup_interval_seconds:
+                try:
+                    cleanup = job_store.cleanup_expired()
+                    if cleanup.get("removed_count"):
+                        print(
+                            f"UniScan job cleanup removed {cleanup['removed_count']} expired jobs.",
+                            file=sys.stderr,
+                        )
+                except Exception as exc:
+                    print(f"Warning: OCR job cleanup failed: {exc}", file=sys.stderr)
+                last_cleanup = time.monotonic()
 
     watchdog = threading.Thread(
         target=_watchdog_loop,
@@ -1494,7 +1617,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
             self.send_response(status)
             self.send_header("Content-Type", "application/pdf")
             self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Disposition", _content_disposition_attachment(filename))
             self.end_headers()
             self.wfile.write(payload)
 
@@ -1502,7 +1625,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/pdf")
             self.send_header("Content-Length", str(path.stat().st_size))
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Disposition", _content_disposition_attachment(filename))
             self.end_headers()
             with path.open("rb") as stream:
                 shutil.copyfileobj(stream, self.wfile)
@@ -1517,6 +1640,14 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 raise ValueError("Invalid Content-Length header.") from exc
             if length <= 0:
                 return b""
+            max_upload_bytes = max(
+                0,
+                _env_int("UNISCAN_MAX_UPLOAD_BYTES", default=_DEFAULT_MAX_UPLOAD_BYTES),
+            )
+            if max_upload_bytes > 0 and length > max_upload_bytes:
+                raise _PayloadTooLarge(
+                    f"Request body is too large. Maximum is {max_upload_bytes} bytes."
+                )
             return self.rfile.read(length)
 
         def _handle_sync_searchable_pdf(self, parsed) -> None:
@@ -1530,20 +1661,24 @@ def _build_handler(*, work_root: Path, default_lang: str):
                     default_lang=default_lang,
                 )
                 page_numbers = parse_page_numbers(pages_raw)
-                summary = build_searchable_pdf(
-                    pdf_bytes=payload,
-                    mode=mode,
-                    lang=lang,
-                    page_numbers=page_numbers,
-                    work_root=pipeline_root,
-                    overwrite_input_path=False,
-                    return_bytes=True,
-                    strict=strict,
-                    delete_original_text_layer=delete_original_text_layer,
-                )
+                with _PIPELINE_LOCK:
+                    summary = build_searchable_pdf(
+                        pdf_bytes=payload,
+                        mode=mode,
+                        lang=lang,
+                        page_numbers=page_numbers,
+                        work_root=pipeline_root,
+                        overwrite_input_path=False,
+                        return_bytes=True,
+                        strict=strict,
+                        delete_original_text_layer=delete_original_text_layer,
+                    )
                 output_bytes = summary.output_pdf_bytes
                 if output_bytes is None:
                     raise RuntimeError("Searchable PDF bytes were not returned by service pipeline.")
+            except _PayloadTooLarge as exc:
+                self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)})
+                return
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -1554,7 +1689,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/pdf")
             self.send_header("Content-Length", str(len(output_bytes)))
-            self.send_header("Content-Disposition", 'attachment; filename="searchable.pdf"')
+            self.send_header("Content-Disposition", _content_disposition_attachment("searchable.pdf"))
             self.send_header("X-UniScan-Mode", summary.mode)
             self.send_header("X-UniScan-Run-Dir", str(summary.run_dir))
             self.end_headers()
@@ -1571,6 +1706,9 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 )
                 parse_page_numbers(pages_raw)
                 protocol = _parse_protocol_metadata(parsed, self.headers)
+            except _PayloadTooLarge as exc:
+                self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)})
+                return
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -1584,77 +1722,84 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 strict=strict,
                 delete_original_text_layer=delete_original_text_layer,
             )
-            existing = job_store.find_by_idempotency_key(protocol.idempotency_key)
-            if existing is not None:
-                existing_payload = _serialize_job(existing)
-                existing_payload["idempotent_replay"] = True
-                has_fingerprint_conflict = (
-                    existing.request_fingerprint is not None
-                    and existing.request_fingerprint != request_fingerprint
-                )
-                has_input_conflict = (
-                    existing.request_fingerprint is None
-                    and existing.input_sha256 is not None
-                    and existing.input_sha256 != input_sha256
-                )
-                if has_fingerprint_conflict or has_input_conflict:
+            with create_job_lock:
+                existing = job_store.find_by_idempotency_key(protocol.idempotency_key)
+                if existing is not None:
+                    existing_payload = _serialize_job(existing)
+                    existing_payload["idempotent_replay"] = True
+                    has_fingerprint_conflict = (
+                        existing.request_fingerprint is not None
+                        and existing.request_fingerprint != request_fingerprint
+                    )
+                    has_input_conflict = (
+                        existing.request_fingerprint is None
+                        and existing.input_sha256 is not None
+                        and existing.input_sha256 != input_sha256
+                    )
+                    if has_fingerprint_conflict or has_input_conflict:
+                        self._send_json(
+                            HTTPStatus.CONFLICT,
+                            {
+                                "error": (
+                                    "Idempotency key already belongs to a different OCR request."
+                                ),
+                                "job": existing_payload,
+                            },
+                        )
+                        return
+                    should_retry_terminal = (
+                        existing.status in _TERMINAL_JOB_STATUSES
+                        and existing.status != "done"
+                    )
+                    if not should_retry_terminal:
+                        self._send_json(HTTPStatus.OK, existing_payload)
+                        return
+
+                job_id = uuid.uuid4().hex[:12]
+                try:
+                    input_path = job_store.write_input(job_id, payload)
+                except Exception as exc:
                     self._send_json(
-                        HTTPStatus.CONFLICT,
-                        {
-                            "error": (
-                                "Idempotency key already belongs to a different OCR request."
-                            ),
-                            "job": existing_payload,
-                        },
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"error": f"Failed to persist input PDF before accepting job: {exc}"},
                     )
                     return
-                self._send_json(HTTPStatus.OK, existing_payload)
-                return
-
-            job_id = uuid.uuid4().hex[:12]
-            try:
-                input_path = job_store.write_input(job_id, payload)
-            except Exception as exc:
-                self._send_json(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    {"error": f"Failed to persist input PDF before accepting job: {exc}"},
+                job = _JobState(
+                    job_id=job_id,
+                    status="queued",
+                    progress=0,
+                    message="Queued",
+                    mode=mode,
+                    pages=pages_raw,
+                    lang=lang,
+                    strict=bool(strict),
+                    delete_original_text_layer=bool(delete_original_text_layer),
+                    filename=filename,
+                    input_bytes=len(payload),
+                    input_path=input_path,
+                    protocol_version=protocol.protocol_version,
+                    request_id=protocol.request_id,
+                    project_id=protocol.project_id,
+                    service_id=protocol.service_id,
+                    task_id=protocol.task_id,
+                    idempotency_key=protocol.idempotency_key,
+                    priority=protocol.priority,
+                    gpu_policy=protocol.gpu_policy,
+                    estimated_vram_gb=protocol.estimated_vram_gb,
+                    estimated_pages=protocol.estimated_pages,
+                    ttl_seconds=protocol.ttl_seconds,
+                    input_sha256=input_sha256,
+                    request_fingerprint=request_fingerprint,
                 )
-                return
-            job = _JobState(
-                job_id=job_id,
-                status="queued",
-                progress=0,
-                message="Queued",
-                mode=mode,
-                pages=pages_raw,
-                lang=lang,
-                strict=bool(strict),
-                delete_original_text_layer=bool(delete_original_text_layer),
-                filename=filename,
-                input_bytes=len(payload),
-                input_path=input_path,
-                protocol_version=protocol.protocol_version,
-                request_id=protocol.request_id,
-                project_id=protocol.project_id,
-                service_id=protocol.service_id,
-                task_id=protocol.task_id,
-                idempotency_key=protocol.idempotency_key,
-                priority=protocol.priority,
-                gpu_policy=protocol.gpu_policy,
-                estimated_vram_gb=protocol.estimated_vram_gb,
-                estimated_pages=protocol.estimated_pages,
-                ttl_seconds=protocol.ttl_seconds,
-                input_sha256=input_sha256,
-                request_fingerprint=request_fingerprint,
-            )
-            try:
-                job_store.create(job)
-            except Exception as exc:
-                self._send_json(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    {"error": f"Failed to persist OCR job metadata: {exc}"},
-                )
-                return
+                try:
+                    job_store.create(job)
+                except Exception as exc:
+                    _safe_remove_job_dir(root=jobs_root, target=jobs_root / job_id)
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"error": f"Failed to persist OCR job metadata: {exc}"},
+                    )
+                    return
 
             _queue_job(job)
             self._send_json(HTTPStatus.ACCEPTED, _serialize_job(job))
