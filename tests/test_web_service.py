@@ -13,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote, urlparse
 
+import pytest
+
 from uniscan.web.service import (
     UNISCAN_OCR_WORKER_CONCURRENCY,
     UNISCAN_JOB_PROTOCOL_VERSION,
@@ -90,6 +92,19 @@ def test_parse_job_request_rejects_disabled_text_layer_cleanup() -> None:
         raise AssertionError("Expected disabled text layer cleanup to be rejected")
 
 
+def test_parse_job_request_rejects_invalid_mode_and_language() -> None:
+    for path, expected in (
+        ("/api/jobs?mode=unknown", "Unsupported mode"),
+        ("/api/jobs?lang=rus%0aeng", "control characters"),
+    ):
+        try:
+            _parse_job_request(urlparse(path), default_lang="rus+eng")
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"Expected request to be rejected: {path}")
+
+
 def test_parse_protocol_metadata_from_headers_and_query() -> None:
     parsed = urlparse(
         "/api/jobs?project_id=query-project&priority=batch&estimated_pages=12&ttl_seconds=3600"
@@ -135,6 +150,21 @@ def test_parse_protocol_metadata_rejects_cpu_gpu_policy() -> None:
         assert "gpu_policy must be one of: auto, cuda" in str(exc)
     else:
         raise AssertionError("Expected cpu gpu_policy to be rejected")
+
+
+def test_parse_protocol_metadata_rejects_nonfinite_and_oversized_values() -> None:
+    for path, expected in (
+        ("/api/jobs?estimated_vram_gb=NaN", "finite non-negative"),
+        ("/api/jobs?estimated_vram_gb=Infinity", "finite non-negative"),
+        ("/api/jobs?estimated_pages=10000001", "must not exceed"),
+        ("/api/jobs?ttl_seconds=315360001", "must not exceed"),
+    ):
+        try:
+            _parse_protocol_metadata(urlparse(path), {})
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"Expected protocol metadata to be rejected: {path}")
 
 
 def test_job_store_persists_done_result_metadata(tmp_path: Path) -> None:
@@ -236,6 +266,69 @@ def test_job_store_marks_active_jobs_interrupted_after_restart(tmp_path: Path) -
     assert metadata["status"] == "interrupted"
     assert metadata["error"] == "Interrupted by OCR API restart."
     assert metadata["finished_at"]
+
+
+def test_job_store_does_not_trust_persisted_external_paths(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    external_input = tmp_path / "external-input.pdf"
+    external_result = tmp_path / "external-result.pdf"
+    external_input.write_bytes(b"%PDF external input")
+    external_result.write_bytes(b"%PDF external result")
+    store = _JobStore(root)
+    store.create(
+        _JobState(
+            job_id="EXTERNAL",
+            status="done",
+            progress=100,
+            message="Done",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+            input_path=external_input,
+            result_path=external_result,
+        )
+    )
+
+    reloaded = _JobStore(root)
+    metadata = reloaded.metadata("EXTERNAL")
+
+    assert metadata is not None
+    assert metadata["status"] == "interrupted"
+    assert metadata["error"] == "Completed OCR result was missing after OCR API restart."
+    assert "input_path" not in metadata
+    assert "result_path" not in metadata
+
+
+def test_job_store_ignores_metadata_with_mismatched_job_id(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    metadata_dir = root / "EXPECTED"
+    metadata_dir.mkdir(parents=True)
+    metadata_dir.joinpath("metadata.json").write_text(
+        json.dumps(
+            {
+                "job_id": "../ESCAPE",
+                "status": "queued",
+                "progress": 0,
+                "message": "Queued",
+                "mode": "chandra+surya",
+                "pages": "",
+                "lang": "rus+eng",
+                "strict": True,
+                "delete_original_text_layer": True,
+                "filename": "input.pdf",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = _JobStore(root)
+
+    assert store.health()["jobs"] == 0
+    assert not (root.parent / "ESCAPE").exists()
 
 
 def test_job_store_reclaims_stale_running_job_by_heartbeat_timeout(tmp_path: Path) -> None:
@@ -425,6 +518,53 @@ def test_job_store_writes_sqlite_index(tmp_path: Path) -> None:
     assert row[1] == "jobsql:v1"
     assert row[2] == "batch"
     assert json.loads(row[3])["job_id"] == "JOBSQL"
+
+
+@pytest.mark.parametrize(
+    "failing_step",
+    ("_write_metadata_locked", "_upsert_sqlite_locked", "_append_event_locked"),
+)
+def test_job_store_create_rolls_back_every_persistence_failure(
+    tmp_path: Path,
+    monkeypatch,
+    failing_step: str,
+) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    input_path = store.write_input("ROLLBACK", b"%PDF input")
+
+    def fail_persistence(*_args, **_kwargs) -> None:
+        raise OSError(f"simulated {failing_step} failure")
+
+    monkeypatch.setattr(store, failing_step, fail_persistence)
+
+    with pytest.raises(OSError, match="simulated"):
+        store.create(
+            _JobState(
+                job_id="ROLLBACK",
+                status="queued",
+                progress=0,
+                message="Queued",
+                mode="chandra+surya",
+                pages="",
+                lang="rus+eng",
+                strict=True,
+                delete_original_text_layer=True,
+                filename="input.pdf",
+                input_bytes=input_path.stat().st_size,
+                input_path=input_path,
+                idempotency_key="rollback:v1",
+            )
+        )
+
+    assert store.get("ROLLBACK") is None
+    assert not (root / "ROLLBACK").exists()
+    with sqlite3.connect(root / "jobs.sqlite3") as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE job_id = ?",
+            ("ROLLBACK",),
+        ).fetchone()[0]
+    assert count == 0
 
 
 def test_job_store_cleanup_expired_removes_terminal_jobs_only(tmp_path: Path, monkeypatch) -> None:
@@ -679,6 +819,114 @@ def test_http_job_persists_input_pdf_before_accepting(tmp_path: Path, monkeypatc
         assert input_path.read_bytes() == body
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         assert metadata["input_path"] == str(input_path.resolve())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_job_isolates_and_cleans_pipeline_work(tmp_path: Path, monkeypatch) -> None:
+    seen_work_roots: list[Path] = []
+
+    def fake_build_searchable_pdf(**kwargs):
+        work_root = Path(kwargs["work_root"])
+        seen_work_roots.append(work_root)
+        run_dir = work_root / "run"
+        run_dir.mkdir(parents=True)
+        result_pdf = run_dir / "result.pdf"
+        result_pdf.write_bytes(b"%PDF result")
+        return SimpleNamespace(
+            output_pdf_path=result_pdf,
+            run_dir=run_dir,
+            partial_page_failures=0,
+        )
+
+    monkeypatch.setattr("uniscan.web.service.build_searchable_pdf", fake_build_searchable_pdf)
+    work_root = tmp_path / "work"
+    handler = _build_handler(work_root=work_root, default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        conn.request(
+            "POST",
+            "/api/jobs?filename=input.pdf",
+            body=b"%PDF input",
+            headers={"Content-Type": "application/pdf"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+        job_id = payload["job_id"]
+        status_payload = None
+        for _ in range(40):
+            status_conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+            status_conn.request("GET", f"/api/jobs/{job_id}")
+            status_response = status_conn.getresponse()
+            status_payload = json.loads(status_response.read().decode("utf-8"))
+            status_conn.close()
+            if status_payload.get("status") == "done" and not (work_root / "jobs" / job_id / "work").exists():
+                break
+            time.sleep(0.05)
+
+        expected_work_root = work_root / "jobs" / job_id / "work"
+        assert response.status == HTTPStatus.ACCEPTED
+        assert status_payload is not None
+        assert status_payload["status"] == "done"
+        assert "run_dir" not in status_payload
+        assert seen_work_roots == [expected_work_root]
+        assert not expected_work_root.exists()
+        assert (work_root / "jobs" / job_id / "result.pdf").read_bytes() == b"%PDF result"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_sync_request_cleans_pipeline_work(tmp_path: Path, monkeypatch) -> None:
+    seen_work_roots: list[Path] = []
+
+    def fake_build_searchable_pdf(**kwargs):
+        work_root = Path(kwargs["work_root"])
+        seen_work_roots.append(work_root)
+        run_dir = work_root / "run"
+        run_dir.mkdir(parents=True)
+        return SimpleNamespace(
+            output_pdf_bytes=b"%PDF sync",
+            output_pdf_path=run_dir / "result.pdf",
+            run_dir=run_dir,
+            mode="surya",
+        )
+
+    monkeypatch.setattr("uniscan.web.service.build_searchable_pdf", fake_build_searchable_pdf)
+    work_root = tmp_path / "work"
+    handler = _build_handler(work_root=work_root, default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        conn.request(
+            "POST",
+            "/searchable-pdf?mode=surya",
+            body=b"%PDF input",
+            headers={"Content-Type": "application/pdf"},
+        )
+        response = conn.getresponse()
+        body = response.read()
+        run_dir_header = response.getheader("X-UniScan-Run-Dir")
+        conn.close()
+
+        assert response.status == HTTPStatus.OK
+        assert body == b"%PDF sync"
+        assert run_dir_header is None
+        assert len(seen_work_roots) == 1
+        assert seen_work_roots[0].parent == work_root / "runs"
+        assert not seen_work_roots[0].exists()
     finally:
         server.shutdown()
         server.server_close()

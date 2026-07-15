@@ -14,6 +14,7 @@ from .ocr_pipeline import (
     SearchablePdfSummary,
     build_searchable_pdf,
     build_chandra_geometry_variants,
+    normalize_pdf_mode,
     run_basic_ocr_benchmark,
 )
 from .page_spec import parse_page_numbers
@@ -32,6 +33,7 @@ __all__ = [
     "SearchablePdfSummary",
     "build_searchable_pdf",
     "build_chandra_geometry_variants",
+    "normalize_pdf_mode",
     "parse_page_numbers",
     "run_basic_ocr_benchmark",
 ]

@@ -11,22 +11,21 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# PIL's default decompression-bomb guard is 178 956 970 px.
-# We cap renders slightly below that so every downstream consumer
-# (ocrmypdf, surya, mineru, …) can open the resulting images safely.
-_MAX_RENDER_PIXELS: int = 150_000_000
+# Keep one rendered RGB page below roughly 192 MiB before model tensors/copies.
+_MAX_RENDER_PIXELS: int = 64_000_000
 
 
 def _safe_render_dpi(page_rect, requested_dpi: int, max_pixels: int = _MAX_RENDER_PIXELS) -> int:
-    """Return the highest integer DPI ≤ *requested_dpi* that keeps the
+    """Return the highest integer DPI <= *requested_dpi* that keeps the
     rendered page within *max_pixels* total pixels.
 
-    This prevents PIL ``DecompressionBombError`` in every downstream tool
-    that opens the rendered PNG (ocrmypdf, surya, mineru, …).
+    This bounds host memory before downstream OCR tools open the rendered PNG.
     """
-    w_pt: float = page_rect.width   # page width in PDF points (1 pt = 1/72 in)
-    h_pt: float = page_rect.height
-    if w_pt <= 0 or h_pt <= 0:
+    requested_dpi = max(1, int(requested_dpi))
+    max_pixels = max(1, int(max_pixels))
+    w_pt = float(page_rect.width)  # page width in PDF points (1 pt = 1/72 in)
+    h_pt = float(page_rect.height)
+    if not math.isfinite(w_pt) or not math.isfinite(h_pt) or w_pt <= 0 or h_pt <= 0:
         return requested_dpi
     w_px = w_pt / 72.0 * requested_dpi
     h_px = h_pt / 72.0 * requested_dpi
@@ -35,10 +34,10 @@ def _safe_render_dpi(page_rect, requested_dpi: int, max_pixels: int = _MAX_RENDE
     scale = math.sqrt(max_pixels / (w_px * h_px))
     safe_dpi = max(1, int(requested_dpi * scale))
     warnings.warn(
-        f"PDF page ({w_pt:.0f}×{h_pt:.0f} pt) at {requested_dpi} DPI would produce "
-        f"{w_px * h_px / 1_000_000:.0f} Mpx — capping to {safe_dpi} DPI "
-        f"({w_pt / 72 * safe_dpi:.0f}×{h_pt / 72 * safe_dpi:.0f} px) "
-        f"to stay below PIL decompression-bomb limit.",
+        f"PDF page ({w_pt:.0f}x{h_pt:.0f} pt) at {requested_dpi} DPI would produce "
+        f"{w_px * h_px / 1_000_000:.0f} Mpx; capping to {safe_dpi} DPI "
+        f"({w_pt / 72 * safe_dpi:.0f}x{h_pt / 72 * safe_dpi:.0f} px) "
+        f"to stay below the render memory limit.",
         stacklevel=4,
     )
     return safe_dpi
@@ -94,7 +93,11 @@ def render_pdf_pages(pdf_path: Path, dpi: int) -> list[LoadedItem]:
         for page_index, page in enumerate(doc, start=1):
             safe_dpi = _safe_render_dpi(page.rect, dpi)
             pix = page.get_pixmap(dpi=safe_dpi, alpha=False)
-            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            arr: np.ndarray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                pix.height,
+                pix.width,
+                pix.n,
+            )
             if pix.n == 4:
                 arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
             else:
@@ -125,7 +128,11 @@ def iter_render_pdf_page_indices(
             page = doc[page_index]
             safe_dpi = _safe_render_dpi(page.rect, dpi)
             pix = page.get_pixmap(dpi=safe_dpi, alpha=False)
-            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            arr: np.ndarray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                pix.height,
+                pix.width,
+                pix.n,
+            )
             if pix.n == 4:
                 arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
             else:

@@ -27,6 +27,7 @@ from uniscan.ocr.artifact_searchable import (
     _geometry_boxes_in_reading_order,
     _geometry_lines_in_reading_order,
     _has_explicit_page_markers,
+    _load_surya_page_geometry,
     _normalize_hybrid_policy,
     _normalize_alignment_token,
     _placements_from_chandra_text_aligned_to_geometry,
@@ -42,6 +43,7 @@ from uniscan.ocr.artifact_searchable import (
     _split_lines_to_pages_by_weights,
     _split_text_to_pages_by_token_weights,
     _split_text_to_pages,
+    _validate_searchable_text_retention,
     build_compare_txt_from_benchmark,
     run_artifact_searchable_package,
 )
@@ -68,6 +70,38 @@ def _rotate_pdf_90(source_pdf: Path, out_pdf: Path) -> Path:
     with out_pdf.open("wb") as fh:
         writer.write(fh)
     return out_pdf
+
+
+def test_validate_searchable_text_retention_rejects_catastrophic_loss() -> None:
+    source = "[SOURCE PAGE 0001]\n" + ("searchable content " * 20)
+
+    _validate_searchable_text_retention(source_text=source, extracted_text="searchable content " * 15)
+    with pytest.raises(RuntimeError, match="retained too little searchable text"):
+        _validate_searchable_text_retention(source_text=source, extracted_text="tiny")
+
+
+def test_build_searchable_pdf_write_is_atomic(tmp_path: Path, monkeypatch) -> None:
+    source_pdf = _build_sample_pdf(tmp_path, "source", [50])
+    output_pdf = tmp_path / "output.pdf"
+    output_pdf.write_bytes(b"ORIGINAL")
+
+    from pypdf import PdfWriter
+
+    def fail_write(_self, stream) -> None:
+        stream.write(b"PARTIAL")
+        raise OSError("simulated writer failure")
+
+    monkeypatch.setattr(PdfWriter, "write", fail_write)
+
+    with pytest.raises(OSError, match="simulated writer failure"):
+        _build_searchable_pdf_from_text(
+            source_pdf=source_pdf,
+            text="[SOURCE PAGE 0001]\nTEXT",
+            out_pdf=output_pdf,
+        )
+
+    assert output_pdf.read_bytes() == b"ORIGINAL"
+    assert list(tmp_path.glob(".output.pdf.*.tmp")) == []
 
 
 def _extract_pdf_text(pdf_path: Path) -> str:
@@ -106,6 +140,8 @@ def test_parse_artifact_filename() -> None:
 
     with pytest.raises(ValueError):
         _parse_artifact_filename(Path("broken_name.txt"))
+    with pytest.raises(ValueError, match="Invalid document component"):
+        _parse_artifact_filename(Path("..__chandra.txt"))
 
 
 def test_split_text_to_pages_with_markers() -> None:
@@ -1093,6 +1129,140 @@ def test_run_artifact_searchable_package_reports_duplicate_pdf_stems(tmp_path: P
     assert "multiple source pdfs" in (rows[0].error or "").lower()
 
 
+def test_artifact_package_isolates_textless_failure_to_one_document(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+    _build_sample_pdf(pdf_root, "first", [30])
+    _build_sample_pdf(pdf_root, "second", [60])
+    for name in ("first", "second"):
+        (compare_dir / f"{name}__chandra.txt").write_text(
+            f"[SOURCE PAGE 0001]\n{name.upper()} TEXT",
+            encoding="utf-8",
+        )
+
+    def fake_textless(*, source_pdf: Path, out_pdf: Path, dpi: int) -> Path:
+        assert dpi > 0
+        if source_pdf.stem == "first":
+            raise RuntimeError("textless conversion failed")
+        return source_pdf
+
+    monkeypatch.setattr(
+        "uniscan.ocr.artifact_searchable._build_textless_source_pdf",
+        fake_textless,
+    )
+
+    rows = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=output_dir,
+        engines=("chandra",),
+        require_page_markers=True,
+        delete_original_text_layer=True,
+    )
+
+    assert [(row.document, row.status) for row in rows] == [
+        ("first", "error"),
+        ("second", "ok"),
+    ]
+    assert "textless conversion failed" in (rows[0].error or "")
+
+
+def test_artifact_package_removes_output_that_fails_retention_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+    (pdf_root / "document.pdf").write_bytes(b"%PDF fixture")
+    (compare_dir / "document__chandra.txt").write_text(
+        "[SOURCE PAGE 0001]\n" + ("EXPECTED SEARCHABLE TEXT " * 20),
+        encoding="utf-8",
+    )
+
+    def fake_build(*, out_pdf: Path, **_kwargs) -> tuple[int, int]:
+        out_pdf.parent.mkdir(parents=True, exist_ok=True)
+        out_pdf.write_bytes(b"%PDF poor output")
+        return 1, 400
+
+    monkeypatch.setattr(
+        "uniscan.ocr.artifact_searchable._build_searchable_pdf_from_text",
+        fake_build,
+    )
+    monkeypatch.setattr(
+        "uniscan.ocr.artifact_searchable._extract_pdf_text",
+        lambda _path: "tiny",
+    )
+
+    rows = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=output_dir,
+        engines=("chandra",),
+        require_page_markers=True,
+    )
+
+    output_pdf = output_dir / "document" / "document__chandra_searchable.pdf"
+    assert len(rows) == 1
+    assert rows[0].status == "error"
+    assert "retained too little" in (rows[0].error or "")
+    assert not output_pdf.exists()
+
+
+def test_artifact_package_preserves_previous_output_when_retention_gate_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+    (pdf_root / "document.pdf").write_bytes(b"%PDF fixture")
+    (compare_dir / "document__chandra.txt").write_text(
+        "[SOURCE PAGE 0001]\n" + ("EXPECTED SEARCHABLE TEXT " * 20),
+        encoding="utf-8",
+    )
+    output_pdf = output_dir / "document" / "document__chandra_searchable.pdf"
+    output_pdf.parent.mkdir(parents=True)
+    output_pdf.write_bytes(b"previous good output")
+
+    def fake_build(*, out_pdf: Path, **_kwargs) -> tuple[int, int]:
+        out_pdf.parent.mkdir(parents=True, exist_ok=True)
+        out_pdf.write_bytes(b"%PDF poor candidate")
+        return 1, 400
+
+    monkeypatch.setattr(
+        "uniscan.ocr.artifact_searchable._build_searchable_pdf_from_text",
+        fake_build,
+    )
+    monkeypatch.setattr(
+        "uniscan.ocr.artifact_searchable._extract_pdf_text",
+        lambda _path: "tiny",
+    )
+
+    rows = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=output_dir,
+        engines=("chandra",),
+        require_page_markers=True,
+    )
+
+    assert len(rows) == 1
+    assert rows[0].status == "error"
+    assert output_pdf.read_bytes() == b"previous good output"
+    assert list(output_pdf.parent.glob("*.candidate")) == []
+
+
 def test_run_artifact_searchable_package_uses_chandra_sidecar_geometry(tmp_path: Path) -> None:
     compare_dir = tmp_path / "compare"
     pdf_root = tmp_path / "pdf_root"
@@ -1155,6 +1325,90 @@ def test_run_artifact_searchable_package_uses_chandra_sidecar_geometry(tmp_path:
     assert rows[0].searchable_pdf_path is not None
     extracted = _extract_pdf_text(Path(rows[0].searchable_pdf_path))
     assert "CHANDRA GEOMETRY LINE" in extracted
+
+
+def test_geometry_loader_rejects_unsafe_and_malformed_sidecars(tmp_path: Path) -> None:
+    compare_dir = tmp_path / "compare"
+    engine_dir = tmp_path / "chandra"
+    compare_dir.mkdir()
+    engine_dir.mkdir()
+
+    outside_sidecar = tmp_path / "outside.json"
+    outside_sidecar.write_text(
+        json.dumps(
+            {
+                "images": [
+                    {
+                        "pages": [
+                            {
+                                "image_bbox": [0, 0, 100, 100],
+                                "text_lines": [{"text": "OUTSIDE", "bbox": [1, 1, 20, 20]}],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    invalid_sidecar = engine_dir / "invalid.json"
+    invalid_sidecar.write_text(
+        json.dumps(
+            {
+                "images": [
+                    {
+                        "pages": [
+                            {
+                                "image_bbox": [0, 0, 100, 100],
+                                "text_lines": [
+                                    {"text": "BOOL", "bbox": [0, 0, True, 20]},
+                                    {"text": "NAN", "bbox": [0, 0, float("nan"), 20]},
+                                    {"text": "REVERSED", "bbox": [20, 20, 10, 10]},
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (engine_dir / "pages.json").write_text(
+        json.dumps(
+            {
+                "pages": [
+                    {
+                        "source_page": True,
+                        "geometry_file": "invalid.json",
+                        "geometry_type": "chandra_text_lines",
+                    },
+                    {
+                        "source_page": 2,
+                        "geometry_file": "../outside.json",
+                        "geometry_type": "chandra_text_lines",
+                    },
+                    {
+                        "source_page": 3,
+                        "geometry_file": "invalid.json",
+                        "geometry_type": "chandra_text_lines",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    warnings: list[str] = []
+    geometry = _load_surya_page_geometry(
+        compare_dir=compare_dir,
+        document="fixture_doc",
+        engine="chandra",
+        geometry_types=("chandra_text_lines",),
+        warnings=warnings,
+    )
+
+    assert geometry == {}
+    assert warnings == ["geometry rejected: '../outside.json' escapes engine directory"]
 
 
 def test_run_artifact_searchable_package_reads_nested_chandra_pages_json(tmp_path: Path) -> None:
@@ -1480,6 +1734,60 @@ def test_run_artifact_searchable_package_require_markers(tmp_path: Path) -> None
     assert "no explicit page markers" in (results[0].error or "").lower()
 
 
+def test_run_artifact_searchable_package_rejects_invalid_utf8_text(tmp_path: Path) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = tmp_path / "out"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+
+    _build_sample_pdf(pdf_root, "fixture_doc", [30])
+    (compare_dir / "fixture_doc__chandra.txt").write_bytes(
+        b"[SOURCE PAGE 1]\nvalid\xffcorrupt"
+    )
+
+    results = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=output_dir,
+        engines=("chandra",),
+        require_page_markers=True,
+    )
+
+    assert len(results) == 1
+    assert results[0].status == "error"
+    assert "decode" in (results[0].error or "").lower()
+
+
+def test_run_artifact_searchable_package_excludes_output_from_pdf_index(
+    tmp_path: Path,
+) -> None:
+    compare_dir = tmp_path / "compare"
+    pdf_root = tmp_path / "pdf_root"
+    output_dir = pdf_root / "generated"
+    compare_dir.mkdir()
+    pdf_root.mkdir()
+
+    _build_sample_pdf(pdf_root, "fixture_doc", [30])
+    output_dir.mkdir()
+    _build_sample_pdf(output_dir, "fixture_doc", [90])
+    (compare_dir / "fixture_doc__chandra.txt").write_text(
+        "[SOURCE PAGE 1]\nsearchable text",
+        encoding="utf-8",
+    )
+
+    results = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=pdf_root,
+        output_dir=output_dir,
+        engines=("chandra",),
+        require_page_markers=True,
+    )
+
+    assert len(results) == 1
+    assert results[0].status == "ok"
+
+
 def test_run_artifact_searchable_package_delete_original_text_layer(tmp_path: Path) -> None:
     compare_dir = tmp_path / "compare"
     pdf_root = tmp_path / "pdf_root"
@@ -1550,6 +1858,30 @@ def test_build_textless_source_pdf_jpeg_is_smaller_than_lossless(
 
     assert len(PdfReader(str(jpeg_pdf)).pages) == len(PdfReader(str(lossless_pdf)).pages) == 2
     assert jpeg_pdf.stat().st_size < lossless_pdf.stat().st_size
+
+
+def test_build_textless_source_pdf_applies_per_page_render_cap(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_pdf = _build_sample_pdf(tmp_path, "source", [60, 120])
+    output_pdf = tmp_path / "textless.pdf"
+    calls: list[tuple[float, float, int]] = []
+
+    def fake_safe_render_dpi(rect, requested_dpi: int) -> int:
+        calls.append((float(rect.width), float(rect.height), requested_dpi))
+        return 72
+
+    monkeypatch.setattr(
+        "uniscan.ocr.pdf_utils._safe_render_dpi",
+        fake_safe_render_dpi,
+    )
+
+    _build_textless_source_pdf(source_pdf=source_pdf, out_pdf=output_pdf, dpi=300)
+
+    assert output_pdf.is_file()
+    assert len(calls) == 2
+    assert all(requested_dpi == 300 for _width, _height, requested_dpi in calls)
 
 
 def test_build_compare_txt_from_benchmark(tmp_path: Path) -> None:

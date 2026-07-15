@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from uniscan.core.pipeline import build_pdf_from_images
 
@@ -33,6 +33,29 @@ OCR_ENGINE_VALUES: tuple[str, ...] = (
     OCR_ENGINE_CHANDRA,
     OCR_ENGINE_OLMOCR,
 )
+
+
+def normalize_ocr_engines(engines: Sequence[str] | None) -> tuple[str, ...]:
+    """Normalize, deduplicate, and validate an OCR engine selection."""
+    raw_engines: Sequence[str] = OCR_ENGINE_VALUES if engines is None else engines
+    normalized: list[str] = []
+    for raw_engine in raw_engines:
+        if not isinstance(raw_engine, str):
+            raise ValueError("OCR engine names must be strings.")
+        engine = raw_engine.strip().lower()
+        if engine and engine not in normalized:
+            normalized.append(engine)
+
+    if not normalized:
+        raise ValueError("No OCR engines selected.")
+
+    unsupported = [engine for engine in normalized if engine not in OCR_ENGINE_VALUES]
+    if unsupported:
+        known = ", ".join(OCR_ENGINE_VALUES)
+        raise ValueError(
+            f"Unsupported OCR engine(s): {', '.join(unsupported)}. Supported: {known}."
+        )
+    return tuple(normalized)
 
 OCR_ENGINE_LABELS: dict[str, str] = {
     OCR_ENGINE_PYTESSERACT: "pytesseract",
@@ -83,7 +106,7 @@ def _find_ghostscript_executable(which_fn=shutil.which) -> str | None:
 
 
 def _run_cmd_with_optional_env(run_cmd, command: list[str], env: dict[str, str] | None):
-    kwargs = {
+    kwargs: dict[str, Any] = {
         "capture_output": True,
         "text": True,
     }
@@ -397,8 +420,8 @@ def _image_paths_to_searchable_pdf_pytesseract(
                 finally:
                     merged.close()
                 return out_pdf
-            except Exception:
-                raise writer_exc
+            except Exception as fallback_exc:
+                raise writer_exc from fallback_exc
         finally:
             for stream in streams:
                 stream.close()
@@ -589,9 +612,9 @@ def image_paths_to_searchable_pdf(
 
     if engine == OCR_ENGINE_PYTESSERACT:
         if dependency_status is None:
-            status = detect_ocr_dependencies(import_module=import_module, which_fn=which_fn)
-            if not status.ready:
-                missing = ", ".join(status.missing) if status.missing else "unknown"
+            detected_dependencies = detect_ocr_dependencies(import_module=import_module, which_fn=which_fn)
+            if not detected_dependencies.ready:
+                missing = ", ".join(detected_dependencies.missing) if detected_dependencies.missing else "unknown"
                 raise RuntimeError(f"OCR dependencies are not ready: missing {missing}")
         else:
             if not dependency_status.ready:
@@ -604,12 +627,12 @@ def image_paths_to_searchable_pdf(
             import_module=import_module,
         )
 
-    status = engine_status or detect_ocr_engine_status(
+    selected_engine_status = engine_status or detect_ocr_engine_status(
         engine,
         import_module=import_module,
         which_fn=which_fn,
     )
-    _ensure_engine_ready(status)
+    _ensure_engine_ready(selected_engine_status)
 
     if engine == OCR_ENGINE_OCRMYPDF:
         return _image_paths_to_searchable_pdf_ocrmypdf(

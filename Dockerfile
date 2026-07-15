@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     ca-certificates \
     curl \
+    fonts-dejavu-core \
     libgl1 \
     libglib2.0-0 \
     tesseract-ocr \

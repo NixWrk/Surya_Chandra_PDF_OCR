@@ -371,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
             page_numbers = parse_page_numbers(args.pages)
         except ValueError as exc:
             parser.error(str(exc))
-        results = run_ocr_benchmark(
+        benchmark_results = run_ocr_benchmark(
             pdf_path=args.pdf,
             output_dir=args.output,
             engines=tuple(args.engines) if args.engines else None,
@@ -380,8 +380,8 @@ def main(argv: list[str] | None = None) -> int:
             dpi=args.dpi,
             lang=args.lang,
         )
-        print(summarize_ocr_benchmark(results))
-        if args.strict and any(result.status != "ok" for result in results):
+        print(summarize_ocr_benchmark(benchmark_results))
+        if args.strict and any(result.status != "ok" for result in benchmark_results):
             return 1
         return 0
     if args.command == "benchmark-ocr-canonical":
@@ -389,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
             page_numbers = parse_page_numbers(args.pages)
         except ValueError as exc:
             parser.error(str(exc))
-        results = run_ocr_canonical_package(
+        canonical_results = run_ocr_canonical_package(
             pdf_path=args.pdf,
             output_dir=args.output,
             engines=tuple(args.engines) if args.engines else None,
@@ -401,12 +401,12 @@ def main(argv: list[str] | None = None) -> int:
             preprocessing=args.preprocessing,
             lang=args.lang,
         )
-        print(summarize_ocr_canonical_package(results))
-        if args.strict and any(result.status != "ok" for result in results):
+        print(summarize_ocr_canonical_package(canonical_results))
+        if args.strict and any(result.status != "ok" for result in canonical_results):
             return 1
         return 0
     if args.command == "build-searchable-from-artifacts":
-        results = run_artifact_searchable_package(
+        artifact_results = run_artifact_searchable_package(
             compare_dir=args.compare_dir,
             pdf_root=args.pdf_root,
             output_dir=args.output,
@@ -417,29 +417,29 @@ def main(argv: list[str] | None = None) -> int:
             chandra_blend_primary_y_weight=args.chandra_blend_weight,
             geometry_debug_log=bool(args.geometry_debug_log),
         )
-        print(summarize_artifact_searchable_package(results))
-        if args.strict and any(result.status != "ok" for result in results):
+        print(summarize_artifact_searchable_package(artifact_results))
+        if args.strict and any(result.status != "ok" for result in artifact_results):
             return 1
         return 0
     if args.command == "prepare-compare-txt":
-        results = build_compare_txt_from_benchmark(
+        compare_results = build_compare_txt_from_benchmark(
             benchmark_root=args.benchmark_root,
             output_dir=args.output,
             engines=tuple(args.engines) if args.engines else None,
         )
-        print(summarize_compare_txt_build(results))
-        if args.strict and any(result.status != "ok" for result in results):
+        print(summarize_compare_txt_build(compare_results))
+        if args.strict and any(result.status != "ok" for result in compare_results):
             return 1
         return 0
     if args.command == "compare-chandra-geometry":
-        summary = build_chandra_geometry_variants(
+        geometry_summary = build_chandra_geometry_variants(
             run_root=args.run_root,
             pdf_root=args.pdf_root,
             output_root=args.output,
             strict=bool(args.strict),
         )
-        print(f"compare_dir={summary.compare_dir}")
-        print(f"output_root={summary.output_root}")
+        print(f"compare_dir={geometry_summary.compare_dir}")
+        print(f"output_root={geometry_summary.output_root}")
         print("variants:")
         print("  - chandra_text__chandra_geometry")
         print("  - chandra_text__surya_geometry")
@@ -449,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
             page_numbers = parse_page_numbers(args.pages)
         except ValueError as exc:
             parser.error(str(exc))
-        summary = build_searchable_pdf(
+        searchable_summary = build_searchable_pdf(
             pdf_path=args.pdf,
             mode=args.mode,
             page_numbers=page_numbers,
@@ -459,11 +459,11 @@ def main(argv: list[str] | None = None) -> int:
             overwrite_input_path=True,
             return_bytes=False,
         )
-        print(f"mode={summary.mode}")
-        print(f"run_dir={summary.run_dir}")
-        print(f"output_pdf={summary.output_pdf_path}")
-        if summary.overwritten_input_path is not None:
-            print(f"overwritten={summary.overwritten_input_path}")
+        print(f"mode={searchable_summary.mode}")
+        print(f"run_dir={searchable_summary.run_dir}")
+        print(f"output_pdf={searchable_summary.output_pdf_path}")
+        if searchable_summary.overwritten_input_path is not None:
+            print(f"overwritten={searchable_summary.overwritten_input_path}")
         return 0
     if args.command == "serve-http":
         run_http_server(

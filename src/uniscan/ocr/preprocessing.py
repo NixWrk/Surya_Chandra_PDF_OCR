@@ -183,6 +183,10 @@ def apply_preprocessing(
     numpy.ndarray
         Pre-processed image (uint8).
     """
+    if mode not in PREPROCESSING_MODES:
+        raise ValueError(
+            f"Invalid preprocessing mode: {mode!r}. Valid values: {PREPROCESSING_MODES}"
+        )
     if mode == "none":
         return image
 

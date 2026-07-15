@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from uniscan.io.loaders import _safe_render_dpi
+
 
 def _textless_jpeg_quality() -> int:
     raw = os.getenv("UNISCAN_TEXTLESS_JPEG_QUALITY", "").strip()
@@ -28,8 +30,7 @@ def _build_textless_source_pdf(*, source_pdf: Path, out_pdf: Path, dpi: int = 30
             "Removing original text layer requires PyMuPDF. Install with: pip install pymupdf"
         ) from exc
 
-    scale = max(float(dpi), 72.0) / 72.0
-    matrix = fitz.Matrix(scale, scale)
+    requested_dpi = max(int(dpi), 72)
     jpeg_quality = _textless_jpeg_quality()
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
 
@@ -37,6 +38,9 @@ def _build_textless_source_pdf(*, source_pdf: Path, out_pdf: Path, dpi: int = 30
     dst_doc = fitz.open()
     try:
         for src_page in src_doc:
+            safe_dpi = _safe_render_dpi(src_page.rect, requested_dpi)
+            scale = float(safe_dpi) / 72.0
+            matrix = fitz.Matrix(scale, scale)
             pix = src_page.get_pixmap(matrix=matrix, alpha=False)
             dst_page = dst_doc.new_page(
                 width=float(src_page.rect.width),

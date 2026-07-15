@@ -15,12 +15,17 @@ from typing import Sequence
 
 from uniscan.io import imwrite_unicode, render_pdf_page_indices
 
-from .benchmark import _run_extraction_engine, resolve_pdf_page_indices
+from .artifact_searchable import _resolve_text_layer_font_path
+from .benchmark import (
+    _markerized_pages_text,
+    _run_extraction_engine,
+    resolve_pdf_page_indices,
+)
 from .engine import (
-    OCR_ENGINE_VALUES,
     SEARCHABLE_PDF_ENGINES,
     detect_ocr_engine_status,
     image_paths_to_searchable_pdf,
+    normalize_ocr_engines,
 )
 from .preprocessing import PREPROCESSING_MODES, PreprocessingMode, preprocess_image_file
 
@@ -103,21 +108,37 @@ def _extract_page_text(
     return text
 
 
-def _build_text_only_searchable_pdf(page_texts: Sequence[str], *, out_pdf: Path) -> Path:
+def _build_text_only_searchable_pdf(
+    page_texts: Sequence[str],
+    *,
+    out_pdf: Path,
+    source_pages_1based: Sequence[int] | None = None,
+) -> Path:
     import fitz  # type: ignore
+
+    source_pages = (
+        list(source_pages_1based)
+        if source_pages_1based is not None
+        else list(range(1, len(page_texts) + 1))
+    )
+    if len(source_pages) != len(page_texts):
+        raise ValueError("source_pages_1based and page_texts lengths must match.")
 
     width, height = fitz.paper_size("a4")
     margin = 36.0
     line_height = 10.0
     wrap_width = 110
     font_size = 8.0
+    font_name = "uniscan-canonical"
+    font_path = _resolve_text_layer_font_path()
 
     doc = fitz.open()
     try:
         page = doc.new_page(width=width, height=height)
+        page.insert_font(fontname=font_name, fontfile=str(font_path))
         y = margin
 
-        for page_number, text in enumerate(page_texts, start=1):
+        for page_number, text in zip(source_pages, page_texts, strict=True):
             block_lines = [f"[SOURCE PAGE {page_number:04d}]"]
             block_lines.append("")
             if text.strip():
@@ -131,8 +152,9 @@ def _build_text_only_searchable_pdf(page_texts: Sequence[str], *, out_pdf: Path)
             for line in block_lines:
                 if y > (height - margin):
                     page = doc.new_page(width=width, height=height)
+                    page.insert_font(fontname=font_name, fontfile=str(font_path))
                     y = margin
-                page.insert_text((margin, y), line, fontsize=font_size, fontname="cour")
+                page.insert_text((margin, y), line, fontsize=font_size, fontname=font_name)
                 y += line_height
 
         out_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -178,20 +200,13 @@ def run_ocr_canonical_package(
             f"Valid values: {PREPROCESSING_MODES}"
         )
 
-    resolved_pdf = Path(pdf_path)
-    resolved_output = Path(output_dir)
-    resolved_output.mkdir(parents=True, exist_ok=True)
-
-    source_pages_dir = resolved_output / "source_pages"
-    canonical_root = resolved_output / "canonical"
-    searchable_root = resolved_output / "searchable_pdf"
-    source_pages_dir.mkdir(parents=True, exist_ok=True)
-    canonical_root.mkdir(parents=True, exist_ok=True)
-    searchable_root.mkdir(parents=True, exist_ok=True)
-
     effective_render_dpi = render_dpi if render_dpi > 0 else dpi
     effective_ocr_dpi = ocr_dpi if ocr_dpi > 0 else effective_render_dpi
+    if effective_render_dpi <= 0 or effective_ocr_dpi <= 0:
+        raise ValueError("Render and OCR DPI values must be positive.")
+    selected_engines = normalize_ocr_engines(engines)
 
+    resolved_pdf = Path(pdf_path)
     page_count = _pdf_page_count(resolved_pdf)
     sample_pages = resolve_pdf_page_indices(
         page_count,
@@ -201,10 +216,29 @@ def run_ocr_canonical_package(
     if not sample_pages:
         raise ValueError("No PDF pages available for canonical OCR packaging.")
 
+    resolved_output = Path(output_dir)
+    resolved_output.mkdir(parents=True, exist_ok=True)
+
+    source_pages_dir = resolved_output / "source_pages"
+    preprocessed_dir = resolved_output / "preprocessed"
+    canonical_root = resolved_output / "canonical"
+    searchable_root = resolved_output / "searchable_pdf"
+    for generated_root in (
+        source_pages_dir,
+        preprocessed_dir,
+        canonical_root,
+        searchable_root,
+    ):
+        if generated_root.exists():
+            shutil.rmtree(generated_root)
+    for generated_root in (source_pages_dir, canonical_root, searchable_root):
+        generated_root.mkdir(parents=True, exist_ok=False)
+
     rendered = render_pdf_page_indices(resolved_pdf, sample_pages, dpi=effective_render_dpi)
+    source_pages_1based = [page + 1 for page in sample_pages]
     sampled_images: list[Path] = []
-    for idx, (_name, image) in enumerate(rendered, start=1):
-        out_path = source_pages_dir / f"page_{idx:04d}.png"
+    for source_page, (_name, image) in zip(source_pages_1based, rendered, strict=True):
+        out_path = source_pages_dir / f"page_{source_page:04d}.png"
         if not imwrite_unicode(out_path, image):
             raise RuntimeError(f"Failed to write source page image: {out_path}")
         sampled_images.append(out_path)
@@ -212,11 +246,10 @@ def run_ocr_canonical_package(
     # Apply preprocessing to produce separate OCR-ready images when needed
     ocr_images: list[Path] = sampled_images
     if preprocessing != "none":
-        preproc_dir = resolved_output / "preprocessed"
-        preproc_dir.mkdir(parents=True, exist_ok=True)
+        preprocessed_dir.mkdir(parents=True, exist_ok=False)
         ocr_images = []
         for src_path in sampled_images:
-            dst_path = preproc_dir / src_path.name
+            dst_path = preprocessed_dir / src_path.name
             try:
                 preprocess_image_file(
                     src_path,
@@ -225,12 +258,10 @@ def run_ocr_canonical_package(
                     render_dpi=effective_render_dpi,
                     ocr_dpi=effective_ocr_dpi,
                 )
-                ocr_images.append(dst_path)
-            except Exception:
-                # Preprocessing failure is non-fatal: fall back to source image
-                ocr_images.append(src_path)
+            except Exception as exc:
+                raise RuntimeError(f"Preprocessing failed for {src_path.name}: {exc}") from exc
+            ocr_images.append(dst_path)
 
-    selected_engines = tuple(engines) if engines is not None else OCR_ENGINE_VALUES
     results: list[CanonicalOcrResult] = []
 
     with tempfile.TemporaryDirectory(prefix="uniscan_canonical_ocr_") as tmp:
@@ -250,8 +281,12 @@ def run_ocr_canonical_package(
 
                 page_texts: list[str] = []
                 total_chars = 0
-                for page_idx, image_path in enumerate(ocr_images, start=1):
-                    page_work = tmp_root / engine / f"page_{page_idx:04d}"
+                for source_page, image_path in zip(
+                    source_pages_1based,
+                    ocr_images,
+                    strict=True,
+                ):
+                    page_work = tmp_root / engine / f"page_{source_page:04d}"
                     text = _extract_page_text(
                         engine,
                         image_path,
@@ -260,10 +295,23 @@ def run_ocr_canonical_package(
                     )
                     page_texts.append(text)
                     total_chars += len(text)
-                    (engine_dir / f"page_{page_idx:04d}.txt").write_text(text, encoding="utf-8")
+                    (engine_dir / f"page_{source_page:04d}.txt").write_text(
+                        text,
+                        encoding="utf-8",
+                    )
 
-                (engine_dir / "all_pages.txt").write_text("\n\n".join(page_texts), encoding="utf-8")
-                _build_text_only_searchable_pdf(page_texts, out_pdf=searchable_pdf_path)
+                (engine_dir / "all_pages.txt").write_text(
+                    _markerized_pages_text(
+                        page_texts=page_texts,
+                        source_pages_1based=source_pages_1based,
+                    ),
+                    encoding="utf-8",
+                )
+                _build_text_only_searchable_pdf(
+                    page_texts,
+                    out_pdf=searchable_pdf_path,
+                    source_pages_1based=source_pages_1based,
+                )
 
                 results.append(
                     CanonicalOcrResult(

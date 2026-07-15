@@ -6,10 +6,13 @@ from pathlib import Path
 from types import SimpleNamespace
 import uuid
 
+import pytest
+
 from uniscan.app import ocr_pipeline
 from uniscan.app.ocr_pipeline import (
     BasicOcrRunSummary,
     SearchablePdfSummary,
+    _ensure_requested_engines_succeeded,
     build_searchable_pdf,
     run_basic_ocr_benchmark,
 )
@@ -36,6 +39,17 @@ def _ok_artifact_result(searchable_pdf: Path, *, engine: str) -> ArtifactSearcha
         page_count=1,
         text_chars=100,
         elapsed_seconds=0.01,
+    )
+
+
+def _ok_benchmark_result(engine: str) -> OcrBenchmarkResult:
+    return OcrBenchmarkResult(
+        engine=engine,
+        status="ok",
+        sample_pages=[1],
+        elapsed_seconds=0.1,
+        artifact_path=f"{engine}.txt",
+        text_chars=100,
     )
 
 
@@ -80,6 +94,15 @@ def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
                     text_chars=100,
                     page_error_count=2,
                 ),
+                OcrBenchmarkResult(
+                    engine="surya",
+                    status="ok",
+                    sample_pages=[1],
+                    elapsed_seconds=0.1,
+                    artifact_path="surya.txt",
+                    text_chars=100,
+                    page_error_count=3,
+                ),
             ),
             result_files=tuple(),
             failed_engines=tuple(),
@@ -114,8 +137,31 @@ def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
     assert summary.mode == "chandra+surya"
     assert summary.overwritten_input_path == input_pdf.resolve()
     assert summary.output_pdf_path == input_pdf.resolve()
-    assert summary.partial_page_failures == 2
+    assert summary.partial_page_failures == 3
     assert input_pdf.read_bytes() == b"SEARCHABLE"
+
+
+def test_atomic_pdf_overwrite_preserves_original_when_replace_fails(monkeypatch) -> None:
+    tmp_path = _new_test_dir()
+    source = tmp_path / "produced.pdf"
+    target = tmp_path / "input.pdf"
+    source.write_bytes(b"SEARCHABLE")
+    target.write_bytes(b"ORIGINAL")
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(ocr_pipeline.os, "replace", fail_replace)
+
+    try:
+        ocr_pipeline._atomic_copy_file(source, target)
+    except OSError as exc:
+        assert "simulated replace failure" in str(exc)
+    else:
+        raise AssertionError("Expected atomic replacement to fail")
+
+    assert target.read_bytes() == b"ORIGINAL"
+    assert list(tmp_path.glob(".input.pdf.*.tmp")) == []
 
 
 def test_build_searchable_pdf_from_bytes_returns_bytes(monkeypatch) -> None:
@@ -144,7 +190,7 @@ def test_build_searchable_pdf_from_bytes_returns_bytes(monkeypatch) -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
         return BasicOcrRunSummary(
             run_dir=run_dir,
-            results=tuple(),
+            results=(_ok_benchmark_result("surya"),),
             result_files=tuple(),
             failed_engines=tuple(),
             skipped_engines=tuple(),
@@ -196,7 +242,7 @@ def test_build_searchable_pdf_uses_textless_source_when_delete_enabled(monkeypat
         assert kwargs["pdf_path"] == seen["textless_pdf"]
         return BasicOcrRunSummary(
             run_dir=run_dir,
-            results=tuple(),
+            results=(_ok_benchmark_result("surya"),),
             result_files=tuple(),
             failed_engines=tuple(),
             skipped_engines=tuple(),
@@ -239,6 +285,74 @@ def test_build_searchable_pdf_uses_textless_source_when_delete_enabled(monkeypat
     assert summary.overwritten_input_path == input_pdf.resolve()
     assert summary.output_pdf_path == input_pdf.resolve()
     assert input_pdf.read_bytes() == b"SEARCHABLE"
+
+
+def test_strict_hybrid_rejects_missing_engine() -> None:
+    summary = BasicOcrRunSummary(
+        run_dir=Path("run"),
+        results=(_ok_benchmark_result("chandra"),),
+        result_files=tuple(),
+        failed_engines=tuple(),
+        skipped_engines=("surya: unavailable",),
+    )
+
+    with pytest.raises(RuntimeError, match="missing successful engines: surya"):
+        _ensure_requested_engines_succeeded(
+            summary,
+            expected_engines=("chandra", "surya"),
+        )
+
+
+def test_build_searchable_pdf_reports_monotonic_progress(monkeypatch) -> None:
+    tmp_path = _new_test_dir()
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF input")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    produced_pdf = tmp_path / "produced.pdf"
+    produced_pdf.write_bytes(b"%PDF output")
+    progress_values: list[int] = []
+
+    def fake_benchmark(**kwargs) -> BasicOcrRunSummary:
+        callback = kwargs["progress"]
+        callback(0, "starting")
+        callback(40, "running")
+        callback(100, "complete")
+        return BasicOcrRunSummary(
+            run_dir=run_dir,
+            results=(_ok_benchmark_result("surya"),),
+            result_files=tuple(),
+            failed_engines=tuple(),
+            skipped_engines=tuple(),
+        )
+
+    monkeypatch.setattr(ocr_pipeline, "run_basic_ocr_benchmark", fake_benchmark)
+    monkeypatch.setattr(
+        ocr_pipeline,
+        "build_compare_txt_from_benchmark",
+        lambda **_kwargs: [_ok_compare_result("surya", tmp_path / "doc__surya.txt")],
+    )
+    monkeypatch.setattr(
+        ocr_pipeline,
+        "run_artifact_searchable_package",
+        lambda **_kwargs: [_ok_artifact_result(produced_pdf, engine="surya")],
+    )
+
+    build_searchable_pdf(
+        pdf_path=input_pdf,
+        mode="surya",
+        work_root=tmp_path / "work",
+        overwrite_input_path=False,
+        return_bytes=False,
+        strict=True,
+        progress=lambda value, _status: progress_values.append(value),
+        delete_original_text_layer=False,
+    )
+
+    assert progress_values == sorted(progress_values)
+    assert progress_values[-1] == 100
+    assert 77 in progress_values
+    assert 78 in progress_values
 
 
 def test_run_basic_ocr_benchmark_supports_engine_python_override(monkeypatch) -> None:

@@ -19,6 +19,7 @@ from uniscan.ocr.engine import (
     detect_ocr_dependencies,
     detect_ocr_engine_status,
     image_paths_to_searchable_pdf,
+    normalize_ocr_engines,
 )
 
 
@@ -73,6 +74,18 @@ def test_ocr_engine_registry_is_stable() -> None:
         OCR_ENGINE_PYMUPDF,
     )
     assert all(engine in OCR_ENGINE_LABELS for engine in OCR_ENGINE_VALUES)
+
+
+def test_normalize_ocr_engines_deduplicates_and_rejects_unsafe_names() -> None:
+    assert normalize_ocr_engines((" Surya ", "surya", "CHANDRA")) == (
+        OCR_ENGINE_SURYA,
+        OCR_ENGINE_CHANDRA,
+    )
+
+    with pytest.raises(ValueError, match="No OCR engines selected"):
+        normalize_ocr_engines(())
+    with pytest.raises(ValueError, match="Unsupported OCR engine"):
+        normalize_ocr_engines(("../../outside",))
 
 
 @pytest.mark.parametrize(

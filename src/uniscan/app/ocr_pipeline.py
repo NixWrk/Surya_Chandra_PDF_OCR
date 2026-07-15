@@ -252,8 +252,31 @@ def _result_error_text(result: OcrBenchmarkResult) -> str:
     return "unknown error"
 
 
-def _normalize_pdf_mode(raw: str | None) -> str:
+def _ensure_requested_engines_succeeded(
+    benchmark: BasicOcrRunSummary,
+    *,
+    expected_engines: tuple[str, ...],
+) -> None:
+    succeeded = {
+        result.engine.strip().lower()
+        for result in benchmark.results
+        if result.status.strip().lower() == "ok"
+    }
+    missing = [engine for engine in expected_engines if engine not in succeeded]
+    if not missing and not benchmark.failed_engines and not benchmark.skipped_engines:
+        return
+
+    details = [f"missing successful engines: {', '.join(missing)}"] if missing else []
+    details.extend(f"failed: {item}" for item in benchmark.failed_engines)
+    details.extend(f"skipped: {item}" for item in benchmark.skipped_engines)
+    raise RuntimeError("Strict OCR benchmark is incomplete: " + " | ".join(details))
+
+
+def normalize_pdf_mode(raw: str | None) -> str:
     normalized = (raw or "").strip().lower()
+    if normalized == "chandra surya":
+        # A literal '+' in a query string is decoded as a space.
+        normalized = PDF_MODE_HYBRID
     if not normalized:
         return PDF_MODE_HYBRID
     if normalized in {PDF_MODE_CHANDRA, PDF_MODE_SURYA, PDF_MODE_HYBRID}:
@@ -369,7 +392,9 @@ def run_basic_ocr_benchmark(
 
     run_root = Path(output_root) if output_root is not None else (Path.cwd() / "outputs" / "basic_gui_runs")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = (run_root / f"{resolved_pdf.stem}_{timestamp}").resolve()
+    run_dir = (
+        run_root / f"{resolved_pdf.stem}_{timestamp}_{uuid.uuid4().hex[:8]}"
+    ).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
 
     _emit_progress(progress, 0, "Preparing...")
@@ -390,10 +415,16 @@ def run_basic_ocr_benchmark(
             engine_output = run_dir / engine
             engine_output.mkdir(parents=True, exist_ok=True)
 
-            def _engine_progress(local_percent: int, status: str) -> None:
+            def _engine_progress(
+                local_percent: int,
+                status: str,
+                *,
+                _start_percent: int = start_percent,
+                _end_percent: int = end_percent,
+            ) -> None:
                 bounded_local = max(0, min(100, int(local_percent)))
-                span = max(0, end_percent - start_percent)
-                mapped = start_percent + int((bounded_local / 100.0) * span)
+                span = max(0, _end_percent - _start_percent)
+                mapped = _start_percent + int((bounded_local / 100.0) * span)
                 _emit_progress(progress, mapped, status)
 
             result: OcrBenchmarkResult | None = None
@@ -480,7 +511,7 @@ def build_searchable_pdf(
     if (pdf_path is None and pdf_bytes is None) or (pdf_path is not None and pdf_bytes is not None):
         raise ValueError("Provide exactly one input: pdf_path or pdf_bytes.")
 
-    normalized_mode = _normalize_pdf_mode(mode)
+    normalized_mode = normalize_pdf_mode(mode)
     benchmark_mode_key = _mode_to_benchmark_key(normalized_mode)
     prepare_engines = _mode_to_prepare_engines(normalized_mode)
     build_engines = _mode_to_build_engines(normalized_mode)
@@ -518,14 +549,24 @@ def build_searchable_pdf(
         source_pdf_root = textless_root
 
     _emit_progress(progress, 2, "OCR benchmarking...")
+
+    def _benchmark_progress(value: int, status: str) -> None:
+        bounded = max(0, min(100, int(value)))
+        _emit_progress(progress, 2 + int(bounded * 0.75), status)
+
     benchmark = run_basic_ocr_benchmark(
         pdf_path=processing_input_path,
         mode_key=benchmark_mode_key,
         page_numbers=page_numbers,
         lang=lang,
         output_root=resolved_work_root,
-        progress=progress,
+        progress=_benchmark_progress,
     )
+    if strict:
+        _ensure_requested_engines_succeeded(
+            benchmark,
+            expected_engines=prepare_engines,
+        )
 
     compare_dir = benchmark.run_dir / "_compare_txt"
     _emit_progress(progress, 78, "Preparing compare artifacts...")
@@ -566,7 +607,7 @@ def build_searchable_pdf(
     overwritten_path: Path | None = None
     final_pdf_path = produced_pdf
     if pdf_path is not None and overwrite_input_path:
-        shutil.copy2(produced_pdf, input_path)
+        _atomic_copy_file(produced_pdf, input_path)
         overwritten_path = input_path
         final_pdf_path = input_path
 
@@ -587,10 +628,25 @@ def build_searchable_pdf(
         benchmark=benchmark,
         compare_results=compare_results,
         artifact_results=artifact_results,
-        partial_page_failures=sum(
-            max(0, int(result.page_error_count)) for result in benchmark.results
+        partial_page_failures=max(
+            (max(0, int(result.page_error_count)) for result in benchmark.results),
+            default=0,
         ),
     )
+
+
+def _atomic_copy_file(source: Path, target: Path) -> None:
+    resolved_source = Path(source)
+    resolved_target = Path(target)
+    resolved_target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = resolved_target.with_name(
+        f".{resolved_target.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        shutil.copy2(resolved_source, temporary)
+        os.replace(temporary, resolved_target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @contextmanager

@@ -27,9 +27,11 @@ ocr = [
   "reportlab>=4.0"
 ]
 dev = [
+  "mypy>=1.10",
   "pytest>=8.0",
   "pytest-cov>=5.0",
-  "ruff>=0.7"
+  "ruff>=0.7",
+  "types-reportlab"
 ]
 
 [project.scripts]
@@ -44,3 +46,18 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[[tool.mypy.overrides]]
+# Optional OCR backends and img2pdf do not publish typed interfaces.
+module = [
+  "chandra",
+  "chandra.*",
+  "img2pdf",
+  "mineru",
+  "mineru.*",
+  "paddleocr",
+  "paddleocr.*",
+  "surya",
+  "surya.*",
+]
+ignore_missing_imports = true

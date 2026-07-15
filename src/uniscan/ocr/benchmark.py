@@ -25,12 +25,13 @@ from .engine import (
     OCR_ENGINE_MINERU,
     OCR_ENGINE_PADDLEOCR,
     OCR_ENGINE_SURYA,
-    OCR_ENGINE_VALUES,
     SEARCHABLE_PDF_ENGINES,
     detect_ocr_engine_status,
     image_paths_to_searchable_pdf,
+    normalize_ocr_engines,
 )
 from .artifact_searchable import (
+    _bbox_values,
     _bbox_reading_order_indices,
     _clean_overlay_line,
     _dehyphenate_line_breaks,
@@ -44,8 +45,19 @@ _DEFAULT_MODELSCOPE_CACHE_HOME = _REPO_ROOT / ".modelscope_cache"
 _DEFAULT_SURYA_MODEL_CACHE_HOME = _REPO_ROOT / ".surya_cache"
 _DEFAULT_YOLO_CONFIG_HOME = _REPO_ROOT / ".ultralytics"
 _DEFAULT_RUNTIME_TMP_HOME = _REPO_ROOT / ".tmp_runtime"
+_MAX_OCR_TEXT_ARTIFACT_BYTES = 64 * 1024 * 1024
 _CHANDRA_MODEL_REPO_ID = "datalab-to/chandra-ocr-2"
 _MODEL_CACHE_CHECK_MEMO: dict[str, str] = {}
+
+
+def _read_utf8_artifact(path: Path) -> str:
+    with path.open("rb") as stream:
+        payload = stream.read(_MAX_OCR_TEXT_ARTIFACT_BYTES + 1)
+    if len(payload) > _MAX_OCR_TEXT_ARTIFACT_BYTES:
+        raise RuntimeError(
+            f"OCR text artifact exceeds {_MAX_OCR_TEXT_ARTIFACT_BYTES} bytes: {path}"
+        )
+    return payload.decode("utf-8-sig")
 
 
 @dataclass(slots=True)
@@ -155,8 +167,8 @@ def _collect_text_strings(value: Any) -> list[str]:
         return [value]
     if isinstance(value, bytes):
         try:
-            return [value.decode("utf-8", errors="ignore")]
-        except Exception:
+            return [value.decode("utf-8-sig")]
+        except UnicodeDecodeError:
             return []
     if isinstance(value, dict):
         for item in value.values():
@@ -703,7 +715,7 @@ def _surya_require_geometry_sidecar() -> bool:
 
 
 def _chandra_require_sidecar() -> bool:
-    return _env_bool("UNISCAN_CHANDRA_REQUIRE_SIDECAR", default=False)
+    return _env_bool("UNISCAN_CHANDRA_REQUIRE_SIDECAR", default=True)
 
 
 def _markerized_pages_text(
@@ -741,7 +753,7 @@ def _write_pagewise_text_artifacts(
             if not isinstance(item, dict):
                 continue
             source_page = item.get("source_page")
-            if isinstance(source_page, int):
+            if isinstance(source_page, int) and not isinstance(source_page, bool) and source_page > 0:
                 metadata_by_page[source_page] = item
 
     total_chars = 0
@@ -765,17 +777,19 @@ def _write_pagewise_text_artifacts(
             if not isinstance(sidecar_raw, str):
                 continue
             sidecar_src = Path(sidecar_raw)
-            if not sidecar_src.exists():
+            if not sidecar_src.is_file():
                 continue
             sidecar_name = f"page_{source_page:04d}.{suffix}.json"
             sidecar_dst = engine_dir / sidecar_name
             try:
                 shutil.copy2(sidecar_src, sidecar_dst)
-                page_info["geometry_file"] = sidecar_name
-                page_info["geometry_type"] = geometry_type
-                break
-            except Exception:
-                continue
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Failed to persist {engine} geometry for source page {source_page}: {exc}"
+                ) from exc
+            page_info["geometry_file"] = sidecar_name
+            page_info["geometry_type"] = geometry_type
+            break
 
         pages_payload.append(page_info)
 
@@ -808,7 +822,12 @@ def _collect_chandra_batch_outputs(
     image_paths: Sequence[Path],
     source_pages_1based: Sequence[int],
     work_dir: Path,
-) -> tuple[list[str], int, list[dict[str, Any]]]:
+) -> tuple[
+    list[str],
+    int,
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise RuntimeError("Chandra sidecar payload has unexpected format.")
@@ -829,6 +848,7 @@ def _collect_chandra_batch_outputs(
 
     page_texts: list[str] = []
     total_chars = 0
+    page_errors: list[dict[str, Any]] = []
     page_metadata: list[dict[str, Any]] = []
     for image_path, source_page in zip(image_paths, source_pages_1based, strict=True):
         image_payload = by_name.get(image_path.name) or by_name.get(image_path.stem)
@@ -850,29 +870,16 @@ def _collect_chandra_batch_outputs(
                         text = _clean_overlay_line(str(line.get("text") or ""))
                         if not text:
                             continue
-                        bbox = line.get("bbox")
-                        if (
-                            isinstance(bbox, list)
-                            and len(bbox) == 4
-                            and all(isinstance(item, (int, float)) for item in bbox)
-                        ):
-                            x0 = min(float(bbox[0]), float(bbox[2]))
-                            y0 = min(float(bbox[1]), float(bbox[3]))
-                            x1 = max(float(bbox[0]), float(bbox[2]))
-                            y1 = max(float(bbox[1]), float(bbox[3]))
-                            if x1 > x0 and y1 > y0:
-                                line_rows.append(((x0, y0, x1, y1), text))
-                                continue
+                        bbox = _bbox_values(line.get("bbox"))
+                        if bbox is not None:
+                            line_rows.append((bbox, text))
+                            continue
                         fallback_lines.append(text)
                     if line_rows:
                         page_width = max(max(bbox[2] for bbox, _text in line_rows), 1.0)
-                        image_bbox = page.get("image_bbox")
-                        if (
-                            isinstance(image_bbox, (list, tuple))
-                            and len(image_bbox) == 4
-                            and all(isinstance(item, (int, float)) for item in image_bbox)
-                        ):
-                            page_width = max(page_width, float(image_bbox[2]))
+                        image_bbox = _bbox_values(page.get("image_bbox"))
+                        if image_bbox is not None:
+                            page_width = max(page_width, image_bbox[2])
                         order = _bbox_reading_order_indices(
                             [bbox for bbox, _text in line_rows],
                             page_width=page_width,
@@ -894,11 +901,24 @@ def _collect_chandra_batch_outputs(
                 }
             )
 
+        if image_payload is None or not text_lines:
+            page_errors.append(
+                {
+                    "source_page": source_page,
+                    "image": str(image_path),
+                    "error": (
+                        "Chandra geometry sidecar has no image entry"
+                        if image_payload is None
+                        else "Chandra geometry sidecar has no text_lines"
+                    ),
+                }
+            )
+
         page_text = "\n".join(_dehyphenate_line_breaks(text_lines))
         page_texts.append(page_text)
         total_chars += len(page_text)
 
-    return page_texts, total_chars, page_metadata
+    return page_texts, total_chars, page_errors, page_metadata
 
 
 def _collect_surya_batch_outputs(
@@ -1078,36 +1098,48 @@ def _run_extraction_engine_pagewise(
         )
         sidecar = batch_work_dir / "chandra_page_lines.json"
         if sidecar.exists():
-            page_texts, total_chars, page_metadata = _collect_chandra_batch_outputs(
+            page_texts, total_chars, page_errors, page_metadata = _collect_chandra_batch_outputs(
                 sidecar_path=sidecar,
                 image_paths=image_paths,
                 source_pages_1based=source_pages_1based,
                 work_dir=work_dir,
             )
+            if page_errors and _chandra_require_sidecar():
+                preview = "; ".join(
+                    f"p{item['source_page']}: {item['error']}" for item in page_errors[:3]
+                )
+                raise RuntimeError(
+                    f"chandra geometry sidecar is required for each page: {preview}"
+                )
             if any(page.strip() for page in page_texts):
-                return page_texts, total_chars, [], page_metadata
-        warning = "chandra sidecar missing; aggregate text on page 1"
+                return page_texts, total_chars, page_errors, page_metadata
+        warning = "chandra sidecar missing or empty; aggregate text mapped to page 1"
         if _chandra_require_sidecar():
             raise RuntimeError(warning)
         # Keep aggregate output usable, but make the degraded page mapping visible.
-        fallback_page_texts = [text] + [""] * (len(image_paths) - 1)
+        degraded_page_texts = [text] + [""] * (len(image_paths) - 1)
         return (
-            fallback_page_texts,
+            degraded_page_texts,
             int(chars),
             [
                 {
-                    "source_page": source_pages_1based[0],
-                    "image": str(image_paths[0]),
+                    "source_page": source_page,
+                    "image": str(image_path),
                     "error": warning,
                 }
+                for image_path, source_page in zip(
+                    image_paths,
+                    source_pages_1based,
+                    strict=True,
+                )
             ],
             [],
         )
 
-    page_texts: list[str] = []
-    total_chars = 0
-    page_errors: list[dict[str, Any]] = []
-    page_metadata: list[dict[str, Any]] = []
+    fallback_page_texts: list[str] = []
+    fallback_total_chars = 0
+    fallback_page_errors: list[dict[str, Any]] = []
+    fallback_page_metadata: list[dict[str, Any]] = []
     total_pages = len(source_pages_1based)
     for page_idx, (image_path, source_page) in enumerate(
         zip(image_paths, source_pages_1based, strict=True),
@@ -1123,12 +1155,12 @@ def _run_extraction_engine_pagewise(
                 which_fn=which_fn,
                 run_cmd=run_cmd,
             )
-            page_texts.append(text)
-            total_chars += int(chars)
+            fallback_page_texts.append(text)
+            fallback_total_chars += int(chars)
             if engine == OCR_ENGINE_SURYA:
                 sidecar = page_work_dir / "surya_page_lines.json"
                 if sidecar.exists():
-                    page_metadata.append(
+                    fallback_page_metadata.append(
                         {
                             "source_page": source_page,
                             "surya_page_lines_path": str(sidecar),
@@ -1142,7 +1174,7 @@ def _run_extraction_engine_pagewise(
             if engine == OCR_ENGINE_CHANDRA:
                 sidecar = page_work_dir / "chandra_page_lines.json"
                 if sidecar.exists():
-                    page_metadata.append(
+                    fallback_page_metadata.append(
                         {
                             "source_page": source_page,
                             "chandra_page_lines_path": str(sidecar),
@@ -1151,8 +1183,8 @@ def _run_extraction_engine_pagewise(
             if progress_cb is not None:
                 progress_cb(page_idx, total_pages, source_page)
         except Exception as exc:
-            page_texts.append("")
-            page_errors.append(
+            fallback_page_texts.append("")
+            fallback_page_errors.append(
                 {
                     "source_page": source_page,
                     "image": str(image_path),
@@ -1162,13 +1194,22 @@ def _run_extraction_engine_pagewise(
             if progress_cb is not None:
                 progress_cb(page_idx, total_pages, source_page)
 
-    if page_errors and not any(text.strip() for text in page_texts):
-        preview = "; ".join(f"p{item['source_page']}: {item['error']}" for item in page_errors[:3])
+    if fallback_page_errors and not any(text.strip() for text in fallback_page_texts):
+        preview = "; ".join(
+            f"p{item['source_page']}: {item['error']}" for item in fallback_page_errors[:3]
+        )
         raise RuntimeError(f"all sampled pages failed for {engine}: {preview}")
-    if engine == OCR_ENGINE_SURYA and _surya_require_geometry_sidecar() and page_errors:
-        preview = "; ".join(f"p{item['source_page']}: {item['error']}" for item in page_errors[:3])
+    if engine == OCR_ENGINE_SURYA and _surya_require_geometry_sidecar() and fallback_page_errors:
+        preview = "; ".join(
+            f"p{item['source_page']}: {item['error']}" for item in fallback_page_errors[:3]
+        )
         raise RuntimeError(f"surya geometry sidecar is required for each page: {preview}")
-    return page_texts, total_chars, page_errors, page_metadata
+    return (
+        fallback_page_texts,
+        fallback_total_chars,
+        fallback_page_errors,
+        fallback_page_metadata,
+    )
 
 
 def _module_presence_probe(name: str):
@@ -1231,15 +1272,17 @@ def _run_surya_module_cli(
 
     def _stage_inputs() -> tuple[Path, list[str]]:
         input_dir = work_dir / "surya_input"
-        input_dir.mkdir(parents=True, exist_ok=True)
+        if input_dir.exists():
+            shutil.rmtree(input_dir)
+        input_dir.mkdir(parents=True, exist_ok=False)
         # Surya CLI consumes a directory. For pagewise mode we must isolate
         # files, otherwise every call re-processes sibling pages and pollutes
         # per-page artifacts with foreign text.
         ordered_names: list[str] = []
         for idx, image_path in enumerate(image_paths, start=1):
             src = Path(image_path)
-            if not src.exists():
-                continue
+            if not src.is_file():
+                raise FileNotFoundError(f"Surya input image not found: {src}")
             if len(image_paths) == 1:
                 target_name = src.name
             else:
@@ -1282,30 +1325,21 @@ def _run_surya_module_cli(
                 if not isinstance(page, dict):
                     continue
                 page_payload: dict[str, Any] = {}
-                image_bbox = page.get("image_bbox")
-                if (
-                    isinstance(image_bbox, (list, tuple))
-                    and len(image_bbox) == 4
-                    and all(isinstance(item, (int, float)) for item in image_bbox)
-                ):
-                    page_payload["image_bbox"] = [float(item) for item in image_bbox]
+                image_bbox = _bbox_values(page.get("image_bbox"))
+                if image_bbox is not None:
+                    page_payload["image_bbox"] = list(image_bbox)
 
                 line_payload: list[dict[str, Any]] = []
                 fallback_texts: list[str] = []
                 for line in page.get("text_lines", []):
                     if isinstance(line, dict):
                         text = _clean_overlay_line(str(line.get("text") or ""))
-                        bbox = line.get("bbox")
-                        if (
-                            text
-                            and isinstance(bbox, (list, tuple))
-                            and len(bbox) == 4
-                            and all(isinstance(item, (int, float)) for item in bbox)
-                        ):
+                        bbox = _bbox_values(line.get("bbox"))
+                        if text and bbox is not None:
                             line_payload.append(
                                 {
                                     "text": text,
-                                    "bbox": [float(item) for item in bbox],
+                                    "bbox": list(bbox),
                                 }
                             )
                         elif text:
@@ -1392,6 +1426,9 @@ def _run_surya_module_cli(
             [str(surya_cmd), "--input", str(input_dir), "--output_dir", str(output_root)],
         )
         for command in candidate_commands:
+            if output_root.exists():
+                shutil.rmtree(output_root)
+            output_root.mkdir(parents=True, exist_ok=False)
             proc = run_cmd(command, capture_output=True, text=True)
             if int(getattr(proc, "returncode", 1)) != 0:
                 stderr = (getattr(proc, "stderr", "") or "").strip()
@@ -1423,7 +1460,9 @@ def _run_surya_module_cli(
     input_dir, ordered_names = _stage_inputs()
 
     output_root = work_dir / "surya_out"
-    output_root.mkdir(parents=True, exist_ok=True)
+    if output_root.exists():
+        shutil.rmtree(output_root)
+    output_root.mkdir(parents=True, exist_ok=False)
     os.environ.setdefault("MODEL_CACHE_DIR", str(_DEFAULT_SURYA_MODEL_CACHE_HOME))
     os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
     os.environ.setdefault("MODELSCOPE_CACHE", str(_DEFAULT_MODELSCOPE_CACHE_HOME))
@@ -1550,7 +1589,7 @@ def _run_mineru_module_cli(
     text_parts: list[str] = []
     for path in sorted(output_root.rglob("*.md")):
         try:
-            raw = path.read_text(encoding="utf-8", errors="ignore").strip()
+            raw = _read_utf8_artifact(path).strip()
         except Exception:
             continue
         cleaned = _strip_markdown(raw)
@@ -1562,7 +1601,7 @@ def _run_mineru_module_cli(
     if not text_parts:
         for path in sorted(output_root.rglob("*_content_list.json")):
             try:
-                payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+                payload = json.loads(_read_utf8_artifact(path))
             except Exception:
                 continue
             if not isinstance(payload, list):
@@ -1646,7 +1685,7 @@ def _extract_marker_cli_text(log_blob: str) -> str:
 
         for md_file in md_files:
             try:
-                raw_md = md_file.read_text(encoding="utf-8", errors="ignore").strip()
+                raw_md = _read_utf8_artifact(md_file).strip()
             except Exception:
                 continue
             cleaned = _strip_markdown(raw_md)
@@ -1664,6 +1703,7 @@ def _run_surya_direct(
     which_fn=shutil.which,
     run_cmd=subprocess.run,
 ) -> tuple[str, int]:
+    (work_dir / "surya_page_lines.json").unlink(missing_ok=True)
     os.environ.setdefault("MODEL_CACHE_DIR", str(_DEFAULT_SURYA_MODEL_CACHE_HOME))
     os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
     os.environ.setdefault("MODELSCOPE_CACHE", str(_DEFAULT_MODELSCOPE_CACHE_HOME))
@@ -1772,15 +1812,10 @@ def _run_chandra_module(
     from chandra.input import load_image
 
     def _safe_bbox(raw_bbox: Any, width: int, height: int) -> list[float] | None:
-        if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
+        parsed = _bbox_values(raw_bbox)
+        if parsed is None:
             return None
-        try:
-            x0 = float(raw_bbox[0])
-            y0 = float(raw_bbox[1])
-            x1 = float(raw_bbox[2])
-            y1 = float(raw_bbox[3])
-        except Exception:
-            return None
+        x0, y0, x1, y1 = parsed
         x0 = max(0.0, min(x0, float(width)))
         y0 = max(0.0, min(y0, float(height)))
         x1 = max(0.0, min(x1, float(width)))
@@ -1794,7 +1829,7 @@ def _run_chandra_module(
     if _env_bool("UNISCAN_CHANDRA_REQUIRE_GPU", default=True):
         raw_model = getattr(model, "model", None)
         model_device = str(getattr(raw_model, "device", ""))
-        if not model_device and hasattr(raw_model, "parameters"):
+        if raw_model is not None and not model_device and hasattr(raw_model, "parameters"):
             try:
                 first_param = next(raw_model.parameters())
                 model_device = str(getattr(first_param, "device", ""))
@@ -1937,7 +1972,7 @@ def _run_chandra_cli(
         for pattern in ("*.md", "*.txt", "*.json", "*.html"):
             for artifact in sorted(page_output.rglob(pattern)):
                 try:
-                    text = artifact.read_text(encoding="utf-8", errors="ignore").strip()
+                    text = _read_utf8_artifact(artifact).strip()
                 except Exception:
                     continue
                 if text:
@@ -1959,6 +1994,7 @@ def _run_chandra_direct(
     run_cmd=subprocess.run,
     page_progress_cb: Callable[[int, int], None] | None = None,
 ) -> tuple[str, int]:
+    (work_dir / "chandra_page_lines.json").unlink(missing_ok=True)
     # Primary: direct Python module import (no CLI binary needed).
     module_error: Exception | None = None
     try:
@@ -2041,61 +2077,71 @@ def _collect_olmocr_workspace_text(workspace: Path) -> tuple[str, int]:
 
     for md_path in markdown_candidates:
         try:
-            raw = md_path.read_text(encoding="utf-8", errors="ignore").strip()
+            raw = _read_utf8_artifact(md_path).strip()
         except Exception:
             continue
         cleaned = _strip_markdown(raw)
         if cleaned:
             text_parts.append(cleaned)
 
-    # Fallback for formats that keep text in JSON/JSONL payloads.
-    for json_path in sorted(workspace.rglob("*.json")):
-        try:
-            payload = _load_json_relaxed(json_path.read_text(encoding="utf-8", errors="ignore"))
-        except Exception:
-            continue
-        if isinstance(payload, dict):
-            _append_payload_text(payload)
-        elif isinstance(payload, list):
-            for item in payload:
+    # Fallback for formats that keep text in JSON/JSONL payloads. Do not append
+    # these when markdown was already found: the formats usually contain the
+    # same document and would duplicate the searchable text layer.
+    if not text_parts:
+        for json_path in sorted(workspace.rglob("*.json")):
+            try:
+                payload = _load_json_relaxed(_read_utf8_artifact(json_path))
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                _append_payload_text(payload)
+            elif isinstance(payload, list):
+                for item in payload:
+                    _append_payload_text(item)
+
+    if not text_parts:
+        for jsonl_path in sorted(workspace.rglob("*.jsonl")):
+            try:
+                lines = _read_utf8_artifact(jsonl_path).splitlines()
+            except Exception:
+                continue
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = _load_json_relaxed(line)
+                except Exception:
+                    continue
+                _append_payload_text(payload)
+
+    if not text_parts:
+        for compressed_path in sorted(workspace.rglob("*.jsonl.zst")):
+            try:
+                import zstandard as zstd  # type: ignore
+            except Exception:
+                break
+            try:
+                with compressed_path.open("rb") as fh:
+                    dctx = zstd.ZstdDecompressor()
+                    with dctx.stream_reader(fh) as reader:
+                        payload = reader.read(_MAX_OCR_TEXT_ARTIFACT_BYTES + 1)
+                if len(payload) > _MAX_OCR_TEXT_ARTIFACT_BYTES:
+                    raise RuntimeError(
+                        f"Compressed OCR artifact exceeds {_MAX_OCR_TEXT_ARTIFACT_BYTES} bytes"
+                    )
+                raw = payload.decode("utf-8-sig")
+            except Exception:
+                continue
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = _load_json_relaxed(line)
+                except Exception:
+                    continue
                 _append_payload_text(item)
-
-    for jsonl_path in sorted(workspace.rglob("*.jsonl")):
-        try:
-            lines = jsonl_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except Exception:
-            continue
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                payload = _load_json_relaxed(line)
-            except Exception:
-                continue
-            _append_payload_text(payload)
-
-    for compressed_path in sorted(workspace.rglob("*.jsonl.zst")):
-        try:
-            import zstandard as zstd  # type: ignore
-        except Exception:
-            break
-        try:
-            with compressed_path.open("rb") as fh:
-                dctx = zstd.ZstdDecompressor()
-                with dctx.stream_reader(fh) as reader:
-                    raw = reader.read().decode("utf-8", errors="ignore")
-        except Exception:
-            continue
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                payload = _load_json_relaxed(line)
-            except Exception:
-                continue
-            _append_payload_text(payload)
 
     if not text_parts:
         raise RuntimeError("olmOCR finished without markdown/text artifacts.")
@@ -2401,6 +2447,7 @@ def run_ocr_benchmark(
     progress: BenchmarkProgressCallback | None = None,
 ) -> list[OcrBenchmarkResult]:
     """Run a sampled OCR benchmark against a PDF fixture."""
+    selected_engines = normalize_ocr_engines(engines)
     resolved_pdf = Path(pdf_path)
     resolved_output = Path(output_dir)
     resolved_output.mkdir(parents=True, exist_ok=True)
@@ -2414,7 +2461,6 @@ def run_ocr_benchmark(
     if not sample_pages:
         raise ValueError("No PDF pages available for OCR benchmark.")
 
-    selected_engines = tuple(engines) if engines is not None else OCR_ENGINE_VALUES
     import_probe = import_module or _module_presence_probe
     results: list[OcrBenchmarkResult] = []
     source_pages_1based = [page + 1 for page in sample_pages]
@@ -2509,14 +2555,22 @@ def run_ocr_benchmark(
 
                 # Keep extraction engines page-aware: persist per-page files and
                 # write markerized aggregate text that preserves source page ids.
-                def _page_progress(done: int, total: int, source_page: int) -> None:
-                    span = max(0, engine_end_percent - engine_start_percent)
+                def _page_progress(
+                    done: int,
+                    total: int,
+                    source_page: int,
+                    *,
+                    _engine: str = engine,
+                    _start_percent: int = engine_start_percent,
+                    _end_percent: int = engine_end_percent,
+                ) -> None:
+                    span = max(0, _end_percent - _start_percent)
                     ratio = 0 if total <= 0 else (max(0, min(done, total)) / float(total))
-                    mapped = engine_start_percent + int(ratio * span)
+                    mapped = _start_percent + int(ratio * span)
                     _emit_benchmark_progress(
                         progress,
                         mapped,
-                        f"{engine}: page {done}/{total} (source {source_page})",
+                        f"{_engine}: page {done}/{total} (source {source_page})",
                     )
 
                 page_texts, text_chars, page_errors, page_metadata = _run_extraction_engine_pagewise(

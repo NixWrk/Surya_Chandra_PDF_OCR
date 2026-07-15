@@ -52,6 +52,11 @@ EXTRACTION_ENGINES = (
 )
 
 
+def test_collect_text_strings_rejects_invalid_utf8_bytes() -> None:
+    assert ocr_benchmark_mod._collect_text_strings(b"valid") == ["valid"]
+    assert ocr_benchmark_mod._collect_text_strings(b"invalid:\xff") == []
+
+
 def _build_sample_pdf(tmp_path: Path, page_values: list[int]) -> Path:
     pages: list[np.ndarray] = []
     for value in page_values:
@@ -103,6 +108,21 @@ def test_render_sample_paths_streams_ten_page_pdf(tmp_path) -> None:
 
     assert [path.name for path in paths] == [f"{idx:05d}.png" for idx in range(1, 11)]
     assert all(path.exists() and path.stat().st_size > 0 for path in paths)
+
+
+def test_safe_render_dpi_caps_extreme_page_memory() -> None:
+    from uniscan.io.loaders import _MAX_RENDER_PIXELS, _safe_render_dpi
+
+    page_rect = SimpleNamespace(width=2384.0, height=3370.0)
+    with pytest.warns(UserWarning, match="render memory limit"):
+        safe_dpi = _safe_render_dpi(page_rect, 220)
+
+    assert 1 <= safe_dpi < 220
+    rendered_pixels = (
+        page_rect.width / 72.0 * safe_dpi
+        * (page_rect.height / 72.0 * safe_dpi)
+    )
+    assert rendered_pixels <= _MAX_RENDER_PIXELS
 
 
 def test_run_ocr_benchmark_writes_report_and_artifacts(tmp_path, monkeypatch) -> None:
@@ -295,6 +315,61 @@ def test_run_ocr_benchmark_unready_engine_is_error(tmp_path, monkeypatch) -> Non
     assert results[0].status == "error"
     assert results[0].note == "missing: dependency-x"
     assert results[0].artifact_path is not None
+
+
+def test_run_ocr_benchmark_rejects_unsafe_engine_before_touching_output(tmp_path) -> None:
+    output_dir = tmp_path / "out"
+
+    with pytest.raises(ValueError, match="Unsupported OCR engine"):
+        run_ocr_benchmark(
+            pdf_path=tmp_path / "missing.pdf",
+            output_dir=output_dir,
+            engines=("../../outside",),
+        )
+
+    assert not output_dir.exists()
+    assert not (tmp_path / "outside").exists()
+
+
+def test_collect_olmocr_prefers_markdown_without_duplicate_json_text(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    markdown_dir = workspace / "markdown"
+    markdown_dir.mkdir(parents=True)
+    (markdown_dir / "document.md").write_text("PRIMARY TEXT", encoding="utf-8")
+    (workspace / "document.json").write_text(
+        json.dumps({"text": "DUPLICATE TEXT"}),
+        encoding="utf-8",
+    )
+
+    text, chars = ocr_benchmark_mod._collect_olmocr_workspace_text(workspace)
+
+    assert text == "PRIMARY TEXT"
+    assert chars == len(text)
+
+
+def test_collect_olmocr_rejects_invalid_utf8_and_uses_valid_fallback(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    markdown_dir = workspace / "markdown"
+    markdown_dir.mkdir(parents=True)
+    (markdown_dir / "broken.md").write_bytes(b"corrupt\xfftext")
+    (workspace / "document.json").write_text(
+        json.dumps({"text": "VALID FALLBACK"}),
+        encoding="utf-8",
+    )
+
+    text, chars = ocr_benchmark_mod._collect_olmocr_workspace_text(workspace)
+
+    assert text == "VALID FALLBACK"
+    assert chars == len(text)
+
+
+def test_read_utf8_artifact_is_bounded(tmp_path, monkeypatch) -> None:
+    artifact = tmp_path / "large.txt"
+    artifact.write_bytes(b"12345")
+    monkeypatch.setattr(ocr_benchmark_mod, "_MAX_OCR_TEXT_ARTIFACT_BYTES", 4)
+
+    with pytest.raises(RuntimeError, match="exceeds 4 bytes"):
+        ocr_benchmark_mod._read_utf8_artifact(artifact)
 
 
 def test_olmocr_docker_defaults_single_page_to_permissive_error_rate(tmp_path, monkeypatch) -> None:
@@ -692,6 +767,106 @@ def test_run_extraction_engine_pagewise_collects_chandra_sidecar(tmp_path, monke
     assert progress_steps == [(1, 2, 1), (2, 2, 2)]
 
 
+def test_run_extraction_engine_pagewise_reports_partial_chandra_sidecar(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    image_paths = [tmp_path / "p1.png", tmp_path / "p2.png"]
+    for image_path in image_paths:
+        image_path.write_bytes(b"img")
+
+    def fake_chandra_direct(_image_paths, *, work_dir, **_kwargs):
+        sidecar = work_dir / "chandra_page_lines.json"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "images": [
+                        {
+                            "image_name": _image_paths[0].name,
+                            "pages": [
+                                {
+                                    "text_lines": [
+                                        {"text": "page-one", "bbox": [0, 0, 10, 10]}
+                                    ]
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return "page-one aggregate", 18
+
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_chandra_direct", fake_chandra_direct)
+    monkeypatch.setenv("UNISCAN_CHANDRA_REQUIRE_SIDECAR", "0")
+
+    page_texts, chars, page_errors, page_metadata = (
+        ocr_benchmark_mod._run_extraction_engine_pagewise(
+            OCR_ENGINE_CHANDRA,
+            image_paths,
+            source_pages_1based=[1, 2],
+            lang="rus",
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: None,
+            run_cmd=lambda *_args, **_kwargs: None,
+        )
+    )
+
+    assert page_texts == ["page-one", ""]
+    assert chars == len("page-one")
+    assert [item["source_page"] for item in page_errors] == [2]
+    assert [item["source_page"] for item in page_metadata] == [1]
+
+
+def test_run_extraction_engine_pagewise_rejects_partial_chandra_sidecar_by_default(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    image_paths = [tmp_path / "p1.png", tmp_path / "p2.png"]
+    for image_path in image_paths:
+        image_path.write_bytes(b"img")
+
+    def fake_chandra_direct(_image_paths, *, work_dir, **_kwargs):
+        sidecar = work_dir / "chandra_page_lines.json"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "images": [
+                        {
+                            "image_name": _image_paths[0].name,
+                            "pages": [
+                                {
+                                    "text_lines": [
+                                        {"text": "page-one", "bbox": [0, 0, 10, 10]}
+                                    ]
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return "page-one aggregate", 18
+
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_chandra_direct", fake_chandra_direct)
+    monkeypatch.delenv("UNISCAN_CHANDRA_REQUIRE_SIDECAR", raising=False)
+
+    with pytest.raises(RuntimeError, match="required for each page"):
+        ocr_benchmark_mod._run_extraction_engine_pagewise(
+            OCR_ENGINE_CHANDRA,
+            image_paths,
+            source_pages_1based=[1, 2],
+            lang="rus",
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: None,
+            run_cmd=lambda *_args, **_kwargs: None,
+        )
+
+
 def test_run_extraction_engine_pagewise_warns_when_chandra_sidecar_is_missing(
     tmp_path,
     monkeypatch,
@@ -704,7 +879,7 @@ def test_run_extraction_engine_pagewise_warns_when_chandra_sidecar_is_missing(
         return "aggregate chandra text", 22
 
     monkeypatch.setattr(ocr_benchmark_mod, "_run_chandra_direct", fake_chandra_direct)
-    monkeypatch.delenv("UNISCAN_CHANDRA_REQUIRE_SIDECAR", raising=False)
+    monkeypatch.setenv("UNISCAN_CHANDRA_REQUIRE_SIDECAR", "0")
 
     page_texts, chars, page_errors, page_metadata = (
         ocr_benchmark_mod._run_extraction_engine_pagewise(
@@ -720,7 +895,11 @@ def test_run_extraction_engine_pagewise_warns_when_chandra_sidecar_is_missing(
 
     assert page_texts == ["aggregate chandra text", ""]
     assert chars == 22
-    assert page_errors[0]["error"] == "chandra sidecar missing; aggregate text on page 1"
+    assert [item["source_page"] for item in page_errors] == [1, 2]
+    assert all(
+        item["error"] == "chandra sidecar missing or empty; aggregate text mapped to page 1"
+        for item in page_errors
+    )
     assert page_metadata == []
 
 
@@ -730,7 +909,7 @@ def test_run_ocr_benchmark_surfaces_chandra_sidecar_warning_in_note(
 ) -> None:
     pdf_path = _build_sample_pdf(tmp_path, [50])
     output_dir = tmp_path / "out"
-    warning = "chandra sidecar missing; aggregate text on page 1"
+    warning = "chandra sidecar missing or empty; aggregate text mapped to page 1"
 
     monkeypatch.setattr(
         ocr_benchmark_mod,
@@ -762,7 +941,7 @@ def test_run_ocr_benchmark_surfaces_chandra_sidecar_warning_in_note(
     assert results[0].page_error_count == 1
 
 
-def test_run_extraction_engine_pagewise_requires_chandra_sidecar_in_strict_mode(
+def test_run_extraction_engine_pagewise_requires_chandra_sidecar_by_default(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -774,7 +953,7 @@ def test_run_extraction_engine_pagewise_requires_chandra_sidecar_in_strict_mode(
         "_run_chandra_direct",
         lambda *_args, **_kwargs: ("aggregate chandra text", 22),
     )
-    monkeypatch.setenv("UNISCAN_CHANDRA_REQUIRE_SIDECAR", "1")
+    monkeypatch.delenv("UNISCAN_CHANDRA_REQUIRE_SIDECAR", raising=False)
 
     with pytest.raises(RuntimeError, match="chandra sidecar missing"):
         ocr_benchmark_mod._run_extraction_engine_pagewise(
@@ -1083,6 +1262,9 @@ def test_surya_module_cli_uses_only_staged_inputs(tmp_path, monkeypatch) -> None
     image_path = tmp_path / "page_0001.png"
     image_path.write_bytes(b"img")
     work_dir = tmp_path / "work"
+    stale_input_dir = work_dir / "surya_input"
+    stale_input_dir.mkdir(parents=True)
+    (stale_input_dir / "stale.png").write_bytes(b"stale")
 
     surya_module = ModuleType("surya")
     scripts_module = ModuleType("surya.scripts")
@@ -1129,6 +1311,61 @@ def test_surya_module_cli_uses_only_staged_inputs(tmp_path, monkeypatch) -> None
         (work_dir / "surya_page_lines.json").read_text(encoding="utf-8")
     )
     assert sidecar_payload["execution_path"] == "module"
+    assert "stale.png" not in text
+
+
+def test_surya_cli_fallback_cannot_reuse_partial_module_output(tmp_path, monkeypatch) -> None:
+    image_path = tmp_path / "page.png"
+    image_path.write_bytes(b"img")
+    work_dir = tmp_path / "work"
+
+    surya_module = ModuleType("surya")
+    scripts_module = ModuleType("surya.scripts")
+    ocr_text_module = ModuleType("surya.scripts.ocr_text")
+
+    class _FailingModuleCli:
+        @staticmethod
+        def main(*, args, standalone_mode=False):
+            assert standalone_mode is False
+            input_dir = Path(args[0])
+            output_root = Path(args[2])
+            result_file = output_root / input_dir.name / "results.json"
+            result_file.parent.mkdir(parents=True, exist_ok=True)
+            result_file.write_text(
+                json.dumps(
+                    {
+                        image_path.name: [
+                            {
+                                "text_lines": [
+                                    {"text": "STALE", "bbox": [0, 0, 10, 10]}
+                                ]
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            raise RuntimeError("module failed after partial output")
+
+    ocr_text_module.ocr_text_cli = _FailingModuleCli
+    monkeypatch.setitem(sys.modules, "surya", surya_module)
+    monkeypatch.setitem(sys.modules, "surya.scripts", scripts_module)
+    monkeypatch.setitem(sys.modules, "surya.scripts.ocr_text", ocr_text_module)
+
+    with pytest.raises(RuntimeError, match="did not produce results file"):
+        ocr_benchmark_mod._run_surya_module_cli(
+            [image_path],
+            lang="rus",
+            work_dir=work_dir,
+            which_fn=lambda _name: "surya_ocr",
+            run_cmd=lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=0,
+                stdout="",
+                stderr="",
+            ),
+        )
+
+    assert not (work_dir / "surya_page_lines.json").exists()
 
 
 @pytest.mark.skipif(not FIXTURE_PDF.exists(), reason="external OCR fixture is not available")

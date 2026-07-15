@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import queue
 import shutil
 import sqlite3
@@ -25,6 +26,7 @@ from uniscan.app import (
     PDF_MODE_HYBRID,
     SearchablePdfSummary,
     build_searchable_pdf,
+    normalize_pdf_mode,
     parse_page_numbers,
 )
 
@@ -136,15 +138,32 @@ class _JobStore:
 
     def create(self, job: _JobState) -> None:
         with self._lock:
+            if job.job_id in self._jobs:
+                raise ValueError(f"OCR job already exists: {job.job_id}")
+            try:
+                self._write_metadata_locked(job)
+                self._upsert_sqlite_locked(job)
+                self._append_event_locked(
+                    job,
+                    "created",
+                    "OCR job was created.",
+                    {"status": job.status, "input_bytes": job.input_bytes},
+                )
+            except Exception:
+                try:
+                    self._delete_sqlite_locked(job.job_id)
+                except Exception as rollback_exc:
+                    print(
+                        f"Warning: failed to roll back OCR job index {job.job_id}: {rollback_exc}",
+                        file=sys.stderr,
+                    )
+                _cleanup_generated_dir(
+                    root=self.jobs_root,
+                    target=self._job_dir(job.job_id),
+                    label=f"failed OCR job {job.job_id}",
+                )
+                raise
             self._jobs[job.job_id] = job
-            self._write_metadata_locked(job)
-            self._upsert_sqlite_locked(job)
-            self._append_event_locked(
-                job,
-                "created",
-                "OCR job was created.",
-                {"status": job.status, "input_bytes": job.input_bytes},
-            )
 
     def get(self, job_id: str) -> _JobState | None:
         with self._lock:
@@ -362,14 +381,20 @@ class _JobStore:
                 )
                 continue
 
+            expected_job_id = metadata_path.parent.name
+            if job.job_id != expected_job_id:
+                print(
+                    "Warning: ignored OCR metadata whose job_id does not match "
+                    f"its directory: {metadata_path}",
+                    file=sys.stderr,
+                )
+                continue
+
             result_candidate = metadata_path.parent / "result.pdf"
             input_candidate = metadata_path.parent / "input.pdf"
-            if job.input_path is None and input_candidate.exists():
-                job.input_path = input_candidate.resolve()
-            if job.result_path is None and result_candidate.exists():
-                job.result_path = result_candidate.resolve()
-            if job.result_path is not None and Path(job.result_path).exists():
-                job.result_path = Path(job.result_path).resolve()
+            job.input_path = input_candidate.resolve() if input_candidate.is_file() else None
+            job.result_path = result_candidate.resolve() if result_candidate.is_file() else None
+            if job.result_path is not None:
                 job.result_bytes = Path(job.result_path).stat().st_size
                 if job.status in _ACTIVE_JOB_STATUSES:
                     job.status = "done"
@@ -391,6 +416,13 @@ class _JobStore:
                 job.error = job.error or "Interrupted by OCR API restart."
                 job.finished_at = job.finished_at or interrupted_at
                 job.heartbeat_at = job.heartbeat_at or interrupted_at
+            elif job.status == "done":
+                interrupted_at = _utc_now()
+                job.status = "interrupted"
+                job.message = "Completed OCR result is missing."
+                job.error = "Completed OCR result was missing after OCR API restart."
+                job.finished_at = interrupted_at
+                job.heartbeat_at = interrupted_at
             job.updated_at = _utc_now()
             self._jobs[job.job_id] = job
             self._write_metadata_locked(job)
@@ -628,6 +660,16 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     tmp_path.replace(path)
 
 
+def _atomic_copy_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        shutil.copy2(source, tmp_path)
+        os.replace(tmp_path, target)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -704,6 +746,17 @@ def _safe_remove_job_dir(*, root: Path, target: Path) -> bool:
         return True
     shutil.rmtree(resolved_target)
     return True
+
+
+def _cleanup_generated_dir(*, root: Path, target: Path, label: str) -> bool:
+    try:
+        removed = _safe_remove_job_dir(root=root, target=target)
+    except OSError as exc:
+        print(f"Warning: failed to clean {label} at {target}: {exc}", file=sys.stderr)
+        return False
+    if not removed:
+        print(f"Warning: refused to clean {label} outside {root}: {target}", file=sys.stderr)
+    return removed
 
 
 def _first_query_value(query: dict[str, list[str]], *names: str) -> str | None:
@@ -814,12 +867,17 @@ def _parse_optional_float(raw: str | None, *, field: str) -> float | None:
         parsed = float(value)
     except ValueError as exc:
         raise ValueError(f"{field} must be a number.") from exc
-    if parsed < 0:
-        raise ValueError(f"{field} must be non-negative.")
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"{field} must be a finite non-negative number.")
     return parsed
 
 
-def _parse_optional_int(raw: str | None, *, field: str) -> int | None:
+def _parse_optional_int(
+    raw: str | None,
+    *,
+    field: str,
+    maximum: int | None = None,
+) -> int | None:
     value = (raw or "").strip()
     if not value:
         return None
@@ -829,6 +887,8 @@ def _parse_optional_int(raw: str | None, *, field: str) -> int | None:
         raise ValueError(f"{field} must be an integer.") from exc
     if parsed < 0:
         raise ValueError(f"{field} must be non-negative.")
+    if maximum is not None and parsed > maximum:
+        raise ValueError(f"{field} must not exceed {maximum}.")
     return parsed
 
 
@@ -928,6 +988,7 @@ def _parse_protocol_metadata(parsed, headers: Any) -> _ProtocolMetadata:
             header_names=("X-Estimated-Pages", "X-UniScan-Estimated-Pages"),
         ),
         field="estimated_pages",
+        maximum=10_000_000,
     )
     ttl_seconds = _parse_optional_int(
         _first_request_value(
@@ -937,6 +998,7 @@ def _parse_protocol_metadata(parsed, headers: Any) -> _ProtocolMetadata:
             header_names=("X-TTL-Seconds", "X-UniScan-TTL-Seconds"),
         ),
         field="ttl_seconds",
+        maximum=10 * 365 * 24 * 60 * 60,
     )
 
     return _ProtocolMetadata(
@@ -988,9 +1050,15 @@ def _query_bool(raw: str | None, *, default: bool) -> bool:
 
 def _parse_job_request(parsed, *, default_lang: str) -> tuple[str, str, str, bool, str, bool]:
     query = parse_qs(parsed.query, keep_blank_values=True)
-    mode = (query.get("mode", [PDF_MODE_HYBRID])[0] or PDF_MODE_HYBRID).strip()
+    mode = normalize_pdf_mode(
+        (query.get("mode", [PDF_MODE_HYBRID])[0] or PDF_MODE_HYBRID).strip()
+    )
     pages_raw = (query.get("pages", [""])[0] or "").strip()
-    lang = (query.get("lang", [default_lang])[0] or default_lang).strip()
+    lang = _clean_protocol_text(
+        (query.get("lang", [default_lang])[0] or default_lang).strip(),
+        field="lang",
+        max_length=80,
+    ) or default_lang
     strict = _query_bool(query.get("strict", ["1"])[0], default=True)
     delete_original_text_layer = _query_bool(
         (
@@ -1377,6 +1445,10 @@ def _build_handler(*, work_root: Path, default_lang: str):
         strict: bool,
         delete_original_text_layer: bool,
     ) -> None:
+        job_root = jobs_root / job_id
+        job_work_root = job_root / "work"
+        keep_job_runs = _env_bool("UNISCAN_KEEP_JOB_RUNS", default=False)
+
         def _set_state(
             *,
             status: str | None = None,
@@ -1450,7 +1522,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
                     mode=mode,
                     lang=lang,
                     page_numbers=page_numbers,
-                    work_root=pipeline_root,
+                    work_root=job_work_root,
                     overwrite_input_path=False,
                     return_bytes=False,
                     strict=strict,
@@ -1459,7 +1531,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 )
             result_target = jobs_root / job_id / "result.pdf"
             result_target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(summary.output_pdf_path, result_target)
+            _atomic_copy_file(summary.output_pdf_path, result_target)
             partial_page_failures = max(
                 0,
                 int(getattr(summary, "partial_page_failures", 0) or 0),
@@ -1473,13 +1545,19 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 status="done",
                 progress=100,
                 message=completion_message,
-                run_dir=str(summary.run_dir),
+                run_dir=str(summary.run_dir) if keep_job_runs else None,
                 result_path=result_target.resolve(),
                 error=None,
             )
         except Exception as exc:
             _set_state(status="error", progress=100, message="Failed", error=str(exc))
         finally:
+            if not keep_job_runs:
+                _cleanup_generated_dir(
+                    root=job_root,
+                    target=job_work_root,
+                    label=f"OCR job {job_id} work directory",
+                )
             keepalive_stop.set()
             keepalive.join(timeout=2)
 
@@ -1648,9 +1726,17 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 raise _PayloadTooLarge(
                     f"Request body is too large. Maximum is {max_upload_bytes} bytes."
                 )
-            return self.rfile.read(length)
+            payload = self.rfile.read(length)
+            if len(payload) != length:
+                raise ValueError(
+                    f"Incomplete request body: expected {length} bytes, received {len(payload)}."
+                )
+            return payload
 
         def _handle_sync_searchable_pdf(self, parsed) -> None:
+            sync_work_root = pipeline_root / f"sync_{uuid.uuid4().hex}"
+            keep_sync_runs = _env_bool("UNISCAN_KEEP_SYNC_RUNS", default=False)
+            summary: SearchablePdfSummary | None = None
             try:
                 payload = self._read_request_body()
                 if not payload:
@@ -1667,7 +1753,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
                         mode=mode,
                         lang=lang,
                         page_numbers=page_numbers,
-                        work_root=pipeline_root,
+                        work_root=sync_work_root,
                         overwrite_input_path=False,
                         return_bytes=True,
                         strict=strict,
@@ -1685,13 +1771,24 @@ def _build_handler(*, work_root: Path, default_lang: str):
             except Exception as exc:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
+            finally:
+                if not keep_sync_runs:
+                    _cleanup_generated_dir(
+                        root=pipeline_root,
+                        target=sync_work_root,
+                        label="synchronous OCR work directory",
+                    )
 
+            if summary is None:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "OCR produced no summary."})
+                return
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/pdf")
             self.send_header("Content-Length", str(len(output_bytes)))
             self.send_header("Content-Disposition", _content_disposition_attachment("searchable.pdf"))
             self.send_header("X-UniScan-Mode", summary.mode)
-            self.send_header("X-UniScan-Run-Dir", str(summary.run_dir))
+            if keep_sync_runs:
+                self.send_header("X-UniScan-Run-Dir", str(summary.run_dir))
             self.end_headers()
             self.wfile.write(output_bytes)
 
@@ -1759,6 +1856,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 try:
                     input_path = job_store.write_input(job_id, payload)
                 except Exception as exc:
+                    _safe_remove_job_dir(root=jobs_root, target=jobs_root / job_id)
                     self._send_json(
                         HTTPStatus.INTERNAL_SERVER_ERROR,
                         {"error": f"Failed to persist input PDF before accepting job: {exc}"},

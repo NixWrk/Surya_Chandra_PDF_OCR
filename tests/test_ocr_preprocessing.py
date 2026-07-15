@@ -276,14 +276,11 @@ def test_apply_preprocessing_invalid_mode_raises_without_cv2() -> None:
     assert result is img
 
 
-@pytest.mark.skipif(not _CV2_AVAILABLE, reason="cv2 not installed")
-def test_apply_preprocessing_unknown_mode_falls_through() -> None:
+def test_apply_preprocessing_unknown_mode_raises() -> None:
     """Unsupported modes beyond 'none'/'basic'/'full' should raise."""
     img = _bgr_image()
-    # 'none' is safe; invalid value should not reach cv2 calls
-    # (the function doesn't validate mode, but canonical.py does)
-    result = apply_preprocessing(img, mode="none")
-    assert result is img
+    with pytest.raises(ValueError, match="Invalid preprocessing mode"):
+        apply_preprocessing(img, mode="unknown")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
