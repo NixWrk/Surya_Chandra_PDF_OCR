@@ -10,9 +10,14 @@ import tempfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from uniscan.core.pipeline import build_pdf_from_images
+
+ImportModule = Callable[[str], Any]
+WhichExecutable = Callable[[str], str | None]
+RunCommand = Callable[..., Any]
+BuildPdf = Callable[..., None]
 
 OCR_ENGINE_PYTESSERACT = "pytesseract"
 OCR_ENGINE_OCRMYPDF = "ocrmypdf"
@@ -82,7 +87,9 @@ OCRMYPDF_PLUGIN_CANDIDATES: dict[str, tuple[str, ...]] = {
 }
 
 
-def _find_ghostscript_executable(which_fn=shutil.which) -> str | None:
+def _find_ghostscript_executable(
+    which_fn: WhichExecutable = shutil.which,
+) -> str | None:
     """Return Ghostscript executable path when available."""
     for candidate in ("gs", "gswin64c", "gswin32c"):
         found = which_fn(candidate) or which_fn(f"{candidate}.exe")
@@ -105,7 +112,11 @@ def _find_ghostscript_executable(which_fn=shutil.which) -> str | None:
     return None
 
 
-def _run_cmd_with_optional_env(run_cmd, command: list[str], env: dict[str, str] | None):
+def _run_cmd_with_optional_env(
+    run_cmd: RunCommand,
+    command: list[str],
+    env: dict[str, str] | None,
+) -> Any:
     kwargs: dict[str, Any] = {
         "capture_output": True,
         "text": True,
@@ -119,7 +130,9 @@ def _run_cmd_with_optional_env(run_cmd, command: list[str], env: dict[str, str] 
         return run_cmd(command, **kwargs)
 
 
-def _ocrmypdf_env_with_ghostscript(which_fn=shutil.which) -> dict[str, str] | None:
+def _ocrmypdf_env_with_ghostscript(
+    which_fn: WhichExecutable = shutil.which,
+) -> dict[str, str] | None:
     gs_exe = _find_ghostscript_executable(which_fn=which_fn)
     if not gs_exe:
         return None
@@ -167,7 +180,7 @@ class OcrEngineStatus:
         return OCR_ENGINE_LABELS.get(self.engine_name, self.engine_name)
 
 
-def _has_module(name: str, import_module) -> bool:
+def _has_module(name: str, import_module: ImportModule) -> bool:
     try:
         import_module(name)
         return True
@@ -175,11 +188,14 @@ def _has_module(name: str, import_module) -> bool:
         return False
 
 
-def _has_command(name: str, which_fn) -> bool:
+def _has_command(name: str, which_fn: WhichExecutable) -> bool:
     return bool(which_fn(name) or which_fn(f"{name}.exe"))
 
 
-def _is_valid_ocrmypdf_plugin_module(name: str, import_module) -> bool:
+def _is_valid_ocrmypdf_plugin_module(
+    name: str,
+    import_module: ImportModule,
+) -> bool:
     """Validate that plugin module can be imported."""
     try:
         import_module(name)
@@ -201,8 +217,8 @@ def _ocrmypdf_plugin_candidates_for_engine(engine: str) -> tuple[str, ...]:
 def _detect_ocrmypdf_plugin_module(
     engine: str,
     *,
-    import_module,
-    which_fn,
+    import_module: ImportModule,
+    which_fn: WhichExecutable,
 ) -> str | None:
     # OCRmyPDF plugin mode still needs OCRmyPDF binary and img2pdf in the runtime.
     if not _has_command("ocrmypdf", which_fn):
@@ -218,8 +234,8 @@ def _detect_ocrmypdf_plugin_module(
 
 def detect_ocr_dependencies(
     *,
-    import_module=importlib.import_module,
-    which_fn=shutil.which,
+    import_module: ImportModule = importlib.import_module,
+    which_fn: WhichExecutable = shutil.which,
 ) -> OcrDependencyStatus:
     """Backward-compatible checker for pytesseract workflow."""
     return OcrDependencyStatus(
@@ -229,7 +245,12 @@ def detect_ocr_dependencies(
     )
 
 
-def _detect_ocr_engine_status_pytesseract(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+def _detect_ocr_engine_status_pytesseract(
+    engine: str,
+    *,
+    import_module: ImportModule = importlib.import_module,
+    which_fn: WhichExecutable = shutil.which,
+) -> OcrEngineStatus:
     deps = detect_ocr_dependencies(import_module=import_module, which_fn=which_fn)
     return OcrEngineStatus(
         engine_name=engine,
@@ -239,7 +260,12 @@ def _detect_ocr_engine_status_pytesseract(engine: str, *, import_module=importli
     )
 
 
-def _detect_ocr_engine_status_ocrmypdf(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+def _detect_ocr_engine_status_ocrmypdf(
+    engine: str,
+    *,
+    import_module: ImportModule = importlib.import_module,
+    which_fn: WhichExecutable = shutil.which,
+) -> OcrEngineStatus:
     missing: list[str] = []
     if not _has_command("ocrmypdf", which_fn):
         missing.append("ocrmypdf")
@@ -253,8 +279,13 @@ def _detect_ocr_engine_status_ocrmypdf(engine: str, *, import_module=importlib.i
     )
 
 
-def _detect_ocr_engine_status_pymupdf(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
-    missing = []
+def _detect_ocr_engine_status_pymupdf(
+    engine: str,
+    *,
+    import_module: ImportModule = importlib.import_module,
+    which_fn: WhichExecutable = shutil.which,
+) -> OcrEngineStatus:
+    missing: list[str] = []
     if not _has_module("fitz", import_module):
         missing.append("pymupdf(fitz)")
     if not _has_module("pypdf", import_module):
@@ -269,7 +300,12 @@ def _detect_ocr_engine_status_pymupdf(engine: str, *, import_module=importlib.im
     )
 
 
-def _detect_ocr_engine_status_paddleocr(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+def _detect_ocr_engine_status_paddleocr(
+    engine: str,
+    *,
+    import_module: ImportModule = importlib.import_module,
+    which_fn: WhichExecutable = shutil.which,
+) -> OcrEngineStatus:
     missing = [] if _has_module("paddleocr", import_module) else ["paddleocr"]
     plugin_module = _detect_ocrmypdf_plugin_module(engine, import_module=import_module, which_fn=which_fn)
     return OcrEngineStatus(
@@ -280,7 +316,12 @@ def _detect_ocr_engine_status_paddleocr(engine: str, *, import_module=importlib.
     )
 
 
-def _detect_ocr_engine_status_surya(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+def _detect_ocr_engine_status_surya(
+    engine: str,
+    *,
+    import_module: ImportModule = importlib.import_module,
+    which_fn: WhichExecutable = shutil.which,
+) -> OcrEngineStatus:
     has_surya = _has_module("surya", import_module)
     has_marker = _has_module("marker", import_module)
     has_surya_cli = _has_command("surya_ocr", which_fn) or _has_command("marker_single", which_fn) or _has_command("marker", which_fn)
@@ -294,7 +335,12 @@ def _detect_ocr_engine_status_surya(engine: str, *, import_module=importlib.impo
     )
 
 
-def _detect_ocr_engine_status_mineru(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+def _detect_ocr_engine_status_mineru(
+    engine: str,
+    *,
+    import_module: ImportModule = importlib.import_module,
+    which_fn: WhichExecutable = shutil.which,
+) -> OcrEngineStatus:
     has_mineru = _has_module("mineru", import_module) or _has_module("magic_pdf", import_module)
     has_mineru_cli = _has_command("mineru", which_fn) or _has_command("magic-pdf", which_fn)
     missing: list[str] = []
@@ -313,7 +359,12 @@ def _detect_ocr_engine_status_mineru(engine: str, *, import_module=importlib.imp
     )
 
 
-def _detect_ocr_engine_status_olmocr(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+def _detect_ocr_engine_status_olmocr(
+    engine: str,
+    *,
+    import_module: ImportModule = importlib.import_module,
+    which_fn: WhichExecutable = shutil.which,
+) -> OcrEngineStatus:
     has_olmocr = _has_module("olmocr", import_module)
     has_olmocr_cli = _has_command("olmocr", which_fn)
     missing = [] if (has_olmocr or has_olmocr_cli) else ["olmocr"]
@@ -325,7 +376,12 @@ def _detect_ocr_engine_status_olmocr(engine: str, *, import_module=importlib.imp
     )
 
 
-def _detect_ocr_engine_status_chandra(engine: str, *, import_module=importlib.import_module, which_fn=shutil.which) -> OcrEngineStatus:
+def _detect_ocr_engine_status_chandra(
+    engine: str,
+    *,
+    import_module: ImportModule = importlib.import_module,
+    which_fn: WhichExecutable = shutil.which,
+) -> OcrEngineStatus:
     has_chandra = _has_module("chandra_ocr", import_module) or _has_module("chandra", import_module)
     has_chandra_cli = _has_command("chandra", which_fn)
     missing = [] if (has_chandra or has_chandra_cli) else ["chandra-ocr(chandra)"]
@@ -339,7 +395,7 @@ def _detect_ocr_engine_status_chandra(engine: str, *, import_module=importlib.im
 
 
 # Registry mapping engine names to their detection functions
-_ENGINE_DETECTION_FUNCTIONS = {
+_ENGINE_DETECTION_FUNCTIONS: dict[str, Callable[..., OcrEngineStatus]] = {
     OCR_ENGINE_PYTESSERACT: _detect_ocr_engine_status_pytesseract,
     OCR_ENGINE_OCRMYPDF: _detect_ocr_engine_status_ocrmypdf,
     OCR_ENGINE_PYMUPDF: _detect_ocr_engine_status_pymupdf,
@@ -354,8 +410,8 @@ _ENGINE_DETECTION_FUNCTIONS = {
 def detect_ocr_engine_status(
     engine_name: str,
     *,
-    import_module=importlib.import_module,
-    which_fn=shutil.which,
+    import_module: ImportModule = importlib.import_module,
+    which_fn: WhichExecutable = shutil.which,
 ) -> OcrEngineStatus:
     engine = engine_name.strip().lower()
     if engine not in OCR_ENGINE_VALUES:
@@ -378,7 +434,7 @@ def _image_paths_to_searchable_pdf_pytesseract(
     *,
     out_pdf: Path,
     lang: str,
-    import_module,
+    import_module: ImportModule,
 ) -> Path:
     pytesseract = import_module("pytesseract")
     pypdf = import_module("pypdf")
@@ -450,9 +506,9 @@ def _image_paths_to_searchable_pdf_ocrmypdf(
     *,
     out_pdf: Path,
     lang: str,
-    which_fn,
-    run_cmd,
-    build_pdf_fn,
+    which_fn: WhichExecutable,
+    run_cmd: RunCommand,
+    build_pdf_fn: BuildPdf,
 ) -> Path:
     ocrmypdf_cmd = which_fn("ocrmypdf") or which_fn("ocrmypdf.exe")
     if not ocrmypdf_cmd:
@@ -489,7 +545,7 @@ def _image_paths_to_searchable_pdf_pymupdf(
     *,
     out_pdf: Path,
     lang: str,
-    import_module,
+    import_module: ImportModule,
 ) -> Path:
     fitz = import_module("fitz")
     pypdf = import_module("pypdf")
@@ -543,9 +599,9 @@ def _image_paths_to_searchable_pdf_ocrmypdf_plugin(
     out_pdf: Path,
     lang: str,
     plugin_module: str,
-    which_fn,
-    run_cmd,
-    build_pdf_fn,
+    which_fn: WhichExecutable,
+    run_cmd: RunCommand,
+    build_pdf_fn: BuildPdf,
 ) -> Path:
     ocrmypdf_cmd = which_fn("ocrmypdf") or which_fn("ocrmypdf.exe")
     if not ocrmypdf_cmd:
@@ -587,10 +643,10 @@ def image_paths_to_searchable_pdf(
     engine_name: str = OCR_ENGINE_PYTESSERACT,
     dependency_status: OcrDependencyStatus | None = None,
     engine_status: OcrEngineStatus | None = None,
-    import_module=importlib.import_module,
-    which_fn=shutil.which,
-    run_cmd=subprocess.run,
-    build_pdf_fn=build_pdf_from_images,
+    import_module: ImportModule = importlib.import_module,
+    which_fn: WhichExecutable = shutil.which,
+    run_cmd: RunCommand = subprocess.run,
+    build_pdf_fn: BuildPdf = build_pdf_from_images,
 ) -> Path:
     """
     Build searchable PDF using selected OCR engine.

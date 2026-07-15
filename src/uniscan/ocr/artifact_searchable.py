@@ -14,7 +14,7 @@ from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from time import perf_counter
-from typing import Sequence
+from typing import Any, Sequence
 
 from uniscan.io.loaders import _safe_render_dpi
 
@@ -574,11 +574,11 @@ def _wrap_text_to_width(
 
 def _estimate_page_line_bboxes(
     *,
-    page,
+    page: Any,
 ) -> list[tuple[float, float, float, float]]:
     try:
-        import fitz  # type: ignore
-        import cv2  # type: ignore
+        import fitz
+        import cv2
         import numpy as np
     except Exception:
         return []
@@ -2193,7 +2193,7 @@ def _placements_from_geometry_text_with_linefit(
     )
 
 
-def _page_rotation_degrees(source_page) -> int:
+def _page_rotation_degrees(source_page: Any) -> int:
     raw_value = source_page.get("/Rotate", 0)
     try:
         return int(raw_value) % 360
@@ -2201,7 +2201,7 @@ def _page_rotation_degrees(source_page) -> int:
         return 0
 
 
-def _normalize_source_page_rotation(source_page) -> None:
+def _normalize_source_page_rotation(source_page: Any) -> None:
     if not hasattr(source_page, "transfer_rotation_to_content"):
         return
     if _page_rotation_degrees(source_page) == 0:
@@ -2433,7 +2433,7 @@ def _build_overlay_page(
     page_height: float,
     placements: Sequence[tuple[tuple[float, float, float, float], str]],
     font_name: str,
-):
+) -> Any:
     from pypdf import PdfReader
     from reportlab.pdfgen import canvas
     from reportlab.pdfbase import pdfmetrics
@@ -2518,7 +2518,7 @@ def _build_searchable_pdf_from_text(
     warnings: list[str] | None = None,
 ) -> tuple[int, int]:
     from pypdf import PdfReader, PdfWriter
-    import fitz  # type: ignore
+    import fitz
 
     font_path = _resolve_text_layer_font_path()
     font_name = _register_overlay_font(font_path)
@@ -3135,7 +3135,9 @@ def summarize_artifact_searchable_package(results: Sequence[ArtifactSearchableRe
     return "\n".join(lines)
 
 
-def _load_compare_source_rows(benchmark_root: Path) -> tuple[list[dict], list[str]]:
+def _load_compare_source_rows(
+    benchmark_root: Path,
+) -> tuple[list[dict[str, Any]], list[str]]:
     summary_path = benchmark_root / "summary.json"
     if summary_path.exists():
         try:
@@ -3154,7 +3156,7 @@ def _load_compare_source_rows(benchmark_root: Path) -> tuple[list[dict], list[st
         key=lambda item: item.stat().st_mtime,
         reverse=True,
     )
-    report_rows: list[dict] = []
+    report_rows: list[dict[str, Any]] = []
     seen_engines: set[str] = set()
     source_reports: list[str] = []
     for report_path in report_paths:

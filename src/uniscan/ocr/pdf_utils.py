@@ -24,7 +24,7 @@ def _textless_jpeg_quality() -> int:
 def _build_textless_source_pdf(*, source_pdf: Path, out_pdf: Path, dpi: int = 300) -> Path:
     """Render PDF pages into an image-only PDF to remove existing text."""
     try:
-        import fitz  # type: ignore
+        import fitz
     except Exception as exc:
         raise RuntimeError(
             "Removing original text layer requires PyMuPDF. Install with: pip install pymupdf"

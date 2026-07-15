@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 PreprocessingMode = Literal["none", "basic", "full"]
 PREPROCESSING_MODES: tuple[PreprocessingMode, ...] = ("none", "basic", "full")
@@ -55,9 +55,10 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def _require_cv2():
+def _require_cv2() -> Any:
     try:
-        import cv2  # type: ignore
+        import cv2
+
         return cv2
     except ImportError as exc:
         raise RuntimeError(
@@ -65,15 +66,16 @@ def _require_cv2():
         ) from exc
 
 
-def _require_numpy():
+def _require_numpy() -> Any:
     try:
-        import numpy as np  # type: ignore
+        import numpy as np
+
         return np
     except ImportError as exc:
         raise RuntimeError("numpy is required for preprocessing.") from exc
 
 
-def to_greyscale(image):
+def to_greyscale(image: Any) -> Any:
     """Convert BGR / RGB image to greyscale. Returns HxW uint8 array."""
     cv2 = _require_cv2()
     if image.ndim == 2:
@@ -83,7 +85,7 @@ def to_greyscale(image):
     return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
 
-def normalize_dpi(image, *, from_dpi: int, to_dpi: int):
+def normalize_dpi(image: Any, *, from_dpi: int, to_dpi: int) -> Any:
     """Resize image proportionally to match target DPI.
 
     If ``from_dpi == to_dpi`` the original array is returned unchanged.
@@ -101,7 +103,7 @@ def normalize_dpi(image, *, from_dpi: int, to_dpi: int):
     return cv2.resize(image, (new_w, new_h), interpolation=interp)
 
 
-def binarize_otsu(grey_image):
+def binarize_otsu(grey_image: Any) -> Any:
     """Apply Otsu's thresholding to a greyscale image. Returns HxW binary uint8."""
     cv2 = _require_cv2()
     if grey_image.ndim != 2:
@@ -110,7 +112,7 @@ def binarize_otsu(grey_image):
     return binary
 
 
-def deskew(grey_image):
+def deskew(grey_image: Any) -> Any:
     """Detect and correct skew angle for a greyscale image.
 
     Uses the projection-profile method (Hough transform on edges).
@@ -156,12 +158,12 @@ def deskew(grey_image):
 
 
 def apply_preprocessing(
-    image,
+    image: Any,
     *,
     mode: PreprocessingMode,
     render_dpi: int = 0,
     ocr_dpi: int = 0,
-):
+) -> Any:
     """Apply preprocessing pipeline to *image* according to *mode*.
 
     Parameters
@@ -208,7 +210,7 @@ def apply_preprocessing(
     return result
 
 
-def _cv2_imread_unicode(path: Path):
+def _cv2_imread_unicode(path: Path) -> Any:
     """Load an image from a path that may contain non-ASCII characters.
 
     ``cv2.imread`` uses the C runtime ``fopen`` on Windows, which does not
@@ -222,7 +224,7 @@ def _cv2_imread_unicode(path: Path):
     return image
 
 
-def _cv2_imwrite_unicode(path: Path, image) -> bool:
+def _cv2_imwrite_unicode(path: Path, image: Any) -> bool:
     """Write *image* to *path* even if the path contains non-ASCII characters."""
     cv2 = _require_cv2()
     ext = path.suffix.lower() or ".png"

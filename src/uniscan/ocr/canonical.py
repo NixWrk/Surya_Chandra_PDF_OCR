@@ -43,7 +43,7 @@ class CanonicalOcrResult:
 
 
 def _pdf_page_count(pdf_path: Path) -> int:
-    import fitz  # type: ignore
+    import fitz
 
     doc = fitz.open(str(pdf_path))
     try:
@@ -55,7 +55,7 @@ def _pdf_page_count(pdf_path: Path) -> int:
 def _extract_pdf_text(pdf_path: Path) -> str:
     fitz_error: Exception | None = None
     try:
-        import fitz  # type: ignore
+        import fitz
 
         doc = fitz.open(str(pdf_path))
         try:
@@ -69,7 +69,7 @@ def _extract_pdf_text(pdf_path: Path) -> str:
         fitz_error = exc
 
     try:
-        import pypdf  # type: ignore
+        import pypdf
 
         reader = pypdf.PdfReader(str(pdf_path))
         return "\n".join((page.extract_text() or "") for page in reader.pages)
@@ -114,7 +114,7 @@ def _build_text_only_searchable_pdf(
     out_pdf: Path,
     source_pages_1based: Sequence[int] | None = None,
 ) -> Path:
-    import fitz  # type: ignore
+    import fitz
 
     source_pages = (
         list(source_pages_1based)

@@ -80,6 +80,10 @@ class OcrBenchmarkResult:
 
 BenchmarkProgressCallback = Callable[[int, str], None]
 PageProgressCallback = Callable[[int, int, int], None]
+ImportModule = Callable[[str], Any]
+WhichExecutable = Callable[[str], str | None]
+RunCommand = Callable[..., Any]
+ExtractionFunction = Callable[..., tuple[str, int]]
 
 
 def sample_pdf_page_indices(page_count: int, *, sample_size: int = 5) -> list[int]:
@@ -148,7 +152,7 @@ def resolve_pdf_page_indices(
 
 def _pdf_page_count(pdf_path: Path) -> int:
     try:
-        import fitz  # type: ignore
+        import fitz
     except Exception as exc:
         raise RuntimeError("PDF import requires PyMuPDF. Install with: pip install pymupdf") from exc
 
@@ -240,7 +244,7 @@ def _render_sample_paths(
 
 def _extract_pdf_text(pdf_path: Path) -> str:
     try:
-        import fitz  # type: ignore
+        import fitz
     except Exception as exc:
         raise RuntimeError("PDF import requires PyMuPDF. Install with: pip install pymupdf") from exc
 
@@ -262,7 +266,7 @@ def _extract_pdf_text_chars(pdf_path: Path) -> int:
 
 def _memory_rss_mb() -> float | None:
     try:
-        import psutil  # type: ignore
+        import psutil
     except Exception:
         return None
     try:
@@ -304,7 +308,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _torch_cuda_probe() -> tuple[bool, str]:
     try:
-        import torch  # type: ignore
+        import torch
     except Exception as exc:
         return False, f"torch import failed: {exc}"
 
@@ -1007,8 +1011,8 @@ def _run_extraction_engine_pagewise(
     source_pages_1based: Sequence[int],
     lang: str,
     work_dir: Path,
-    which_fn,
-    run_cmd,
+    which_fn: WhichExecutable,
+    run_cmd: RunCommand,
     progress_cb: PageProgressCallback | None = None,
 ) -> tuple[list[str], int, list[dict[str, Any]], list[dict[str, Any]]]:
     if len(image_paths) != len(source_pages_1based):
@@ -1212,7 +1216,7 @@ def _run_extraction_engine_pagewise(
     )
 
 
-def _module_presence_probe(name: str):
+def _module_presence_probe(name: str) -> object:
     """Import-probe compatible callable without importing heavyweight modules."""
     if importlib.util.find_spec(name) is None:
         raise ImportError(name)
@@ -1264,8 +1268,8 @@ def _run_surya_module_cli(
     *,
     lang: str,
     work_dir: Path,
-    which_fn=shutil.which,
-    run_cmd,
+    which_fn: WhichExecutable = shutil.which,
+    run_cmd: RunCommand,
 ) -> tuple[str, int]:
     if len(image_paths) == 0:
         raise ValueError("No images for Surya OCR.")
@@ -1469,7 +1473,7 @@ def _run_surya_module_cli(
     # Surya opens images via PIL internally — lift the decompression-bomb
     # guard so it can process high-resolution pages.
     try:
-        from PIL import Image as _PIL_Image  # type: ignore
+        from PIL import Image as _PIL_Image
         _PIL_Image.MAX_IMAGE_PIXELS = None
     except Exception:
         pass
@@ -1528,7 +1532,7 @@ def _run_mineru_module_cli(
     *,
     lang: str,
     work_dir: Path,
-    run_cmd,
+    run_cmd: RunCommand,
 ) -> tuple[str, int]:
     if len(image_paths) == 0:
         raise ValueError("No images for MinerU OCR.")
@@ -1559,7 +1563,7 @@ def _run_mineru_module_cli(
     # MinerU converts input images to PDF internally via PIL — lift the
     # decompression-bomb guard before importing the module.
     try:
-        from PIL import Image as _PIL_Image  # type: ignore
+        from PIL import Image as _PIL_Image
         _PIL_Image.MAX_IMAGE_PIXELS = None
     except Exception:
         pass
@@ -1626,8 +1630,8 @@ def _run_text_engine_from_cli(
     engine: str,
     lang: str,
     candidates: Sequence[tuple[str, ...]],
-    which_fn,
-    run_cmd,
+    which_fn: WhichExecutable,
+    run_cmd: RunCommand,
 ) -> tuple[str, int]:
     collected: list[str] = []
     errors: list[str] = []
@@ -1700,8 +1704,8 @@ def _run_surya_direct(
     *,
     lang: str,
     work_dir: Path,
-    which_fn=shutil.which,
-    run_cmd=subprocess.run,
+    which_fn: WhichExecutable = shutil.which,
+    run_cmd: RunCommand = subprocess.run,
 ) -> tuple[str, int]:
     (work_dir / "surya_page_lines.json").unlink(missing_ok=True)
     os.environ.setdefault("MODEL_CACHE_DIR", str(_DEFAULT_SURYA_MODEL_CACHE_HOME))
@@ -1755,8 +1759,8 @@ def _run_mineru_direct(
     *,
     lang: str,
     work_dir: Path,
-    which_fn=shutil.which,
-    run_cmd=subprocess.run,
+    which_fn: WhichExecutable = shutil.which,
+    run_cmd: RunCommand = subprocess.run,
 ) -> tuple[str, int]:
     module_error: Exception | None = None
     try:
@@ -1802,7 +1806,7 @@ def _run_chandra_module(
     selected_device = _configure_chandra_runtime_device()
     # Chandra uses PIL internally; lift the decompression-bomb guard.
     try:
-        from PIL import Image as _PIL_Image  # type: ignore
+        from PIL import Image as _PIL_Image
         _PIL_Image.MAX_IMAGE_PIXELS = None
     except Exception:
         pass
@@ -1932,8 +1936,8 @@ def _run_chandra_cli(
     *,
     lang: str,
     work_dir: Path,
-    which_fn=shutil.which,
-    run_cmd=subprocess.run,
+    which_fn: WhichExecutable = shutil.which,
+    run_cmd: RunCommand = subprocess.run,
 ) -> tuple[str, int]:
     """Run Chandra OCR via CLI binary (fallback path)."""
     if len(image_paths) == 0:
@@ -1990,8 +1994,8 @@ def _run_chandra_direct(
     *,
     lang: str,
     work_dir: Path,
-    which_fn=shutil.which,
-    run_cmd=subprocess.run,
+    which_fn: WhichExecutable = shutil.which,
+    run_cmd: RunCommand = subprocess.run,
     page_progress_cb: Callable[[int, int], None] | None = None,
 ) -> tuple[str, int]:
     (work_dir / "chandra_page_lines.json").unlink(missing_ok=True)
@@ -2118,7 +2122,7 @@ def _collect_olmocr_workspace_text(workspace: Path) -> tuple[str, int]:
     if not text_parts:
         for compressed_path in sorted(workspace.rglob("*.jsonl.zst")):
             try:
-                import zstandard as zstd  # type: ignore
+                import zstandard as zstd
             except Exception:
                 break
             try:
@@ -2154,7 +2158,7 @@ def _render_images_to_pdf(image_paths: Sequence[Path], out_pdf: Path) -> None:
     if len(image_paths) == 0:
         raise ValueError("No images to render into PDF.")
     try:
-        import fitz  # type: ignore
+        import fitz
     except Exception as exc:
         raise RuntimeError("olmOCR docker fallback requires PyMuPDF. Install with: pip install pymupdf") from exc
 
@@ -2179,8 +2183,8 @@ def _run_olmocr_docker(
     image_paths: Sequence[Path],
     *,
     work_dir: Path,
-    which_fn=shutil.which,
-    run_cmd=subprocess.run,
+    which_fn: WhichExecutable = shutil.which,
+    run_cmd: RunCommand = subprocess.run,
 ) -> tuple[str, int]:
     docker_cmd = which_fn("docker") or which_fn("docker.exe")
     if not docker_cmd:
@@ -2296,8 +2300,8 @@ def _run_olmocr_direct(
     *,
     lang: str,
     work_dir: Path,
-    which_fn=shutil.which,
-    run_cmd=subprocess.run,
+    which_fn: WhichExecutable = shutil.which,
+    run_cmd: RunCommand = subprocess.run,
 ) -> tuple[str, int]:
     if len(image_paths) == 0:
         raise ValueError("No images for olmOCR.")
@@ -2367,7 +2371,7 @@ def _run_olmocr_direct(
     raise RuntimeError("olmOCR failed: " + " | ".join(errors))
 
 
-def _engine_extraction_functions():
+def _engine_extraction_functions() -> dict[str, ExtractionFunction]:
     return {
         OCR_ENGINE_PADDLEOCR: _run_paddleocr_direct,
         OCR_ENGINE_SURYA: _run_surya_direct,
@@ -2383,8 +2387,8 @@ def _run_extraction_engine(
     *,
     lang: str,
     work_dir: Path,
-    which_fn,
-    run_cmd,
+    which_fn: WhichExecutable,
+    run_cmd: RunCommand,
 ) -> tuple[str, int]:
     # Use registry pattern to avoid repetitive if/elif chains
     extraction_func = _engine_extraction_functions().get(engine)
@@ -2441,9 +2445,9 @@ def run_ocr_benchmark(
     page_numbers: Sequence[int] | None = None,
     dpi: int = 220,
     lang: str = "eng",
-    import_module=None,
-    which_fn=shutil.which,
-    run_cmd=subprocess.run,
+    import_module: ImportModule | None = None,
+    which_fn: WhichExecutable = shutil.which,
+    run_cmd: RunCommand = subprocess.run,
     progress: BenchmarkProgressCallback | None = None,
 ) -> list[OcrBenchmarkResult]:
     """Run a sampled OCR benchmark against a PDF fixture."""

@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -650,7 +651,7 @@ def _atomic_copy_file(source: Path, target: Path) -> None:
 
 
 @contextmanager
-def _temporary_env(name: str, value: str | None):
+def _temporary_env(name: str, value: str | None) -> Iterator[None]:
     had_old = name in os.environ
     old_value = os.environ.get(name)
     try:

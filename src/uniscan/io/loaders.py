@@ -7,6 +7,7 @@ import re
 import warnings
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -15,7 +16,11 @@ import numpy as np
 _MAX_RENDER_PIXELS: int = 64_000_000
 
 
-def _safe_render_dpi(page_rect, requested_dpi: int, max_pixels: int = _MAX_RENDER_PIXELS) -> int:
+def _safe_render_dpi(
+    page_rect: Any,
+    requested_dpi: int,
+    max_pixels: int = _MAX_RENDER_PIXELS,
+) -> int:
     """Return the highest integer DPI <= *requested_dpi* that keeps the
     rendered page within *max_pixels* total pixels.
 
@@ -83,7 +88,7 @@ def imwrite_unicode(path: Path, image: np.ndarray) -> bool:
 def render_pdf_pages(pdf_path: Path, dpi: int) -> list[LoadedItem]:
     """Render PDF pages to BGR images."""
     try:
-        import fitz  # type: ignore
+        import fitz
     except Exception as exc:
         raise RuntimeError("PDF import requires PyMuPDF. Install with: pip install pymupdf") from exc
 
@@ -116,7 +121,7 @@ def iter_render_pdf_page_indices(
 ) -> Iterator[LoadedItem]:
     """Yield selected PDF pages as BGR images one page at a time."""
     try:
-        import fitz  # type: ignore
+        import fitz
     except Exception as exc:
         raise RuntimeError("PDF import requires PyMuPDF. Install with: pip install pymupdf") from exc
 

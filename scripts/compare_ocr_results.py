@@ -58,7 +58,7 @@ def _safe_slug(value: str) -> str:
 def _extract_pdf_text(pdf_path: Path) -> str:
     fitz_error: Exception | None = None
     try:
-        import fitz  # type: ignore
+        import fitz
 
         doc = fitz.open(str(pdf_path))
         try:
@@ -72,7 +72,7 @@ def _extract_pdf_text(pdf_path: Path) -> str:
         fitz_error = exc
 
     try:
-        import pypdf  # type: ignore
+        import pypdf
 
         reader = pypdf.PdfReader(str(pdf_path))
         parts = []

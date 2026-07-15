@@ -19,7 +19,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import ParseResult, parse_qs, quote, urlparse
 
 from uniscan.app import (
     DEFAULT_BASIC_GUI_LANG,
@@ -892,7 +892,7 @@ def _parse_optional_int(
     return parsed
 
 
-def _parse_protocol_metadata(parsed, headers: Any) -> _ProtocolMetadata:
+def _parse_protocol_metadata(parsed: ParseResult, headers: Any) -> _ProtocolMetadata:
     query = parse_qs(parsed.query, keep_blank_values=True)
 
     protocol_version = _clean_protocol_text(
@@ -1048,7 +1048,11 @@ def _query_bool(raw: str | None, *, default: bool) -> bool:
     return default
 
 
-def _parse_job_request(parsed, *, default_lang: str) -> tuple[str, str, str, bool, str, bool]:
+def _parse_job_request(
+    parsed: ParseResult,
+    *,
+    default_lang: str,
+) -> tuple[str, str, str, bool, str, bool]:
     query = parse_qs(parsed.query, keep_blank_values=True)
     mode = normalize_pdf_mode(
         (query.get("mode", [PDF_MODE_HYBRID])[0] or PDF_MODE_HYBRID).strip()
@@ -1397,7 +1401,11 @@ def _html_ui() -> bytes:
     ).encode("utf-8")
 
 
-def _build_handler(*, work_root: Path, default_lang: str):
+def _build_handler(
+    *,
+    work_root: Path,
+    default_lang: str,
+) -> type[BaseHTTPRequestHandler]:
     jobs_root = (work_root / "jobs").resolve()
     pipeline_root = (work_root / "runs").resolve()
     jobs_root.mkdir(parents=True, exist_ok=True)
@@ -1733,7 +1741,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
                 )
             return payload
 
-        def _handle_sync_searchable_pdf(self, parsed) -> None:
+        def _handle_sync_searchable_pdf(self, parsed: ParseResult) -> None:
             sync_work_root = pipeline_root / f"sync_{uuid.uuid4().hex}"
             keep_sync_runs = _env_bool("UNISCAN_KEEP_SYNC_RUNS", default=False)
             summary: SearchablePdfSummary | None = None
@@ -1792,7 +1800,7 @@ def _build_handler(*, work_root: Path, default_lang: str):
             self.end_headers()
             self.wfile.write(output_bytes)
 
-        def _handle_create_job(self, parsed) -> None:
+        def _handle_create_job(self, parsed: ParseResult) -> None:
             try:
                 payload = self._read_request_body()
                 if not payload:
