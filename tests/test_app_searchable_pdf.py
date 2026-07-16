@@ -250,15 +250,37 @@ def test_chunked_hybrid_pipeline_records_failed_page_range(
     _write_numbered_pdf(source_pdf, page_count=21)
     attempts = 0
 
-    def fail_second_chunk(**_kwargs: object) -> SearchablePdfSummary:
+    def fail_second_chunk(**kwargs: object) -> SearchablePdfSummary:
         nonlocal attempts
         attempts += 1
         if attempts == 2:
             raise RuntimeError("CUDA out of memory")
-        raise RuntimeError("test fixture stops after first call")
+        chunk_pdf = Path(str(kwargs["pdf_path"]))
+        run_dir = Path(str(kwargs["work_root"])) / "run"
+        compare_dir = run_dir / "_compare_txt"
+        compare_dir.mkdir(parents=True, exist_ok=True)
+        output_pdf = run_dir / "result.pdf"
+        shutil.copy2(chunk_pdf, output_pdf)
+        return SearchablePdfSummary(
+            mode="chandra+surya",
+            run_dir=run_dir,
+            compare_dir=compare_dir,
+            output_pdf_path=output_pdf,
+            output_pdf_bytes=None,
+            overwritten_input_path=None,
+            benchmark=BasicOcrRunSummary(
+                run_dir=run_dir,
+                results=(_ok_benchmark_result("chandra"),),
+                result_files=tuple(),
+                failed_engines=tuple(),
+                skipped_engines=tuple(),
+            ),
+            compare_results=tuple(),
+            artifact_results=tuple(),
+        )
 
     monkeypatch.setattr(ocr_pipeline, "build_searchable_pdf", fail_second_chunk)
-    with pytest.raises(RuntimeError, match="pages 1-10"):
+    with pytest.raises(RuntimeError, match="pages 11-20"):
         ocr_pipeline._build_searchable_pdf_chunked(
             input_path=source_pdf,
             mode="chandra+surya",
@@ -275,10 +297,12 @@ def test_chunked_hybrid_pipeline_records_failed_page_range(
     manifest_path = next((tmp_path / "failed_work").glob("hybrid_chunks_*/chunk_manifest.json"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["status"] == "error"
-    assert manifest["failed_chunk"] == 1
-    assert manifest["chunks"][0]["status"] == "error"
-    assert manifest["chunks"][0]["start_page"] == 1
-    assert manifest["chunks"][0]["end_page"] == 10
+    assert manifest["failed_chunk"] == 2
+    assert [item["status"] for item in manifest["chunks"]] == ["done", "error", "pending"]
+    assert manifest["chunks"][1]["start_page"] == 11
+    assert manifest["chunks"][1]["end_page"] == 20
+    first_output = Path(str(manifest["chunks"][0]["output_pdf"]))
+    assert first_output.is_file()
 
 
 def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
