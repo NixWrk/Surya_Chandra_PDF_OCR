@@ -10,6 +10,7 @@ services:
       - "127.0.0.1:${UNISCAN_HOST_PORT:-8000}:8000"
     environment:
       UNISCAN_HTTP_PORT: "8000"
+      CUDA_VISIBLE_DEVICES: "${UNISCAN_GPU_DEVICE_ID:-1}"
       UNISCAN_DEFAULT_LANG: "rus+eng"
       UNISCAN_WORK_ROOT: "/data/work"
       UNISCAN_CHANDRA_DEVICE_POLICY: "cuda"
@@ -38,7 +39,13 @@ services:
         aliases:
           - surya-chandra-ocr-api
           - ocr-api
-    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${UNISCAN_GPU_DEVICE_ID:-1}"]
+              capabilities: [gpu]
     restart: "no"
 
 networks:
