@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 import uuid
 
@@ -59,6 +60,225 @@ def _new_test_dir() -> Path:
     target = root / f"searchable_{uuid.uuid4().hex[:8]}"
     target.mkdir(parents=True, exist_ok=True)
     return target
+
+
+def _write_numbered_pdf(path: Path, *, page_count: int) -> None:
+    import fitz
+
+    document = fitz.open()
+    try:
+        for page_index in range(page_count):
+            page = document.new_page(
+                width=595 + (page_index % 2),
+                height=842 + (page_index % 3),
+            )
+            page.insert_text((72, 72), f"PAGE {page_index + 1}")
+        document.save(str(path))
+    finally:
+        document.close()
+
+
+def test_hybrid_chunk_pages_defaults_to_ten_and_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("UNISCAN_HYBRID_CHUNK_PAGES", raising=False)
+    assert ocr_pipeline._resolve_hybrid_chunk_pages() == 10
+    monkeypatch.setenv("UNISCAN_HYBRID_CHUNK_PAGES", "0")
+    assert ocr_pipeline._resolve_hybrid_chunk_pages() == 0
+    monkeypatch.setenv("UNISCAN_HYBRID_CHUNK_PAGES", "250")
+    assert ocr_pipeline._resolve_hybrid_chunk_pages() == 100
+    monkeypatch.setenv("UNISCAN_HYBRID_CHUNK_PAGES", "invalid")
+    assert ocr_pipeline._resolve_hybrid_chunk_pages() == 10
+
+
+def test_split_and_merge_pdf_chunks_preserves_page_order_and_sizes() -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=23)
+
+    chunks = ocr_pipeline._split_pdf_chunks(
+        source_pdf=source_pdf,
+        output_root=tmp_path / "chunks",
+        pages_per_chunk=10,
+    )
+
+    assert [
+        (chunk.start_page, chunk.end_page)
+        for chunk in chunks
+    ] == [(1, 10), (11, 20), (21, 23)]
+
+    merged_pdf = ocr_pipeline._merge_pdf_chunks(
+        source_pdf=source_pdf,
+        chunks=[(chunk, chunk.path) for chunk in chunks],
+        output_pdf=tmp_path / "merged.pdf",
+    )
+    source = fitz.open(str(source_pdf))
+    merged = fitz.open(str(merged_pdf))
+    try:
+        assert merged.page_count == source.page_count == 23
+        for page_index in range(23):
+            assert merged[page_index].get_text().strip() == f"PAGE {page_index + 1}"
+            assert merged[page_index].rect == source[page_index].rect
+    finally:
+        source.close()
+        merged.close()
+
+
+def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=23)
+    calls: list[dict[str, object]] = []
+
+    def fake_build_searchable_pdf(**kwargs: object) -> SearchablePdfSummary:
+        chunk_pdf = Path(str(kwargs["pdf_path"]))
+        work_root = Path(str(kwargs["work_root"]))
+        run_dir = work_root / "run"
+        compare_dir = run_dir / "_compare_txt"
+        compare_dir.mkdir(parents=True, exist_ok=True)
+        output_pdf = run_dir / "result.pdf"
+        shutil.copy2(chunk_pdf, output_pdf)
+        chunk_document = fitz.open(str(chunk_pdf))
+        try:
+            pages = int(chunk_document.page_count)
+        finally:
+            chunk_document.close()
+        calls.append(
+            {
+                "mode": kwargs["mode"],
+                "pages": pages,
+                "chunk_setting": os.environ.get("UNISCAN_HYBRID_CHUNK_PAGES"),
+                "delete_original_text_layer": kwargs["delete_original_text_layer"],
+            }
+        )
+        callback = kwargs["progress"]
+        assert callable(callback)
+        callback(0, "starting")
+        callback(100, "done")
+        benchmark = BasicOcrRunSummary(
+            run_dir=run_dir,
+            results=(
+                OcrBenchmarkResult(
+                    engine="chandra",
+                    status="ok",
+                    sample_pages=list(range(1, pages + 1)),
+                    elapsed_seconds=0.1,
+                    artifact_path=str(output_pdf),
+                    text_chars=pages,
+                ),
+            ),
+            result_files=tuple(),
+            failed_engines=tuple(),
+            skipped_engines=tuple(),
+        )
+        return SearchablePdfSummary(
+            mode="chandra+surya",
+            run_dir=run_dir,
+            compare_dir=compare_dir,
+            output_pdf_path=output_pdf,
+            output_pdf_bytes=None,
+            overwritten_input_path=None,
+            benchmark=benchmark,
+            compare_results=(
+                _ok_compare_result("chandra", compare_dir / "chunk__chandra.txt"),
+            ),
+            artifact_results=(_ok_artifact_result(output_pdf, engine="chandra"),),
+        )
+
+    monkeypatch.setattr(ocr_pipeline, "build_searchable_pdf", fake_build_searchable_pdf)
+    progress_values: list[int] = []
+    summary = ocr_pipeline._build_searchable_pdf_chunked(
+        input_path=source_pdf,
+        mode="chandra+surya",
+        lang="rus+eng",
+        work_root=tmp_path / "work",
+        overwrite_target=None,
+        return_bytes=True,
+        strict=True,
+        progress=lambda value, _status: progress_values.append(value),
+        delete_original_text_layer=True,
+        chunk_pages=10,
+        page_count=23,
+    )
+
+    assert calls == [
+        {
+            "mode": "chandra+surya",
+            "pages": 10,
+            "chunk_setting": "0",
+            "delete_original_text_layer": True,
+        },
+        {
+            "mode": "chandra+surya",
+            "pages": 10,
+            "chunk_setting": "0",
+            "delete_original_text_layer": True,
+        },
+        {
+            "mode": "chandra+surya",
+            "pages": 3,
+            "chunk_setting": "0",
+            "delete_original_text_layer": True,
+        },
+    ]
+    assert summary.chunk_count == 3
+    assert summary.chunk_pages == 10
+    assert summary.output_pdf_bytes is not None
+    assert progress_values == sorted(progress_values)
+    assert progress_values[-1] == 100
+    assert [result.sample_pages for result in summary.benchmark.results] == [
+        list(range(1, 11)),
+        list(range(11, 21)),
+        list(range(21, 24)),
+    ]
+    manifest = json.loads(summary.chunk_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "done"
+    assert [item["status"] for item in manifest["chunks"]] == ["done", "done", "done"]
+
+
+def test_chunked_hybrid_pipeline_records_failed_page_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=21)
+    attempts = 0
+
+    def fail_second_chunk(**_kwargs: object) -> SearchablePdfSummary:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            raise RuntimeError("CUDA out of memory")
+        raise RuntimeError("test fixture stops after first call")
+
+    monkeypatch.setattr(ocr_pipeline, "build_searchable_pdf", fail_second_chunk)
+    with pytest.raises(RuntimeError, match="pages 1-10"):
+        ocr_pipeline._build_searchable_pdf_chunked(
+            input_path=source_pdf,
+            mode="chandra+surya",
+            lang="rus+eng",
+            work_root=tmp_path / "failed_work",
+            overwrite_target=None,
+            return_bytes=False,
+            strict=True,
+            progress=None,
+            delete_original_text_layer=True,
+            chunk_pages=10,
+            page_count=21,
+        )
+    manifest_path = next((tmp_path / "failed_work").glob("hybrid_chunks_*/chunk_manifest.json"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "error"
+    assert manifest["failed_chunk"] == 1
+    assert manifest["chunks"][0]["status"] == "error"
+    assert manifest["chunks"][0]["start_page"] == 1
+    assert manifest["chunks"][0]["end_page"] == 10
 
 
 def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
@@ -123,6 +343,7 @@ def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
     monkeypatch.setattr(ocr_pipeline, "build_compare_txt_from_benchmark", fake_build_compare_txt_from_benchmark)
     monkeypatch.setattr(ocr_pipeline, "_build_textless_source_pdf", fake_build_textless_source_pdf)
     monkeypatch.setattr(ocr_pipeline, "run_artifact_searchable_package", fake_run_artifact_searchable_package)
+    monkeypatch.setattr(ocr_pipeline, "_pdf_page_count", lambda _path: 1)
 
     summary = build_searchable_pdf(
         pdf_path=input_pdf,

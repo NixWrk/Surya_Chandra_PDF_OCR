@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -61,6 +61,8 @@ _ENGINE_SUBPROCESS_ENV_SUFFIXES: tuple[str, ...] = (
 
 ProgressCallback = Callable[[int, str], None]
 
+_DEFAULT_HYBRID_CHUNK_PAGES = 10
+
 
 @dataclass(slots=True, frozen=True)
 class BasicOcrRunSummary:
@@ -93,6 +95,17 @@ class SearchablePdfSummary:
     compare_results: tuple[CompareTxtBuildResult, ...]
     artifact_results: tuple[ArtifactSearchableResult, ...]
     partial_page_failures: int = 0
+    chunk_count: int = 1
+    chunk_pages: int | None = None
+    chunk_manifest_path: Path | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class _PdfChunk:
+    index: int
+    start_page: int
+    end_page: int
+    path: Path
 
 
 def _emit_progress(cb: ProgressCallback | None, percent: int, status: str) -> None:
@@ -347,6 +360,185 @@ def _resolve_textless_dpi() -> int:
     return max(72, min(400, value))
 
 
+def _resolve_hybrid_chunk_pages() -> int:
+    raw = (os.environ.get("UNISCAN_HYBRID_CHUNK_PAGES") or "").strip()
+    if not raw:
+        return _DEFAULT_HYBRID_CHUNK_PAGES
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_HYBRID_CHUNK_PAGES
+    return max(0, min(100, value))
+
+
+def _pdf_page_count(pdf_path: Path) -> int:
+    try:
+        import fitz
+    except Exception as exc:
+        raise RuntimeError("PDF chunking requires PyMuPDF.") from exc
+
+    document = fitz.open(str(pdf_path))
+    try:
+        return int(document.page_count)
+    finally:
+        document.close()
+
+
+def _split_pdf_chunks(
+    *,
+    source_pdf: Path,
+    output_root: Path,
+    pages_per_chunk: int,
+) -> list[_PdfChunk]:
+    if pages_per_chunk <= 0:
+        raise ValueError("pages_per_chunk must be positive.")
+    try:
+        import fitz
+    except Exception as exc:
+        raise RuntimeError("PDF chunking requires PyMuPDF.") from exc
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    source = fitz.open(str(source_pdf))
+    chunks: list[_PdfChunk] = []
+    try:
+        total_pages = int(source.page_count)
+        for index, start_zero in enumerate(range(0, total_pages, pages_per_chunk), start=1):
+            end_zero = min(start_zero + pages_per_chunk, total_pages) - 1
+            start_page = start_zero + 1
+            end_page = end_zero + 1
+            path = output_root / (
+                f"chunk_{index:04d}_p{start_page:04d}_{end_page:04d}.pdf"
+            )
+            chunk_document = fitz.open()
+            try:
+                chunk_document.insert_pdf(
+                    source,
+                    from_page=start_zero,
+                    to_page=end_zero,
+                    links=True,
+                    annots=True,
+                )
+                chunk_document.save(str(path), garbage=4, deflate=True)
+            finally:
+                chunk_document.close()
+            chunks.append(
+                _PdfChunk(
+                    index=index,
+                    start_page=start_page,
+                    end_page=end_page,
+                    path=path,
+                )
+            )
+    finally:
+        source.close()
+    return chunks
+
+
+def _merge_pdf_chunks(
+    *,
+    source_pdf: Path,
+    chunks: list[tuple[_PdfChunk, Path]],
+    output_pdf: Path,
+) -> Path:
+    if not chunks:
+        raise ValueError("No OCR chunks to merge.")
+    try:
+        import fitz
+    except Exception as exc:
+        raise RuntimeError("PDF chunk merging requires PyMuPDF.") from exc
+
+    ordered = sorted(chunks, key=lambda item: item[0].start_page)
+    source = fitz.open(str(source_pdf))
+    merged = fitz.open()
+    temporary = output_pdf.with_name(f".{output_pdf.stem}.{uuid.uuid4().hex}.tmp.pdf")
+    try:
+        source_sizes = [
+            (float(page.rect.width), float(page.rect.height))
+            for page in source
+        ]
+        expected_next_page = 1
+        for chunk, chunk_pdf in ordered:
+            if chunk.start_page != expected_next_page:
+                raise RuntimeError(
+                    "OCR chunks are not contiguous: "
+                    f"expected page {expected_next_page}, got {chunk.start_page}."
+                )
+            expected_pages = chunk.end_page - chunk.start_page + 1
+            chunk_document = fitz.open(str(chunk_pdf))
+            try:
+                if int(chunk_document.page_count) != expected_pages:
+                    raise RuntimeError(
+                        f"OCR chunk {chunk.index} has {chunk_document.page_count} pages; "
+                        f"expected {expected_pages}."
+                    )
+                for local_index, page in enumerate(chunk_document):
+                    source_index = chunk.start_page - 1 + local_index
+                    expected_width, expected_height = source_sizes[source_index]
+                    if (
+                        abs(float(page.rect.width) - expected_width) > 0.5
+                        or abs(float(page.rect.height) - expected_height) > 0.5
+                    ):
+                        raise RuntimeError(
+                            "OCR chunk page size changed for source page "
+                            f"{source_index + 1}."
+                        )
+                merged.insert_pdf(chunk_document, links=True, annots=True)
+            finally:
+                chunk_document.close()
+            expected_next_page = chunk.end_page + 1
+
+        if expected_next_page - 1 != len(source_sizes):
+            raise RuntimeError(
+                f"OCR chunks cover {expected_next_page - 1} of {len(source_sizes)} pages."
+            )
+        metadata = {
+            key: str(value)
+            for key, value in dict(source.metadata or {}).items()
+            if value not in {None, ""}
+        }
+        if metadata:
+            merged.set_metadata(metadata)
+        try:
+            toc = source.get_toc(simple=True)
+            if toc:
+                merged.set_toc(toc)
+        except Exception:
+            pass
+        output_pdf.parent.mkdir(parents=True, exist_ok=True)
+        merged.save(str(temporary), garbage=4, deflate=True)
+    finally:
+        source.close()
+        merged.close()
+
+    try:
+        verification = fitz.open(str(temporary))
+        try:
+            if int(verification.page_count) != expected_next_page - 1:
+                raise RuntimeError(
+                    f"Merged OCR PDF has {verification.page_count} pages; "
+                    f"expected {expected_next_page - 1}."
+                )
+        finally:
+            verification.close()
+        os.replace(temporary, output_pdf)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return output_pdf
+
+
+def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def run_basic_ocr_benchmark(
     *,
     pdf_path: Path,
@@ -533,6 +725,37 @@ def build_searchable_pdf(
         input_path = staged_dir / "input.pdf"
         input_path.write_bytes(pdf_bytes)
 
+    chunk_pages = _resolve_hybrid_chunk_pages()
+    if (
+        normalized_mode == PDF_MODE_HYBRID
+        and page_numbers is None
+        and chunk_pages > 0
+    ):
+        page_count = _pdf_page_count(input_path)
+        if page_count > chunk_pages:
+            if return_bytes is None:
+                need_bytes = pdf_bytes is not None
+            else:
+                need_bytes = bool(return_bytes)
+            overwrite_target = (
+                input_path
+                if pdf_path is not None and overwrite_input_path
+                else None
+            )
+            return _build_searchable_pdf_chunked(
+                input_path=input_path,
+                mode=normalized_mode,
+                lang=lang,
+                work_root=resolved_work_root,
+                overwrite_target=overwrite_target,
+                return_bytes=need_bytes,
+                strict=strict,
+                progress=progress,
+                delete_original_text_layer=delete_original_text_layer,
+                chunk_pages=chunk_pages,
+                page_count=page_count,
+            )
+
     processing_input_path = input_path
     source_pdf_root = input_path.parent
     if delete_original_text_layer:
@@ -633,6 +856,200 @@ def build_searchable_pdf(
             (max(0, int(result.page_error_count)) for result in benchmark.results),
             default=0,
         ),
+    )
+
+
+def _build_searchable_pdf_chunked(
+    *,
+    input_path: Path,
+    mode: str,
+    lang: str,
+    work_root: Path,
+    overwrite_target: Path | None,
+    return_bytes: bool,
+    strict: bool,
+    progress: ProgressCallback | None,
+    delete_original_text_layer: bool,
+    chunk_pages: int,
+    page_count: int,
+) -> SearchablePdfSummary:
+    run_dir = (
+        work_root
+        / (
+            f"hybrid_chunks_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+            f"{uuid.uuid4().hex[:8]}"
+        )
+    ).resolve()
+    input_chunks = _split_pdf_chunks(
+        source_pdf=input_path,
+        output_root=run_dir / "input_chunks",
+        pages_per_chunk=chunk_pages,
+    )
+    if not input_chunks:
+        raise RuntimeError(f"No PDF chunks were produced for {input_path}.")
+
+    manifest_path = run_dir / "chunk_manifest.json"
+    manifest_chunks: list[dict[str, object]] = [
+        {
+            "index": chunk.index,
+            "start_page": chunk.start_page,
+            "end_page": chunk.end_page,
+            "input_pdf": str(chunk.path),
+            "status": "pending",
+        }
+        for chunk in input_chunks
+    ]
+    manifest: dict[str, object] = {
+        "status": "running",
+        "source_pdf": str(input_path),
+        "mode": mode,
+        "page_count": page_count,
+        "chunk_pages": chunk_pages,
+        "chunk_count": len(input_chunks),
+        "chunks": manifest_chunks,
+    }
+    _write_json_atomic(manifest_path, manifest)
+
+    chunk_outputs: list[tuple[_PdfChunk, Path]] = []
+    benchmark_results: list[OcrBenchmarkResult] = []
+    benchmark_files: list[Path] = []
+    benchmark_failures: list[str] = []
+    benchmark_skips: list[str] = []
+    compare_results: list[CompareTxtBuildResult] = []
+    artifact_results: list[ArtifactSearchableResult] = []
+    partial_page_failures = 0
+    total_chunks = len(input_chunks)
+    _emit_progress(
+        progress,
+        0,
+        f"Preparing {total_chunks} hybrid OCR chunks ({chunk_pages} pages each)...",
+    )
+
+    for chunk, record in zip(input_chunks, manifest_chunks, strict=True):
+        start_percent = 1 + int(((chunk.index - 1) / total_chunks) * 94)
+        end_percent = 1 + int((chunk.index / total_chunks) * 94)
+
+        def _chunk_progress(
+            value: int,
+            status: str,
+            *,
+            start: int = start_percent,
+            end: int = end_percent,
+            label: str = (
+                f"chunk {chunk.index}/{total_chunks} "
+                f"pages {chunk.start_page}-{chunk.end_page}"
+            ),
+        ) -> None:
+            bounded = max(0, min(100, int(value)))
+            mapped = start + int((bounded / 100.0) * max(0, end - start))
+            _emit_progress(progress, mapped, f"Hybrid OCR {label}: {status}")
+
+        record["status"] = "running"
+        _write_json_atomic(manifest_path, manifest)
+        try:
+            with _temporary_env("UNISCAN_HYBRID_CHUNK_PAGES", "0"):
+                summary = build_searchable_pdf(
+                    pdf_path=chunk.path,
+                    mode=mode,
+                    lang=lang,
+                    page_numbers=None,
+                    work_root=run_dir / "chunk_runs" / f"chunk_{chunk.index:04d}",
+                    overwrite_input_path=False,
+                    return_bytes=False,
+                    strict=strict,
+                    progress=_chunk_progress,
+                    delete_original_text_layer=delete_original_text_layer,
+                )
+            if not summary.output_pdf_path.exists():
+                raise RuntimeError(
+                    f"Chunk output is missing: {summary.output_pdf_path}"
+                )
+        except Exception as exc:
+            record["status"] = "error"
+            record["error"] = str(exc)
+            manifest["status"] = "error"
+            manifest["failed_chunk"] = chunk.index
+            _write_json_atomic(manifest_path, manifest)
+            raise RuntimeError(
+                f"Hybrid OCR chunk {chunk.index}/{total_chunks} failed "
+                f"for pages {chunk.start_page}-{chunk.end_page}: {exc}"
+            ) from exc
+
+        record.update(
+            {
+                "status": "done",
+                "run_dir": str(summary.run_dir),
+                "output_pdf": str(summary.output_pdf_path),
+                "partial_page_failures": summary.partial_page_failures,
+            }
+        )
+        _write_json_atomic(manifest_path, manifest)
+        chunk_outputs.append((chunk, summary.output_pdf_path))
+        partial_page_failures += max(0, int(summary.partial_page_failures))
+        benchmark_results.extend(
+            replace(
+                result,
+                sample_pages=[
+                    chunk.start_page + int(page) - 1
+                    for page in result.sample_pages
+                ],
+            )
+            for result in summary.benchmark.results
+        )
+        benchmark_files.extend(summary.benchmark.result_files)
+        benchmark_failures.extend(
+            f"chunk {chunk.index}: {item}"
+            for item in summary.benchmark.failed_engines
+        )
+        benchmark_skips.extend(
+            f"chunk {chunk.index}: {item}"
+            for item in summary.benchmark.skipped_engines
+        )
+        compare_results.extend(summary.compare_results)
+        artifact_results.extend(summary.artifact_results)
+
+    _emit_progress(progress, 97, "Merging hybrid OCR chunks...")
+    merged_pdf = _merge_pdf_chunks(
+        source_pdf=input_path,
+        chunks=chunk_outputs,
+        output_pdf=run_dir / "searchable_pdf_final" / f"{input_path.stem}_searchable.pdf",
+    )
+    final_pdf_path = merged_pdf
+    overwritten_path: Path | None = None
+    if overwrite_target is not None:
+        _atomic_copy_file(merged_pdf, overwrite_target)
+        final_pdf_path = overwrite_target
+        overwritten_path = overwrite_target
+
+    output_bytes = final_pdf_path.read_bytes() if return_bytes else None
+    compare_dir = run_dir / "_compare_txt"
+    compare_dir.mkdir(parents=True, exist_ok=True)
+    benchmark = BasicOcrRunSummary(
+        run_dir=run_dir,
+        results=tuple(benchmark_results),
+        result_files=tuple(benchmark_files),
+        failed_engines=tuple(benchmark_failures),
+        skipped_engines=tuple(benchmark_skips),
+    )
+    manifest["status"] = "done"
+    manifest["output_pdf"] = str(merged_pdf)
+    manifest["partial_page_failures"] = partial_page_failures
+    _write_json_atomic(manifest_path, manifest)
+    _emit_progress(progress, 100, "Done")
+    return SearchablePdfSummary(
+        mode=mode,
+        run_dir=run_dir,
+        compare_dir=compare_dir,
+        output_pdf_path=final_pdf_path,
+        output_pdf_bytes=output_bytes,
+        overwritten_input_path=overwritten_path,
+        benchmark=benchmark,
+        compare_results=tuple(compare_results),
+        artifact_results=tuple(artifact_results),
+        partial_page_failures=partial_page_failures,
+        chunk_count=total_chunks,
+        chunk_pages=chunk_pages,
+        chunk_manifest_path=manifest_path,
     )
 
 

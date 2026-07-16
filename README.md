@@ -206,6 +206,15 @@ $env:UNISCAN_SURYA_REQUIRE_GPU = "1"
   --strict
 ```
 
+Full-document hybrid OCR is isolated into 10-page PDF chunks by default. Each
+chunk completes both Chandra recognition and Surya geometry before its searchable
+PDF is accepted. The service then merges the chunks and verifies contiguous page
+coverage, page count, order, and page dimensions. This bounds Surya input size,
+releases engine subprocess VRAM between chunks, and applies the engine timeout to
+one chunk instead of the whole document. Set `UNISCAN_HYBRID_CHUNK_PAGES` to a
+different positive value to tune the tradeoff. `0` disables document chunking for
+diagnostics. Explicit `pages=` selections keep the existing non-chunked path.
+
 Useful commands:
 
 ```powershell
@@ -420,6 +429,8 @@ If a model download is interrupted, deleting the incomplete cache for that engin
 
 `chandra+surya`:
 The default. Chandra provides text, Surya provides geometry. Best target for searchable PDFs when both engines are available.
+Zotero production jobs always use this mode. Large documents remain hybrid and
+use the chunking contract described above.
 
 `chandra`:
 Uses Chandra text and Chandra geometry. Useful when Surya is unavailable or for comparison.
