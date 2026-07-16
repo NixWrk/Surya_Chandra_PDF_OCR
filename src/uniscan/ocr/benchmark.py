@@ -16,6 +16,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Sequence
 
+from PIL import Image
+
 from uniscan.io import imwrite_unicode, iter_render_pdf_page_indices
 
 from .engine import (
@@ -58,6 +60,25 @@ def _read_utf8_artifact(path: Path) -> str:
             f"OCR text artifact exceeds {_MAX_OCR_TEXT_ARTIFACT_BYTES} bytes: {path}"
         )
     return payload.decode("utf-8-sig")
+
+
+def _is_effectively_blank_page_image(path: Path) -> bool:
+    try:
+        with Image.open(path) as source:
+            grayscale = source.convert("L")
+            grayscale.thumbnail((1024, 1024))
+            histogram = grayscale.histogram()
+    except OSError:
+        return False
+    pixels = int(sum(histogram))
+    if pixels <= 0:
+        return False
+    nonwhite = int(sum(histogram[:245]))
+    dark = int(sum(histogram[:200]))
+    return bool(
+        nonwhite <= max(8, int(pixels * 0.0005))
+        and dark <= max(2, int(pixels * 0.00005))
+    )
 
 
 @dataclass(slots=True)
@@ -772,6 +793,8 @@ def _write_pagewise_text_artifacts(
             "text_chars": chars,
         }
         page_meta = metadata_by_page.get(source_page, {})
+        if page_meta.get("blank_page") is True:
+            page_info["blank_page"] = True
         sidecar_specs = (
             ("surya_page_lines_path", "surya_text_lines", "surya"),
             ("chandra_page_lines_path", "chandra_text_lines", "chandra"),
@@ -906,17 +929,28 @@ def _collect_chandra_batch_outputs(
             )
 
         if image_payload is None or not text_lines:
-            page_errors.append(
-                {
-                    "source_page": source_page,
-                    "image": str(image_path),
-                    "error": (
-                        "Chandra geometry sidecar has no image entry"
-                        if image_payload is None
-                        else "Chandra geometry sidecar has no text_lines"
-                    ),
-                }
-            )
+            if _is_effectively_blank_page_image(image_path):
+                if image_payload is not None and page_metadata:
+                    page_metadata[-1]["blank_page"] = True
+                else:
+                    page_metadata.append(
+                        {
+                            "source_page": source_page,
+                            "blank_page": True,
+                        }
+                    )
+            else:
+                page_errors.append(
+                    {
+                        "source_page": source_page,
+                        "image": str(image_path),
+                        "error": (
+                            "Chandra geometry sidecar has no image entry"
+                            if image_payload is None
+                            else "Chandra geometry sidecar has no text_lines"
+                        ),
+                    }
+                )
 
         page_text = "\n".join(_dehyphenate_line_breaks(text_lines))
         page_texts.append(page_text)
@@ -973,13 +1007,24 @@ def _collect_surya_batch_outputs(
         page_texts.append(page_text)
         total_chars += len(page_text)
         if not text_lines or not isinstance(image_payload, dict):
-            page_errors.append(
-                {
-                    "source_page": source_page,
-                    "image": str(image_path),
-                    "error": f"Surya geometry sidecar has no text_lines for source page {source_page}",
-                }
-            )
+            if _is_effectively_blank_page_image(image_path):
+                page_metadata.append(
+                    {
+                        "source_page": source_page,
+                        "blank_page": True,
+                    }
+                )
+            else:
+                page_errors.append(
+                    {
+                        "source_page": source_page,
+                        "image": str(image_path),
+                        "error": (
+                            "Surya geometry sidecar has no text_lines "
+                            f"for source page {source_page}"
+                        ),
+                    }
+                )
             continue
 
         per_page_image_payload = dict(image_payload)

@@ -9,6 +9,7 @@ from types import ModuleType
 
 import numpy as np
 import pytest
+from PIL import Image
 
 import uniscan.ocr.benchmark as ocr_benchmark_mod
 from uniscan.cli import main
@@ -644,6 +645,91 @@ def test_run_extraction_engine_pagewise_requires_surya_sidecar_by_default(tmp_pa
             which_fn=lambda _name: None,
             run_cmd=lambda *_args, **_kwargs: None,
         )
+
+
+def test_run_extraction_engine_pagewise_accepts_blank_surya_page(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    image_paths = [tmp_path / "p1.png", tmp_path / "p2.png"]
+    for image_path in image_paths:
+        Image.new("RGB", (200, 300), "white").save(image_path)
+
+    def fake_surya_direct(_image_paths, *, lang, work_dir, which_fn, run_cmd):
+        sidecar = work_dir / "surya_page_lines.json"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "images": [
+                        {
+                            "image_name": "0001_p1.png",
+                            "pages": [
+                                {
+                                    "image_bbox": [0, 0, 200, 300],
+                                    "text_lines": [
+                                        {
+                                            "text": "page-1",
+                                            "bbox": [10, 10, 100, 30],
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                        {
+                            "image_name": "0002_p2.png",
+                            "pages": [
+                                {
+                                    "image_bbox": [0, 0, 200, 300],
+                                    "text_lines": [],
+                                }
+                            ],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return "aggregate", 9
+
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_surya_direct", fake_surya_direct)
+    monkeypatch.delenv("UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON", raising=False)
+    progress_steps: list[tuple[int, int, int]] = []
+
+    page_texts, chars, page_errors, page_metadata = (
+        ocr_benchmark_mod._run_extraction_engine_pagewise(
+            OCR_ENGINE_SURYA,
+            image_paths,
+            source_pages_1based=[1, 2],
+            lang="rus",
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: None,
+            run_cmd=lambda *_args, **_kwargs: None,
+            progress_cb=lambda done, total, source_page: progress_steps.append(
+                (done, total, source_page)
+            ),
+        )
+    )
+
+    assert page_texts == ["page-1", ""]
+    assert chars == len("page-1")
+    assert page_errors == []
+    assert page_metadata[1] == {"source_page": 2, "blank_page": True}
+    assert progress_steps == [(1, 2, 1), (2, 2, 2)]
+
+    pdf_path = tmp_path / "fixture.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+    _, pages_json_path = ocr_benchmark_mod._write_pagewise_text_artifacts(
+        output_dir=tmp_path / "out",
+        engine=OCR_ENGINE_SURYA,
+        pdf_path=pdf_path,
+        source_pages_1based=[1, 2],
+        page_texts=page_texts,
+        aggregate_path=tmp_path / "out" / "fixture_surya.txt",
+        page_metadata=page_metadata,
+    )
+    pages_payload = json.loads(pages_json_path.read_text(encoding="utf-8"))
+    assert pages_payload["pages"][1]["blank_page"] is True
 
 
 def test_run_extraction_engine_pagewise_reports_missing_surya_page_geometry(
