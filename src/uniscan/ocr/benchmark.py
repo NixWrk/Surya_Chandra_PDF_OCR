@@ -1933,7 +1933,8 @@ def _run_chandra_module(
                         if line:
                             page_texts.append(line)
 
-        if not page_texts:
+        blank_page = not page_texts and _is_effectively_blank_page_image(image_path)
+        if not page_texts and not blank_page:
             raise RuntimeError(f"Chandra OCR produced no text for {image_path.name}.")
 
         if not page_lines and page_texts:
@@ -1947,7 +1948,7 @@ def _run_chandra_module(
             )
 
         collected.append("\n".join(page_texts))
-        if page_lines:
+        if page_lines or blank_page:
             sidecar_images.append(
                 {
                     "image_name": image_path.name,

@@ -1240,6 +1240,71 @@ def test_chandra_expand_chunk_to_line_boxes_splits_rows() -> None:
     assert any("TAIL LINE" in str(item["text"]) for item in placements)
 
 
+def test_run_chandra_module_accepts_verified_blank_page(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "blank.png"
+    Image.new("RGB", (200, 300), "white").save(image_path)
+    progress_steps: list[tuple[int, int]] = []
+
+    class FakeInferenceManager:
+        def __init__(self, *, method: str) -> None:
+            assert method == "hf"
+
+        def generate(
+            self,
+            _batch,
+            *,
+            include_images: bool,
+            include_headers_footers: bool,
+        ):
+            assert include_images is False
+            assert include_headers_footers is False
+            return [
+                SimpleNamespace(
+                    chunks=[{"label": "blank-page", "content": ""}],
+                    markdown="",
+                )
+            ]
+
+    model_module = ModuleType("chandra.model")
+    model_module.InferenceManager = FakeInferenceManager
+    schema_module = ModuleType("chandra.model.schema")
+    schema_module.BatchInputItem = lambda **kwargs: kwargs
+    input_module = ModuleType("chandra.input")
+    input_module.load_image = lambda _path: Image.new("RGB", (200, 300), "white")
+    chandra_module = ModuleType("chandra")
+    chandra_module.model = model_module
+
+    monkeypatch.setitem(sys.modules, "chandra", chandra_module)
+    monkeypatch.setitem(sys.modules, "chandra.model", model_module)
+    monkeypatch.setitem(sys.modules, "chandra.model.schema", schema_module)
+    monkeypatch.setitem(sys.modules, "chandra.input", input_module)
+    monkeypatch.setattr(ocr_benchmark_mod, "_ensure_chandra_cache_ready", lambda: None)
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_configure_chandra_runtime_device",
+        lambda: "cuda:0",
+    )
+    monkeypatch.setenv("UNISCAN_CHANDRA_REQUIRE_GPU", "0")
+
+    text, chars = ocr_benchmark_mod._run_chandra_module(
+        [image_path],
+        lang="rus",
+        work_dir=tmp_path / "work",
+        page_progress_cb=lambda done, total: progress_steps.append((done, total)),
+    )
+
+    assert text == ""
+    assert chars == 0
+    assert progress_steps == [(1, 1)]
+    sidecar = json.loads(
+        (tmp_path / "work" / "chandra_page_lines.json").read_text(encoding="utf-8")
+    )
+    assert sidecar["images"][0]["pages"][0]["text_lines"] == []
+
+
 def test_run_chandra_direct_disables_cli_fallback_by_default(monkeypatch, tmp_path: Path) -> None:
     image_path = tmp_path / "p1.png"
     image_path.write_bytes(b"img")
