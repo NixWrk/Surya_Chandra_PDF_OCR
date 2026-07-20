@@ -91,6 +91,19 @@ def test_hybrid_chunk_pages_defaults_to_ten_and_can_be_disabled(
     assert ocr_pipeline._resolve_hybrid_chunk_pages() == 10
 
 
+def test_production_pdf_mode_rejects_single_engine_modes() -> None:
+    assert ocr_pipeline.normalize_pdf_mode(None) == "chandra+surya"
+    assert ocr_pipeline.normalize_pdf_mode("chandra surya") == "chandra+surya"
+    for mode in ("chandra", "surya"):
+        with pytest.raises(ValueError, match="requires chandra\\+surya"):
+            ocr_pipeline.normalize_pdf_mode(mode)
+
+
+def test_production_pdf_pipeline_rejects_non_strict_execution() -> None:
+    with pytest.raises(ValueError, match="strict cannot be disabled"):
+        build_searchable_pdf(pdf_bytes=b"not-opened", strict=False)
+
+
 def test_split_and_merge_pdf_chunks_preserves_page_order_and_sizes() -> None:
     import fitz
 
@@ -104,10 +117,7 @@ def test_split_and_merge_pdf_chunks_preserves_page_order_and_sizes() -> None:
         pages_per_chunk=10,
     )
 
-    assert [
-        (chunk.start_page, chunk.end_page)
-        for chunk in chunks
-    ] == [(1, 10), (11, 20), (21, 23)]
+    assert [(chunk.start_page, chunk.end_page) for chunk in chunks] == [(1, 10), (11, 20), (21, 23)]
 
     merged_pdf = ocr_pipeline._merge_pdf_chunks(
         source_pdf=source_pdf,
@@ -185,9 +195,7 @@ def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
             output_pdf_bytes=None,
             overwritten_input_path=None,
             benchmark=benchmark,
-            compare_results=(
-                _ok_compare_result("chandra", compare_dir / "chunk__chandra.txt"),
-            ),
+            compare_results=(_ok_compare_result("chandra", compare_dir / "chunk__chandra.txt"),),
             artifact_results=(_ok_artifact_result(output_pdf, engine="chandra"),),
         )
 
@@ -240,6 +248,102 @@ def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
     manifest = json.loads(summary.chunk_manifest_path.read_text(encoding="utf-8"))
     assert manifest["status"] == "done"
     assert [item["status"] for item in manifest["chunks"]] == ["done", "done", "done"]
+    assert manifest["schema"] == "uniscan.hybrid-chunks.v2"
+    assert all(item["output_sha256"] for item in manifest["chunks"])
+
+    calls_before_resume = len(calls)
+    progress_values.clear()
+    resumed = ocr_pipeline._build_searchable_pdf_chunked(
+        input_path=source_pdf,
+        mode="chandra+surya",
+        lang="rus+eng",
+        work_root=tmp_path / "work",
+        overwrite_target=None,
+        return_bytes=True,
+        strict=True,
+        progress=lambda value, _status: progress_values.append(value),
+        delete_original_text_layer=True,
+        chunk_pages=10,
+        page_count=23,
+    )
+
+    assert len(calls) == calls_before_resume
+    assert resumed.run_dir == summary.run_dir
+    assert progress_values == sorted(progress_values)
+    resumed_manifest = json.loads(resumed.chunk_manifest_path.read_text(encoding="utf-8"))
+    assert resumed_manifest["resume_count"] == 1
+    assert [item["reused"] for item in resumed_manifest["chunks"]] == [True, True, True]
+
+    first_output = Path(str(resumed_manifest["chunks"][0]["output_pdf"]))
+    first_output.write_bytes(b"tampered")
+    repaired = ocr_pipeline._build_searchable_pdf_chunked(
+        input_path=source_pdf,
+        mode="chandra+surya",
+        lang="rus+eng",
+        work_root=tmp_path / "work",
+        overwrite_target=None,
+        return_bytes=False,
+        strict=True,
+        progress=None,
+        delete_original_text_layer=True,
+        chunk_pages=10,
+        page_count=23,
+    )
+
+    assert len(calls) == calls_before_resume + 1
+    repaired_manifest = json.loads(repaired.chunk_manifest_path.read_text(encoding="utf-8"))
+    assert [item["reused"] for item in repaired_manifest["chunks"]] == [False, True, True]
+
+    repaired.chunk_manifest_path.write_text("{broken", encoding="utf-8")
+    recovered = ocr_pipeline._build_searchable_pdf_chunked(
+        input_path=source_pdf,
+        mode="chandra+surya",
+        lang="rus+eng",
+        work_root=tmp_path / "work",
+        overwrite_target=None,
+        return_bytes=False,
+        strict=True,
+        progress=None,
+        delete_original_text_layer=True,
+        chunk_pages=10,
+        page_count=23,
+    )
+
+    assert len(calls) == calls_before_resume + 4
+    recovered_manifest = json.loads(
+        recovered.chunk_manifest_path.read_text(encoding="utf-8")
+    )
+    assert "ignored unreadable manifest" in recovered_manifest["recovery_reason"]
+    assert [item["reused"] for item in recovered_manifest["chunks"]] == [
+        False,
+        False,
+        False,
+    ]
+
+    changed_pdf = source_pdf.with_name("changed.pdf")
+    changed = fitz.open(str(source_pdf))
+    try:
+        changed[0].insert_text((72, 110), "SOURCE CONTENT CHANGED")
+        changed.save(str(changed_pdf))
+    finally:
+        changed.close()
+    os.replace(changed_pdf, source_pdf)
+    changed_summary = ocr_pipeline._build_searchable_pdf_chunked(
+        input_path=source_pdf,
+        mode="chandra+surya",
+        lang="rus+eng",
+        work_root=tmp_path / "work",
+        overwrite_target=None,
+        return_bytes=False,
+        strict=True,
+        progress=None,
+        delete_original_text_layer=True,
+        chunk_pages=10,
+        page_count=23,
+    )
+
+    assert len(calls) == calls_before_resume + 7
+    assert changed_summary.run_dir != recovered.run_dir
 
 
 def test_chunked_hybrid_pipeline_records_failed_page_range(
@@ -294,7 +398,9 @@ def test_chunked_hybrid_pipeline_records_failed_page_range(
             chunk_pages=10,
             page_count=21,
         )
-    manifest_path = next((tmp_path / "failed_work").glob("hybrid_chunks_*/chunk_manifest.json"))
+    manifest_path = next(
+        (tmp_path / "failed_work").glob("hybrid_chunk_cache/hybrid_*/chunk_manifest.json")
+    )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["status"] == "error"
     assert manifest["failed_chunk"] == 2
@@ -303,6 +409,31 @@ def test_chunked_hybrid_pipeline_records_failed_page_range(
     assert manifest["chunks"][1]["end_page"] == 20
     first_output = Path(str(manifest["chunks"][0]["output_pdf"]))
     assert first_output.is_file()
+
+    resumed = ocr_pipeline._build_searchable_pdf_chunked(
+        input_path=source_pdf,
+        mode="chandra+surya",
+        lang="rus+eng",
+        work_root=tmp_path / "failed_work",
+        overwrite_target=None,
+        return_bytes=False,
+        strict=True,
+        progress=None,
+        delete_original_text_layer=True,
+        chunk_pages=10,
+        page_count=21,
+    )
+
+    assert attempts == 4
+    assert resumed.chunk_manifest_path == manifest_path
+    resumed_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert resumed_manifest["status"] == "done"
+    assert resumed_manifest["resume_count"] == 1
+    assert [item["reused"] for item in resumed_manifest["chunks"]] == [
+        True,
+        False,
+        False,
+    ]
 
 
 def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
@@ -364,9 +495,13 @@ def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
         return [_ok_artifact_result(produced_pdf, engine="chandra")]
 
     monkeypatch.setattr(ocr_pipeline, "run_basic_ocr_benchmark", fake_run_basic_ocr_benchmark)
-    monkeypatch.setattr(ocr_pipeline, "build_compare_txt_from_benchmark", fake_build_compare_txt_from_benchmark)
+    monkeypatch.setattr(
+        ocr_pipeline, "build_compare_txt_from_benchmark", fake_build_compare_txt_from_benchmark
+    )
     monkeypatch.setattr(ocr_pipeline, "_build_textless_source_pdf", fake_build_textless_source_pdf)
-    monkeypatch.setattr(ocr_pipeline, "run_artifact_searchable_package", fake_run_artifact_searchable_package)
+    monkeypatch.setattr(
+        ocr_pipeline, "run_artifact_searchable_package", fake_run_artifact_searchable_package
+    )
     monkeypatch.setattr(ocr_pipeline, "_pdf_page_count", lambda _path: 1)
 
     summary = build_searchable_pdf(
@@ -435,29 +570,36 @@ def test_build_searchable_pdf_from_bytes_returns_bytes(monkeypatch) -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
         return BasicOcrRunSummary(
             run_dir=run_dir,
-            results=(_ok_benchmark_result("surya"),),
+            results=(_ok_benchmark_result("chandra"), _ok_benchmark_result("surya")),
             result_files=tuple(),
             failed_engines=tuple(),
             skipped_engines=tuple(),
         )
 
     def fake_build_compare_txt_from_benchmark(**_kwargs):
-        return [_ok_compare_result("surya", tmp_path / "doc__surya.txt")]
+        return [_ok_compare_result("chandra", tmp_path / "doc__chandra.txt")]
 
     def fake_run_artifact_searchable_package(**kwargs):
-        assert kwargs["engines"] == ("surya",)
+        assert kwargs["engines"] == ("chandra",)
         assert kwargs["pdf_root"] == seen_textless_path["value"].parent
-        assert os.environ.get("UNISCAN_CHANDRA_GEOMETRY_DIR") is None
-        return [_ok_artifact_result(produced_pdf, engine="surya")]
+        assert os.environ.get("UNISCAN_CHANDRA_GEOMETRY_DIR") == str(
+            tmp_path / "inline_run" / "surya"
+        )
+        return [_ok_artifact_result(produced_pdf, engine="chandra")]
 
     monkeypatch.setattr(ocr_pipeline, "run_basic_ocr_benchmark", fake_run_basic_ocr_benchmark)
-    monkeypatch.setattr(ocr_pipeline, "build_compare_txt_from_benchmark", fake_build_compare_txt_from_benchmark)
+    monkeypatch.setattr(
+        ocr_pipeline, "build_compare_txt_from_benchmark", fake_build_compare_txt_from_benchmark
+    )
     monkeypatch.setattr(ocr_pipeline, "_build_textless_source_pdf", fake_build_textless_source_pdf)
-    monkeypatch.setattr(ocr_pipeline, "run_artifact_searchable_package", fake_run_artifact_searchable_package)
+    monkeypatch.setattr(
+        ocr_pipeline, "run_artifact_searchable_package", fake_run_artifact_searchable_package
+    )
+    monkeypatch.setattr(ocr_pipeline, "_pdf_page_count", lambda _path: 1)
 
     summary = build_searchable_pdf(
         pdf_bytes=b"INLINE-PDF",
-        mode="surya",
+        mode="chandra+surya",
         work_root=tmp_path / "work_inline",
         overwrite_input_path=False,
         return_bytes=True,
@@ -465,7 +607,7 @@ def test_build_searchable_pdf_from_bytes_returns_bytes(monkeypatch) -> None:
     )
 
     assert isinstance(summary, SearchablePdfSummary)
-    assert summary.mode == "surya"
+    assert summary.mode == "chandra+surya"
     assert summary.overwritten_input_path is None
     assert summary.output_pdf_bytes == b"PDF-BYTES-RESULT"
     assert summary.output_pdf_path == produced_pdf
@@ -487,14 +629,14 @@ def test_build_searchable_pdf_uses_textless_source_when_delete_enabled(monkeypat
         assert kwargs["pdf_path"] == seen["textless_pdf"]
         return BasicOcrRunSummary(
             run_dir=run_dir,
-            results=(_ok_benchmark_result("surya"),),
+            results=(_ok_benchmark_result("chandra"), _ok_benchmark_result("surya")),
             result_files=tuple(),
             failed_engines=tuple(),
             skipped_engines=tuple(),
         )
 
     def fake_build_compare_txt_from_benchmark(**_kwargs):
-        return [_ok_compare_result("surya", run_dir / "_compare_txt" / "doc__surya.txt")]
+        return [_ok_compare_result("chandra", run_dir / "_compare_txt" / "doc__chandra.txt")]
 
     def fake_build_textless_source_pdf(*, source_pdf: Path, out_pdf: Path, dpi: int = 300) -> Path:
         assert source_pdf == input_pdf.resolve()
@@ -505,19 +647,25 @@ def test_build_searchable_pdf_uses_textless_source_when_delete_enabled(monkeypat
         return out_pdf
 
     def fake_run_artifact_searchable_package(**kwargs):
-        assert kwargs["engines"] == ("surya",)
+        assert kwargs["engines"] == ("chandra",)
         assert kwargs["pdf_root"] == seen["textless_pdf"].parent
         assert seen["textless_pdf"].exists()
-        return [_ok_artifact_result(produced_pdf, engine="surya")]
+        assert os.environ.get("UNISCAN_CHANDRA_GEOMETRY_DIR") == str(run_dir / "surya")
+        return [_ok_artifact_result(produced_pdf, engine="chandra")]
 
     monkeypatch.setattr(ocr_pipeline, "run_basic_ocr_benchmark", fake_run_basic_ocr_benchmark)
-    monkeypatch.setattr(ocr_pipeline, "build_compare_txt_from_benchmark", fake_build_compare_txt_from_benchmark)
+    monkeypatch.setattr(
+        ocr_pipeline, "build_compare_txt_from_benchmark", fake_build_compare_txt_from_benchmark
+    )
     monkeypatch.setattr(ocr_pipeline, "_build_textless_source_pdf", fake_build_textless_source_pdf)
-    monkeypatch.setattr(ocr_pipeline, "run_artifact_searchable_package", fake_run_artifact_searchable_package)
+    monkeypatch.setattr(
+        ocr_pipeline, "run_artifact_searchable_package", fake_run_artifact_searchable_package
+    )
+    monkeypatch.setattr(ocr_pipeline, "_pdf_page_count", lambda _path: 1)
 
     summary = build_searchable_pdf(
         pdf_path=input_pdf,
-        mode="surya",
+        mode="chandra+surya",
         work_root=tmp_path / "work",
         overwrite_input_path=True,
         return_bytes=False,
@@ -526,7 +674,7 @@ def test_build_searchable_pdf_uses_textless_source_when_delete_enabled(monkeypat
     )
 
     assert isinstance(summary, SearchablePdfSummary)
-    assert summary.mode == "surya"
+    assert summary.mode == "chandra+surya"
     assert summary.overwritten_input_path == input_pdf.resolve()
     assert summary.output_pdf_path == input_pdf.resolve()
     assert input_pdf.read_bytes() == b"SEARCHABLE"
@@ -565,7 +713,7 @@ def test_build_searchable_pdf_reports_monotonic_progress(monkeypatch) -> None:
         callback(100, "complete")
         return BasicOcrRunSummary(
             run_dir=run_dir,
-            results=(_ok_benchmark_result("surya"),),
+            results=(_ok_benchmark_result("chandra"), _ok_benchmark_result("surya")),
             result_files=tuple(),
             failed_engines=tuple(),
             skipped_engines=tuple(),
@@ -575,17 +723,18 @@ def test_build_searchable_pdf_reports_monotonic_progress(monkeypatch) -> None:
     monkeypatch.setattr(
         ocr_pipeline,
         "build_compare_txt_from_benchmark",
-        lambda **_kwargs: [_ok_compare_result("surya", tmp_path / "doc__surya.txt")],
+        lambda **_kwargs: [_ok_compare_result("chandra", tmp_path / "doc__chandra.txt")],
     )
     monkeypatch.setattr(
         ocr_pipeline,
         "run_artifact_searchable_package",
-        lambda **_kwargs: [_ok_artifact_result(produced_pdf, engine="surya")],
+        lambda **_kwargs: [_ok_artifact_result(produced_pdf, engine="chandra")],
     )
+    monkeypatch.setattr(ocr_pipeline, "_pdf_page_count", lambda _path: 1)
 
     build_searchable_pdf(
         pdf_path=input_pdf,
-        mode="surya",
+        mode="chandra+surya",
         work_root=tmp_path / "work",
         overwrite_input_path=False,
         return_bytes=False,

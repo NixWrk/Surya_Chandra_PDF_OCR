@@ -9,9 +9,7 @@ import tkinter as tk
 
 from uniscan.app import (
     DEFAULT_BASIC_GUI_LANG,
-    PDF_MODE_CHANDRA,
     PDF_MODE_HYBRID,
-    PDF_MODE_SURYA,
     SearchablePdfSummary,
     build_searchable_pdf,
     parse_page_numbers,
@@ -20,9 +18,7 @@ from uniscan.app import (
 
 DEFAULT_LANG = DEFAULT_BASIC_GUI_LANG
 MODE_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("Chandra + Surya (default)", PDF_MODE_HYBRID),
-    ("Chandra", PDF_MODE_CHANDRA),
-    ("Surya", PDF_MODE_SURYA),
+    ("Chandra + Surya", PDF_MODE_HYBRID),
 )
 
 

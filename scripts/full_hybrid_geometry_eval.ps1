@@ -184,32 +184,40 @@ foreach ($doc in $docs) {
     $docOut = Join-Path $outputRootResolved $tag
     New-Item -ItemType Directory -Force -Path $docOut | Out-Null
 
-    $suryaNativePdf = Join-Path $docOut "${tag}__surya_native.pdf"
-    $chandraNativePdf = Join-Path $docOut "${tag}__chandra_native.pdf"
-    Copy-Item -LiteralPath $sourcePdf -Destination $suryaNativePdf -Force
-    Copy-Item -LiteralPath $sourcePdf -Destination $chandraNativePdf -Force
+    $suryaRunDir = Join-Path $docOut "_diagnostic_surya"
+    $chandraRunDir = Join-Path $docOut "_diagnostic_chandra"
+    $compareDir = Join-Path $chandraRunDir "_compare_txt"
 
-    $suryaOut = Invoke-UniScan -Step "$tag / surya native" -Args @(
-        "-m", "uniscan", "searchable-pdf",
-        "--pdf", $suryaNativePdf,
-        "--mode", "surya",
+    Invoke-UniScan -Step "$tag / surya geometry diagnostic" -Args @(
+        "-m", "uniscan", "benchmark-ocr",
+        "--pdf", $sourcePdf,
+        "--output", $suryaRunDir,
+        "--engines", "surya",
+        "--sample-size", "999999",
         "--strict"
     ) -LogFile $logFile -PythonExe $pythonResolved
-    $suryaRunDir = Get-RunDirFromOutput -OutputLines $suryaOut -Step "$tag / surya native"
 
-    $chandraOut = Invoke-UniScan -Step "$tag / chandra native" -Args @(
-        "-m", "uniscan", "searchable-pdf",
-        "--pdf", $chandraNativePdf,
-        "--mode", "chandra",
+    Invoke-UniScan -Step "$tag / chandra text diagnostic" -Args @(
+        "-m", "uniscan", "benchmark-ocr",
+        "--pdf", $sourcePdf,
+        "--output", $chandraRunDir,
+        "--engines", "chandra",
+        "--sample-size", "999999",
         "--strict"
     ) -LogFile $logFile -PythonExe $pythonResolved
-    $chandraRunDir = Get-RunDirFromOutput -OutputLines $chandraOut -Step "$tag / chandra native"
+
+    Invoke-UniScan -Step "$tag / prepare chandra text" -Args @(
+        "-m", "uniscan", "prepare-compare-txt",
+        "--benchmark-root", $chandraRunDir,
+        "--output", $compareDir,
+        "--engines", "chandra",
+        "--strict"
+    ) -LogFile $logFile -PythonExe $pythonResolved
 
     $suryaGeometryDir = Join-Path $suryaRunDir "surya"
     if (-not (Test-Path -LiteralPath $suryaGeometryDir)) {
         throw "Surya geometry directory not found: $suryaGeometryDir"
     }
-    $compareDir = Join-Path $chandraRunDir "_compare_txt"
     if (-not (Test-Path -LiteralPath $compareDir)) {
         throw "Chandra compare dir not found: $compareDir"
     }

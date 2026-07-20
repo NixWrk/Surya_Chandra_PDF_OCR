@@ -53,17 +53,15 @@ def test_parse_job_request_defaults() -> None:
 
 
 def test_parse_job_request_applies_filename_extension() -> None:
-    parsed = urlparse(
-        "/api/jobs?mode=surya&pages=1-3&lang=eng&strict=0&filename=my_file"
-    )
+    parsed = urlparse("/api/jobs?mode=chandra+surya&pages=1-3&lang=eng&strict=1&filename=my_file")
     mode, pages_raw, lang, strict, filename, delete_original_text_layer = _parse_job_request(
         parsed,
         default_lang="rus+eng",
     )
-    assert mode == "surya"
+    assert mode == "chandra+surya"
     assert pages_raw == "1-3"
     assert lang == "eng"
-    assert strict is False
+    assert strict is True
     assert filename == "my_file.pdf"
     assert delete_original_text_layer is True
 
@@ -92,9 +90,21 @@ def test_parse_job_request_rejects_disabled_text_layer_cleanup() -> None:
         raise AssertionError("Expected disabled text layer cleanup to be rejected")
 
 
+def test_parse_job_request_rejects_disabled_strict_mode() -> None:
+    parsed = urlparse("/api/jobs?strict=0")
+    try:
+        _parse_job_request(parsed, default_lang="rus+eng")
+    except ValueError as exc:
+        assert "strict cannot be disabled" in str(exc)
+    else:
+        raise AssertionError("Expected disabled strict mode to be rejected")
+
+
 def test_parse_job_request_rejects_invalid_mode_and_language() -> None:
     for path, expected in (
         ("/api/jobs?mode=unknown", "Unsupported mode"),
+        ("/api/jobs?mode=chandra", "requires chandra+surya"),
+        ("/api/jobs?mode=surya", "requires chandra+surya"),
         ("/api/jobs?lang=rus%0aeng", "control characters"),
     ):
         try:
@@ -359,7 +369,9 @@ def test_job_store_reclaims_stale_running_job_by_heartbeat_timeout(tmp_path: Pat
     assert reclaimed == ["STALE"]
     assert metadata is not None
     assert metadata["status"] == "interrupted"
-    assert metadata["error"] == "Recovered stale OCR running job after 60 seconds without heartbeat."
+    assert (
+        metadata["error"] == "Recovered stale OCR running job after 60 seconds without heartbeat."
+    )
     assert metadata["finished_at"]
 
 
@@ -868,7 +880,10 @@ def test_http_job_isolates_and_cleans_pipeline_work(tmp_path: Path, monkeypatch)
             status_response = status_conn.getresponse()
             status_payload = json.loads(status_response.read().decode("utf-8"))
             status_conn.close()
-            if status_payload.get("status") == "done" and not (work_root / "jobs" / job_id / "work").exists():
+            if (
+                status_payload.get("status") == "done"
+                and not (work_root / "jobs" / job_id / "work").exists()
+            ):
                 break
             time.sleep(0.05)
 
@@ -888,17 +903,25 @@ def test_http_job_isolates_and_cleans_pipeline_work(tmp_path: Path, monkeypatch)
 
 def test_http_sync_request_cleans_pipeline_work(tmp_path: Path, monkeypatch) -> None:
     seen_work_roots: list[Path] = []
+    seen_cache_roots: list[Path] = []
 
     def fake_build_searchable_pdf(**kwargs):
         work_root = Path(kwargs["work_root"])
+        cache_root = Path(kwargs["hybrid_chunk_cache_root"])
         seen_work_roots.append(work_root)
-        run_dir = work_root / "run"
+        seen_cache_roots.append(cache_root)
+        run_dir = cache_root / "hybrid_test"
         run_dir.mkdir(parents=True)
+        output_pdf = run_dir / "result.pdf"
+        output_pdf.write_bytes(b"%PDF sync")
+        manifest_path = run_dir / "chunk_manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
         return SimpleNamespace(
             output_pdf_bytes=b"%PDF sync",
-            output_pdf_path=run_dir / "result.pdf",
+            output_pdf_path=output_pdf,
             run_dir=run_dir,
-            mode="surya",
+            mode="chandra+surya",
+            chunk_manifest_path=manifest_path,
         )
 
     monkeypatch.setattr("uniscan.web.service.build_searchable_pdf", fake_build_searchable_pdf)
@@ -912,7 +935,7 @@ def test_http_sync_request_cleans_pipeline_work(tmp_path: Path, monkeypatch) -> 
         conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
         conn.request(
             "POST",
-            "/searchable-pdf?mode=surya",
+            "/searchable-pdf?mode=chandra+surya",
             body=b"%PDF input",
             headers={"Content-Type": "application/pdf"},
         )
@@ -927,6 +950,9 @@ def test_http_sync_request_cleans_pipeline_work(tmp_path: Path, monkeypatch) -> 
         assert len(seen_work_roots) == 1
         assert seen_work_roots[0].parent == work_root / "runs"
         assert not seen_work_roots[0].exists()
+        assert seen_cache_roots == [work_root / "runs" / "hybrid_chunk_cache"]
+        assert seen_cache_roots[0].is_dir()
+        assert not (seen_cache_roots[0] / "hybrid_test").exists()
     finally:
         server.shutdown()
         server.server_close()
@@ -1379,7 +1405,9 @@ def test_http_job_idempotency_rejects_conflicting_request(tmp_path: Path, monkey
         assert first_response.status == HTTPStatus.ACCEPTED
 
         conn = http.client.HTTPConnection("127.0.0.1", port)
-        conn.request("POST", "/api/jobs?mode=surya", body=b"%PDF A", headers=headers)
+        conn.request(
+            "POST", "/api/jobs?mode=chandra+surya&lang=eng", body=b"%PDF A", headers=headers
+        )
         second_response = conn.getresponse()
         second_payload = json.loads(second_response.read().decode("utf-8"))
         conn.close()

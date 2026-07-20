@@ -6,9 +6,7 @@ import argparse
 from pathlib import Path
 
 from uniscan.app import (
-    PDF_MODE_CHANDRA,
     PDF_MODE_HYBRID,
-    PDF_MODE_SURYA,
     build_chandra_geometry_variants,
     build_searchable_pdf,
     parse_page_numbers,
@@ -300,9 +298,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     searchable_pdf_parser.add_argument(
         "--mode",
-        choices=[PDF_MODE_CHANDRA, PDF_MODE_SURYA, PDF_MODE_HYBRID],
+        choices=[PDF_MODE_HYBRID],
         default=PDF_MODE_HYBRID,
-        help="OCR mode. Default: chandra+surya.",
+        help="Production OCR mode: chandra+surya.",
     )
     searchable_pdf_parser.add_argument(
         "--pages",
@@ -314,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         "--lang",
         default="rus+eng",
         help=(
-            "Language hint for legacy/Tesseract-style engines; Surya and Chandra "
+            "Compatibility language hint; production Chandra and Surya "
             "detect language automatically."
         ),
     )
@@ -327,7 +325,8 @@ def main(argv: list[str] | None = None) -> int:
     searchable_pdf_parser.add_argument(
         "--strict",
         action="store_true",
-        help="Return non-zero exit code on any failed stage.",
+        default=True,
+        help="Compatibility flag; production searchable-PDF processing is always strict.",
     )
 
     serve_http_parser = subparsers.add_parser(

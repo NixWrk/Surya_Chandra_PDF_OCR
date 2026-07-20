@@ -5,7 +5,9 @@ It is built around two OCR engines:
 
 1. **Chandra** extracts text.
 2. **Surya** provides page geometry for accurate invisible text placement.
-3. **Hybrid mode** (`chandra+surya`) combines Chandra text with Surya geometry and is the default mode.
+3. **Hybrid mode** (`chandra+surya`) combines Chandra text with Surya geometry.
+
+`chandra+surya` is the only production searchable-PDF mode. Neither Tesseract nor a Surya-only fallback is installed or selected by the production container.
 
 The project is meant for people who have scanned documents and want a local, reproducible workflow that produces PDFs with selectable and searchable text. It is especially useful when text-only OCR output is not enough and the text layer needs to align with the scanned page.
 
@@ -66,7 +68,7 @@ Model cache locations:
 
 ## Project Status
 
-Repository hardening is complete as of 2026-04-21. The intended user path is now: clone the repository, run `setup_dual_venv.cmd`, then run `run_basic_gui.cmd` or the CLI. Future work should be treated as maintenance, dependency updates, or feature work rather than initial repository rescue.
+The production path was re-accepted on 2026-07-20. The intended user path is: clone the repository, run `setup_dual_venv.cmd`, then run `run_basic_gui.cmd`, the CLI, or the durable HTTP API.
 
 Completed baseline:
 
@@ -78,6 +80,10 @@ Completed baseline:
 6. Human-readable troubleshooting for expected setup warnings.
 7. Durable async HTTP job metadata with restart-visible `done` and
    `interrupted` states for external orchestrators.
+8. Ten-page, content-addressed hybrid chunks with atomic manifests and
+   verified resume after a process or host restart.
+9. A production-only `chandra+surya` contract; single-engine execution remains
+   available only in explicit benchmark/diagnostic commands.
 
 The HTTP job API is the cross-project integration boundary. For the standard
 request metadata, idempotency rules, OCR-owned queue semantics, and GPU
@@ -147,7 +153,7 @@ $env:UNISCAN_SURYA_REQUIRE_GPU = "1"
 After setup, the GUI lets you:
 
 1. Choose a PDF.
-2. Pick `chandra+surya`, `chandra`, or `surya`.
+2. Run the required `chandra+surya` pipeline.
 3. Optionally limit OCR to pages such as `1,3,5-8`.
 
 Before OCR starts, UniScan always creates an image-only copy of the source PDF
@@ -209,11 +215,23 @@ $env:UNISCAN_SURYA_REQUIRE_GPU = "1"
 Full-document hybrid OCR is isolated into 10-page PDF chunks by default. Each
 chunk completes both Chandra recognition and Surya geometry before its searchable
 PDF is accepted. The service then merges the chunks and verifies contiguous page
-coverage, page count, order, and page dimensions. This bounds Surya input size,
-releases engine subprocess VRAM between chunks, and applies the engine timeout to
-one chunk instead of the whole document. Set `UNISCAN_HYBRID_CHUNK_PAGES` to a
-different positive value to tune the tradeoff. `0` disables document chunking for
-diagnostics. Explicit `pages=` selections keep the existing non-chunked path.
+coverage, page count, order, and page dimensions. Every chunk input and output is
+published atomically and recorded with its SHA-256, byte size, page count, and
+serialized stage summary. The cache key includes the source PDF hash, effective
+OCR settings, and pipeline revision.
+
+If a process, container, or host stops, a retry with the same PDF and settings
+reuses only completed chunks whose hash and PDF geometry still validate. A
+running, failed, missing, or modified chunk is processed again. HTTP jobs share a
+content-addressed cache outside the per-job work directory, so an idempotent retry
+can resume even though it receives a new job id. The cache is retained on failure
+and removed after the result PDF has been copied successfully.
+
+This bounds Surya input size, releases engine subprocess VRAM between chunks, and
+applies the engine timeout to one chunk instead of the whole document. Set
+`UNISCAN_HYBRID_CHUNK_PAGES` to a different positive value to tune the tradeoff.
+`0` disables document chunking for diagnostics. Explicit `pages=` selections keep
+the existing non-chunked path.
 
 Useful commands:
 
@@ -427,16 +445,14 @@ If a model download is interrupted, deleting the incomplete cache for that engin
 
 ## Modes
 
-`chandra+surya`:
-The default. Chandra provides text, Surya provides geometry. Best target for searchable PDFs when both engines are available.
-Zotero production jobs always use this mode. Large documents remain hybrid and
-use the chunking contract described above.
+`chandra+surya` is the only mode accepted by `searchable-pdf`, the desktop GUI,
+and both HTTP job endpoints. Chandra provides text and Surya provides geometry;
+missing either engine is a hard failure. Large documents use the resumable
+chunking contract described above.
 
-`chandra`:
-Uses Chandra text and Chandra geometry. Useful when Surya is unavailable or for comparison.
-
-`surya`:
-Uses Surya OCR and Surya geometry.
+The lower-level `benchmark-ocr` and artifact comparison commands retain
+single-engine choices for diagnostics and quality evaluation. They are not
+production fallbacks and are not exposed by the searchable-PDF service.
 
 ## Troubleshooting
 

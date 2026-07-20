@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    Bootstrap script for setting up the OCR benchmark environment on a new PC.
+    Bootstrap diagnostics for the production hybrid OCR environment on a new PC.
 
 .DESCRIPTION
-    Checks prerequisites (Python, CUDA, Tesseract) and runs a quick smoke test.
-    Run this BEFORE benchmark_ocr_matrix.ps1.
+    Checks Python, CUDA, the repository, and a PDF fixture before a hybrid smoke test.
+    Production OCR uses Chandra text plus Surya geometry and does not require Tesseract.
 
 .EXAMPLE
     .\scripts\bootstrap_new_pc.ps1
@@ -78,29 +78,10 @@ catch {
     Write-Host "  nvidia-smi not found. UniScan OCR requires CUDA GPU for Chandra/Surya." -ForegroundColor Yellow
 }
 
-# --- 3. Tesseract ---
-Write-Host "[3/5] Tesseract OCR..." -ForegroundColor Cyan
-$tessExe = Get-Command tesseract -ErrorAction SilentlyContinue
-if ($null -ne $tessExe) {
-    $tessVer = & tesseract --version 2>&1 | Select-Object -First 1
-    Write-Host "  OK: $tessVer at $($tessExe.Source)" -ForegroundColor Green
-    # Check language packs
-    $langs = & tesseract --list-langs 2>&1
-    $hasRus = @($langs | Where-Object { $_ -eq "rus" }).Count -gt 0
-    $hasEng = @($langs | Where-Object { $_ -eq "eng" }).Count -gt 0
-    if ($hasRus -and $hasEng) {
-        Write-Host "  Languages: eng + rus available" -ForegroundColor Green
-    } else {
-        $missing = @()
-        if (-not $hasEng) { $missing += "eng" }
-        if (-not $hasRus) { $missing += "rus" }
-        Write-Host "  WARNING: Missing language packs: $($missing -join ', ')" -ForegroundColor Yellow
-        Write-Host "  Download from: https://github.com/tesseract-ocr/tessdata" -ForegroundColor Yellow
-    }
-} else {
-    Write-Host "  NOT FOUND. Tesseract-based engines (pytesseract, ocrmypdf, pymupdf) will fail." -ForegroundColor Yellow
-    Write-Host "  Install from: https://github.com/UB-Mannheim/tesseract/wiki" -ForegroundColor Yellow
-}
+# --- 3. Production OCR contract ---
+Write-Host "[3/5] Production OCR mode..." -ForegroundColor Cyan
+Write-Host "  chandra+surya only: Chandra text + Surya geometry." -ForegroundColor Green
+Write-Host "  Tesseract and single-engine searchable-PDF fallbacks are not required." -ForegroundColor Green
 
 # --- 4. Repo install check ---
 Write-Host "[4/5] Repository..." -ForegroundColor Cyan

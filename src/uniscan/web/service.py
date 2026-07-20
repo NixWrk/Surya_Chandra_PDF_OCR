@@ -1064,6 +1064,10 @@ def _parse_job_request(
         max_length=80,
     ) or default_lang
     strict = _query_bool(query.get("strict", ["1"])[0], default=True)
+    if not strict:
+        raise ValueError(
+            "strict cannot be disabled; production OCR requires Chandra and Surya."
+        )
     delete_original_text_layer = _query_bool(
         (
             query.get("delete_text_layer")
@@ -1220,13 +1224,11 @@ def _html_ui() -> bytes:
       <div class="field">
         <label>Mode</label>
         <select id="mode">
-          <option value="chandra+surya" selected>chandra+surya (default)</option>
-          <option value="chandra">chandra</option>
-          <option value="surya">surya</option>
+          <option value="chandra+surya" selected>chandra+surya</option>
         </select>
       </div>
       <div class="field">
-        <label>OCR language (legacy engines; Surya/Chandra auto-detect)</label>
+        <label>OCR language hint (Chandra/Surya auto-detect)</label>
         <input id="lang" value="rus+eng">
       </div>
       <div class="field">
@@ -1235,9 +1237,8 @@ def _html_ui() -> bytes:
       </div>
       <div class="field">
         <label>Strict</label>
-        <select id="strict">
+        <select id="strict" disabled>
           <option value="1" selected>true</option>
-          <option value="0">false</option>
         </select>
       </div>
       <div class="field">
@@ -1408,8 +1409,10 @@ def _build_handler(
 ) -> type[BaseHTTPRequestHandler]:
     jobs_root = (work_root / "jobs").resolve()
     pipeline_root = (work_root / "runs").resolve()
+    hybrid_chunk_cache_root = (pipeline_root / "hybrid_chunk_cache").resolve()
     jobs_root.mkdir(parents=True, exist_ok=True)
     pipeline_root.mkdir(parents=True, exist_ok=True)
+    hybrid_chunk_cache_root.mkdir(parents=True, exist_ok=True)
 
     job_store = _JobStore(jobs_root)
     job_queue: queue.PriorityQueue[tuple[int, str, str, _QueuedJob]] = queue.PriorityQueue()
@@ -1456,6 +1459,8 @@ def _build_handler(
         job_root = jobs_root / job_id
         job_work_root = job_root / "work"
         keep_job_runs = _env_bool("UNISCAN_KEEP_JOB_RUNS", default=False)
+        summary: SearchablePdfSummary | None = None
+        completed_successfully = False
 
         def _set_state(
             *,
@@ -1525,7 +1530,7 @@ def _build_handler(
         try:
             page_numbers = parse_page_numbers(pages_raw)
             with _PIPELINE_LOCK:
-                summary: SearchablePdfSummary = build_searchable_pdf(
+                summary = build_searchable_pdf(
                     pdf_path=input_path,
                     mode=mode,
                     lang=lang,
@@ -1536,6 +1541,7 @@ def _build_handler(
                     strict=strict,
                     progress=_progress_cb,
                     delete_original_text_layer=delete_original_text_layer,
+                    hybrid_chunk_cache_root=hybrid_chunk_cache_root,
                 )
             result_target = jobs_root / job_id / "result.pdf"
             result_target.parent.mkdir(parents=True, exist_ok=True)
@@ -1557,9 +1563,21 @@ def _build_handler(
                 result_path=result_target.resolve(),
                 error=None,
             )
+            completed_successfully = True
         except Exception as exc:
             _set_state(status="error", progress=100, message="Failed", error=str(exc))
         finally:
+            if (
+                completed_successfully
+                and summary is not None
+                and getattr(summary, "chunk_manifest_path", None) is not None
+                and not keep_job_runs
+            ):
+                _cleanup_generated_dir(
+                    root=hybrid_chunk_cache_root,
+                    target=summary.run_dir,
+                    label=f"completed OCR chunk cache {job_id}",
+                )
             if not keep_job_runs:
                 _cleanup_generated_dir(
                     root=job_root,
@@ -1745,6 +1763,7 @@ def _build_handler(
             sync_work_root = pipeline_root / f"sync_{uuid.uuid4().hex}"
             keep_sync_runs = _env_bool("UNISCAN_KEEP_SYNC_RUNS", default=False)
             summary: SearchablePdfSummary | None = None
+            completed_successfully = False
             try:
                 payload = self._read_request_body()
                 if not payload:
@@ -1766,10 +1785,12 @@ def _build_handler(
                         return_bytes=True,
                         strict=strict,
                         delete_original_text_layer=delete_original_text_layer,
+                        hybrid_chunk_cache_root=hybrid_chunk_cache_root,
                     )
                 output_bytes = summary.output_pdf_bytes
                 if output_bytes is None:
                     raise RuntimeError("Searchable PDF bytes were not returned by service pipeline.")
+                completed_successfully = True
             except _PayloadTooLarge as exc:
                 self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)})
                 return
@@ -1780,6 +1801,17 @@ def _build_handler(
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             finally:
+                if (
+                    completed_successfully
+                    and summary is not None
+                    and getattr(summary, "chunk_manifest_path", None) is not None
+                    and not keep_sync_runs
+                ):
+                    _cleanup_generated_dir(
+                        root=hybrid_chunk_cache_root,
+                        target=summary.run_dir,
+                        label="completed synchronous OCR chunk cache",
+                    )
                 if not keep_sync_runs:
                     _cleanup_generated_dir(
                         root=pipeline_root,

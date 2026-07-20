@@ -78,13 +78,20 @@ Query parameters:
 
 | Name | Default | Meaning |
 | --- | --- | --- |
-| `mode` | `chandra+surya` | OCR mode: `chandra+surya`, `chandra`, or `surya`. |
+| `mode` | `chandra+surya` | Production OCR mode. Any other value is rejected. |
 | `lang` | service default, usually `rus+eng` | Language string passed to OCR engines. |
 | `pages` | all pages | Optional page selection such as `1,3,5-8`. |
-| `strict` | `1` | Fail the job if required OCR artifacts are missing. |
+| `strict` | `1` | Must stay enabled. Both Chandra text and Surya geometry are required. |
 | `filename` | `document.pdf` | Original filename used for metadata and result download name. |
 | `delete_text_layer` | `1` | Must stay enabled. OCR removes the existing text layer before processing. |
 | `delete_original_text_layer` | same as `delete_text_layer` | Legacy alias accepted only when true. |
+
+Full-document jobs larger than the configured chunk size (10 pages by default)
+use a shared content-addressed cache. On retry, the worker reuses a completed
+chunk only after its SHA-256, byte size, page count, and page dimensions validate
+against the same source/config identity. Interrupted and failed chunks run again.
+The cache survives failed jobs and process/host restarts; it is deleted after a
+successful result is durably copied into the job directory.
 
 ## Protocol Metadata
 
