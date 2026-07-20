@@ -37,6 +37,7 @@ _DEFAULT_WORKER_TIMEOUT_SECONDS = 30 * 60
 _DEFAULT_WORKER_WATCHDOG_INTERVAL_SECONDS = 30
 _DEFAULT_JOB_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _DEFAULT_MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+_MAX_JOB_METADATA_BYTES = 1024 * 1024
 
 _DEFAULT_PRIORITY = "normal"
 _KNOWN_PRIORITIES = {"interactive", "normal", "batch", "low"}
@@ -371,24 +372,38 @@ class _JobStore:
 
     def _load_existing_jobs(self) -> None:
         for metadata_path in sorted(self.jobs_root.glob("*/metadata.json")):
-            try:
-                raw = json.loads(metadata_path.read_text(encoding="utf-8"))
-                job = _job_from_metadata(raw)
-            except Exception as exc:
-                print(
-                    f"Warning: failed to load OCR job metadata {metadata_path}: {exc}",
-                    file=sys.stderr,
-                )
-                continue
-
             expected_job_id = metadata_path.parent.name
-            if job.job_id != expected_job_id:
+            try:
+                metadata_size = metadata_path.stat().st_size
+                if metadata_size <= 0 or metadata_size > _MAX_JOB_METADATA_BYTES:
+                    raise ValueError(
+                        "metadata size "
+                        f"{metadata_size} is outside 1..{_MAX_JOB_METADATA_BYTES} bytes"
+                    )
+                raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ValueError("metadata root must be an object")
+                job = _job_from_metadata(raw)
+                if job.job_id != expected_job_id:
+                    raise ValueError(
+                        f"metadata job_id {job.job_id!r} does not match directory "
+                        f"{expected_job_id!r}"
+                    )
+            except Exception as exc:
+                indexed_job, index_error = self._load_indexed_job(expected_job_id)
+                if indexed_job is None:
+                    fallback = f"; SQLite fallback failed: {index_error}" if index_error else ""
+                    print(
+                        f"Warning: failed to load OCR job metadata {metadata_path}: {exc}{fallback}",
+                        file=sys.stderr,
+                    )
+                    continue
+                job = indexed_job
                 print(
-                    "Warning: ignored OCR metadata whose job_id does not match "
-                    f"its directory: {metadata_path}",
+                    "Warning: recovered OCR job metadata from SQLite after primary "
+                    f"metadata failed for {metadata_path}: {exc}",
                     file=sys.stderr,
                 )
-                continue
 
             result_candidate = metadata_path.parent / "result.pdf"
             input_candidate = metadata_path.parent / "input.pdf"
@@ -427,6 +442,36 @@ class _JobStore:
             self._jobs[job.job_id] = job
             self._write_metadata_locked(job)
             self._upsert_sqlite_locked(job)
+
+    def _load_indexed_job(self, expected_job_id: str) -> tuple[_JobState | None, str | None]:
+        try:
+            with self._db_lock, self._connect_db() as conn:
+                row = conn.execute(
+                    "SELECT metadata_json, length(CAST(metadata_json AS BLOB)) "
+                    "FROM jobs WHERE job_id = ?",
+                    (expected_job_id,),
+                ).fetchone()
+            if row is None:
+                return None, None
+            raw_json, raw_size = row
+            size = int(raw_size or 0)
+            if size <= 0 or size > _MAX_JOB_METADATA_BYTES:
+                raise ValueError(
+                    f"indexed metadata size {size} is outside "
+                    f"1..{_MAX_JOB_METADATA_BYTES} bytes"
+                )
+            raw = json.loads(str(raw_json))
+            if not isinstance(raw, dict):
+                raise ValueError("indexed metadata root must be an object")
+            job = _job_from_metadata(raw)
+            if job.job_id != expected_job_id:
+                raise ValueError(
+                    f"indexed job_id {job.job_id!r} does not match directory "
+                    f"{expected_job_id!r}"
+                )
+            return job, None
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
 
     def _job_dir(self, job_id: str) -> Path:
         return self.jobs_root / job_id

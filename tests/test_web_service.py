@@ -278,6 +278,44 @@ def test_job_store_marks_active_jobs_interrupted_after_restart(tmp_path: Path) -
     assert metadata["finished_at"]
 
 
+def test_job_store_recovers_corrupt_primary_metadata_from_sqlite(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    store.create(
+        _JobState(
+            job_id="RECOVER",
+            status="running",
+            progress=52,
+            message="OCR is running",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+        )
+    )
+    metadata_path = root / "RECOVER" / "metadata.json"
+    metadata_path.write_bytes(b"\0" * metadata_path.stat().st_size)
+
+    recovered = _JobStore(root)
+    recovery_log = capsys.readouterr().err
+    metadata = recovered.metadata("RECOVER")
+
+    assert "recovered OCR job metadata from SQLite" in recovery_log
+    assert metadata is not None
+    assert metadata["status"] == "interrupted"
+    assert metadata["error"] == "Interrupted by OCR API restart."
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["status"] == "interrupted"
+
+    _JobStore(root)
+    assert capsys.readouterr().err == ""
+
+
 def test_job_store_does_not_trust_persisted_external_paths(tmp_path: Path) -> None:
     root = tmp_path / "jobs"
     external_input = tmp_path / "external-input.pdf"
@@ -338,6 +376,50 @@ def test_job_store_ignores_metadata_with_mismatched_job_id(tmp_path: Path) -> No
     store = _JobStore(root)
 
     assert store.health()["jobs"] == 0
+    assert not (root.parent / "ESCAPE").exists()
+
+
+def test_job_store_rejects_mismatched_sqlite_recovery_job_id(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    store.create(
+        _JobState(
+            job_id="EXPECTED",
+            status="queued",
+            progress=0,
+            message="Queued",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+        )
+    )
+    metadata_path = root / "EXPECTED" / "metadata.json"
+    metadata_path.write_bytes(b"\0" * metadata_path.stat().st_size)
+    indexed_payload = {
+        "job_id": "../ESCAPE",
+        "status": "queued",
+        "progress": 0,
+        "message": "Queued",
+        "mode": "chandra+surya",
+        "pages": "",
+        "lang": "rus+eng",
+        "strict": True,
+        "delete_original_text_layer": True,
+        "filename": "input.pdf",
+    }
+    with sqlite3.connect(root / "jobs.sqlite3") as conn:
+        conn.execute(
+            "UPDATE jobs SET metadata_json = ? WHERE job_id = ?",
+            (json.dumps(indexed_payload), "EXPECTED"),
+        )
+
+    reloaded = _JobStore(root)
+
+    assert reloaded.health()["jobs"] == 0
     assert not (root.parent / "ESCAPE").exists()
 
 
