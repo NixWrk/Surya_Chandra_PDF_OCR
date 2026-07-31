@@ -16,7 +16,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Sequence
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from uniscan.io import imwrite_unicode, iter_render_pdf_page_indices
 
@@ -50,6 +50,47 @@ _DEFAULT_RUNTIME_TMP_HOME = _REPO_ROOT / ".tmp_runtime"
 _MAX_OCR_TEXT_ARTIFACT_BYTES = 64 * 1024 * 1024
 _CHANDRA_MODEL_REPO_ID = "datalab-to/chandra-ocr-2"
 _MODEL_CACHE_CHECK_MEMO: dict[str, str] = {}
+_ZERO_OUTPUT_RETRY_PREPROCESSING = "autocontrast-cutoff-1"
+_OCR_OUTCOME_TEXT = "text"
+_OCR_OUTCOME_VERIFIED_BLANK = "verified_blank"
+_OCR_OUTCOME_EXPLICIT_NONTEXT = "explicit_nontext"
+_OCR_OUTCOME_ZERO = "zero_output"
+_PAGE_ERROR_ZERO_OUTPUT = "zero_output"
+_PAGE_ERROR_MISSING_OUTPUT = "missing_output"
+_OCR_STATUS_RECONCILIATION_PENDING = "reconciliation_pending"
+_PAGE_ERROR_UNCLASSIFIED = "unclassified"
+
+
+def _alnum_evidence(lines: Sequence[str]) -> tuple[int, int]:
+    alnum_line_count = sum(1 for line in lines if any(char.isalnum() for char in line))
+    alnum_chars = sum(1 for line in lines for char in line if char.isalnum())
+    return alnum_line_count, alnum_chars
+
+
+def _write_json_atomic(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    candidate = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        candidate.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(candidate, path)
+    finally:
+        candidate.unlink(missing_ok=True)
+
+
+def _write_autocontrast_retry_image(*, source: Path, target: Path) -> None:
+    with Image.open(source) as original:
+        original_size = original.size
+        enhanced = ImageOps.autocontrast(original.convert("RGB"), cutoff=1)
+        if enhanced.size != original_size:
+            raise RuntimeError(
+                "OCR zero-output retry changed image dimensions "
+                f"from {original_size} to {enhanced.size}."
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        enhanced.save(target, format="PNG")
 
 
 def _read_utf8_artifact(path: Path) -> str:
@@ -620,6 +661,7 @@ _CHANDRA_NON_TEXT_LABELS: set[str] = {
     "figure",
     "diagram",
 }
+_CHANDRA_GRAPHIC_LABELS: set[str] = {"image", "figure", "diagram"}
 
 
 def _chandra_chunk_lines(raw_content: Any) -> list[str]:
@@ -767,6 +809,7 @@ def _write_pagewise_text_artifacts(
     page_texts: Sequence[str],
     aggregate_path: Path,
     page_metadata: Sequence[dict[str, Any]] | None = None,
+    page_errors: Sequence[dict[str, Any]] | None = None,
 ) -> tuple[int, Path]:
     engine_dir = output_dir / engine
     engine_dir.mkdir(parents=True, exist_ok=True)
@@ -780,6 +823,21 @@ def _write_pagewise_text_artifacts(
             source_page = item.get("source_page")
             if isinstance(source_page, int) and not isinstance(source_page, bool) and source_page > 0:
                 metadata_by_page[source_page] = item
+
+    errors_by_page: dict[int, list[dict[str, str]]] = {}
+    if page_errors:
+        for item in page_errors:
+            if not isinstance(item, dict):
+                continue
+            source_page = item.get("source_page")
+            if not isinstance(source_page, int) or isinstance(source_page, bool):
+                continue
+            error = str(item.get("error") or "").strip()
+            if error:
+                code = str(item.get("code") or _PAGE_ERROR_UNCLASSIFIED).strip()
+                errors_by_page.setdefault(source_page, []).append(
+                    {"code": code, "message": error}
+                )
 
     total_chars = 0
     for source_page, text in zip(source_pages_1based, page_texts, strict=True):
@@ -795,6 +853,20 @@ def _write_pagewise_text_artifacts(
         page_meta = metadata_by_page.get(source_page, {})
         if page_meta.get("blank_page") is True:
             page_info["blank_page"] = True
+        for evidence_key in (
+            "ocr_outcome",
+            "explicit_nontext",
+            "attempt_count",
+            "retry_preprocessing",
+            "alnum_line_count",
+            "alnum_chars",
+        ):
+            evidence_value = page_meta.get(evidence_key)
+            if evidence_value is not None:
+                page_info[evidence_key] = evidence_value
+        if source_page in errors_by_page:
+            page_info["page_errors"] = errors_by_page[source_page]
+
         sidecar_specs = (
             ("surya_page_lines_path", "surya_text_lines", "surya"),
             ("chandra_page_lines_path", "chandra_text_lines", "chandra"),
@@ -879,6 +951,7 @@ def _collect_chandra_batch_outputs(
     page_metadata: list[dict[str, Any]] = []
     for image_path, source_page in zip(image_paths, source_pages_1based, strict=True):
         image_payload = by_name.get(image_path.name) or by_name.get(image_path.stem)
+        page_meta: dict[str, Any] = {"source_page": source_page}
         text_lines: list[str] = []
         if image_payload is not None:
             pages = image_payload.get("pages")
@@ -903,7 +976,10 @@ def _collect_chandra_batch_outputs(
                             continue
                         fallback_lines.append(text)
                     if line_rows:
-                        page_width = max(max(bbox[2] for bbox, _text in line_rows), 1.0)
+                        page_width = max(
+                            max(bbox[2] for bbox, _text in line_rows),
+                            1.0,
+                        )
                         image_bbox = _bbox_values(page.get("image_bbox"))
                         if image_bbox is not None:
                             page_width = max(page_width, image_bbox[2])
@@ -914,34 +990,30 @@ def _collect_chandra_batch_outputs(
                         text_lines.extend(line_rows[idx][1] for idx in order)
                     text_lines.extend(fallback_lines)
 
-            page_dir = work_dir / f"page_{source_page:04d}"
-            page_dir.mkdir(parents=True, exist_ok=True)
-            page_sidecar_path = page_dir / "chandra_page_lines.json"
-            page_sidecar_path.write_text(
-                json.dumps({"images": [image_payload]}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            page_metadata.append(
-                {
-                    "source_page": source_page,
-                    "chandra_page_lines_path": str(page_sidecar_path),
-                }
-            )
+            for key in (
+                "ocr_outcome",
+                "explicit_nontext",
+                "attempt_count",
+                "retry_preprocessing",
+            ):
+                value = image_payload.get(key)
+                if value is not None:
+                    page_meta[key] = value
 
+        blank_page = False
         if image_payload is None or not text_lines:
             if _is_effectively_blank_page_image(image_path):
-                if image_payload is not None and page_metadata:
-                    page_metadata[-1]["blank_page"] = True
-                else:
-                    page_metadata.append(
-                        {
-                            "source_page": source_page,
-                            "blank_page": True,
-                        }
-                    )
+                blank_page = True
+                page_meta["blank_page"] = True
+                page_meta["ocr_outcome"] = _OCR_OUTCOME_VERIFIED_BLANK
             else:
                 page_errors.append(
                     {
+                        "code": (
+                            _PAGE_ERROR_MISSING_OUTPUT
+                            if image_payload is None
+                            else _PAGE_ERROR_ZERO_OUTPUT
+                        ),
                         "source_page": source_page,
                         "image": str(image_path),
                         "error": (
@@ -951,6 +1023,35 @@ def _collect_chandra_batch_outputs(
                         ),
                     }
                 )
+
+        if text_lines:
+            page_meta["ocr_outcome"] = _OCR_OUTCOME_TEXT
+        elif not blank_page and image_payload is not None:
+            page_meta.setdefault("ocr_outcome", _OCR_OUTCOME_ZERO)
+
+        alnum_line_count, alnum_chars = _alnum_evidence(text_lines)
+        page_meta["alnum_line_count"] = alnum_line_count
+        page_meta["alnum_chars"] = alnum_chars
+
+        if image_payload is not None:
+            per_page_image_payload = dict(image_payload)
+            per_page_image_payload["image_name"] = image_path.name
+            for key in (
+                "ocr_outcome",
+                "explicit_nontext",
+                "attempt_count",
+                "retry_preprocessing",
+            ):
+                value = page_meta.get(key)
+                if value is not None:
+                    per_page_image_payload[key] = value
+            page_dir = work_dir / f"page_{source_page:04d}"
+            page_sidecar_path = page_dir / "chandra_page_lines.json"
+            _write_json_atomic(page_sidecar_path, {"images": [per_page_image_payload]})
+            page_meta["chandra_page_lines_path"] = str(page_sidecar_path)
+
+        if image_payload is not None or blank_page:
+            page_metadata.append(page_meta)
 
         page_text = "\n".join(_dehyphenate_line_breaks(text_lines))
         page_texts.append(page_text)
@@ -965,6 +1066,8 @@ def _collect_surya_batch_outputs(
     image_paths: Sequence[Path],
     source_pages_1based: Sequence[int],
     work_dir: Path,
+    attempt_count: int = 1,
+    retry_preprocessing: str | None = None,
 ) -> tuple[list[str], int, list[dict[str, Any]], list[dict[str, Any]]]:
     payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -992,6 +1095,7 @@ def _collect_surya_batch_outputs(
         staged_name = f"{image_index:04d}_{image_path.name}" if multi_image else image_path.name
         image_payload = by_name.get(staged_name) or by_name.get(image_path.name)
         text_lines: list[str] = []
+        page_meta: dict[str, Any] = {"source_page": source_page}
         if isinstance(image_payload, dict):
             for page in image_payload.get("pages", []):
                 if not isinstance(page, dict):
@@ -1006,45 +1110,63 @@ def _collect_surya_batch_outputs(
         page_text = "\n".join(_dehyphenate_line_breaks(text_lines))
         page_texts.append(page_text)
         total_chars += len(page_text)
+        blank_page = False
         if not text_lines or not isinstance(image_payload, dict):
             if _is_effectively_blank_page_image(image_path):
-                page_metadata.append(
-                    {
-                        "source_page": source_page,
-                        "blank_page": True,
-                    }
-                )
+                blank_page = True
+                page_meta["blank_page"] = True
+                page_meta["ocr_outcome"] = _OCR_OUTCOME_VERIFIED_BLANK
             else:
                 page_errors.append(
                     {
+                        "code": (
+                            _PAGE_ERROR_MISSING_OUTPUT
+                            if not isinstance(image_payload, dict)
+                            else _PAGE_ERROR_ZERO_OUTPUT
+                        ),
                         "source_page": source_page,
                         "image": str(image_path),
                         "error": (
-                            "Surya geometry sidecar has no text_lines "
-                            f"for source page {source_page}"
+                            (
+                                "Surya geometry sidecar has no image entry "
+                                if not isinstance(image_payload, dict)
+                                else "Surya geometry sidecar has no text_lines "
+                            )
+                            + f"for source page {source_page}"
                         ),
                     }
                 )
-            continue
+        elif text_lines:
+            page_meta["ocr_outcome"] = _OCR_OUTCOME_TEXT
 
-        per_page_image_payload = dict(image_payload)
-        per_page_image_payload["image_name"] = image_path.name
-        per_page_payload: dict[str, Any] = {"images": [per_page_image_payload]}
-        if execution_path:
-            per_page_payload["execution_path"] = execution_path
-        page_dir = work_dir / f"page_{source_page:04d}"
-        page_dir.mkdir(parents=True, exist_ok=True)
-        page_sidecar_path = page_dir / "surya_page_lines.json"
-        page_sidecar_path.write_text(
-            json.dumps(per_page_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        page_metadata.append(
-            {
-                "source_page": source_page,
-                "surya_page_lines_path": str(page_sidecar_path),
-            }
-        )
+        if not text_lines and not blank_page:
+            page_meta["ocr_outcome"] = (
+                _OCR_OUTCOME_ZERO if isinstance(image_payload, dict) else "missing_output"
+            )
+        page_meta["attempt_count"] = attempt_count
+        if retry_preprocessing is not None:
+            page_meta["retry_preprocessing"] = retry_preprocessing
+        alnum_line_count, alnum_chars = _alnum_evidence(text_lines)
+        page_meta["alnum_line_count"] = alnum_line_count
+        page_meta["alnum_chars"] = alnum_chars
+
+        if isinstance(image_payload, dict):
+            per_page_image_payload = dict(image_payload)
+            per_page_image_payload["image_name"] = image_path.name
+            per_page_image_payload["ocr_outcome"] = page_meta["ocr_outcome"]
+            per_page_image_payload["attempt_count"] = attempt_count
+            if retry_preprocessing is not None:
+                per_page_image_payload["retry_preprocessing"] = retry_preprocessing
+            per_page_payload: dict[str, Any] = {"images": [per_page_image_payload]}
+            if execution_path:
+                per_page_payload["execution_path"] = execution_path
+            page_dir = work_dir / f"page_{source_page:04d}"
+            page_sidecar_path = page_dir / "surya_page_lines.json"
+            _write_json_atomic(page_sidecar_path, per_page_payload)
+            page_meta["surya_page_lines_path"] = str(page_sidecar_path)
+
+        if isinstance(image_payload, dict) or blank_page:
+            page_metadata.append(page_meta)
 
     return page_texts, total_chars, page_errors, page_metadata
 
@@ -1059,6 +1181,7 @@ def _run_extraction_engine_pagewise(
     which_fn: WhichExecutable,
     run_cmd: RunCommand,
     progress_cb: PageProgressCallback | None = None,
+    defer_empty_pages: bool = False,
 ) -> tuple[list[str], int, list[dict[str, Any]], list[dict[str, Any]]]:
     if len(image_paths) != len(source_pages_1based):
         raise ValueError("image_paths and source_pages_1based lengths must match.")
@@ -1102,7 +1225,59 @@ def _run_extraction_engine_pagewise(
             ]
             page_metadata = []
 
-        successful_pages = {int(item["source_page"]) for item in page_metadata}
+        zero_output_pages = {
+            int(item["source_page"])
+            for item in page_metadata
+            if item.get("ocr_outcome") == _OCR_OUTCOME_ZERO
+            and isinstance(item.get("source_page"), int)
+            and isinstance(item.get("surya_page_lines_path"), str)
+        }
+        for page_index, (image_path, source_page) in enumerate(
+            zip(image_paths, source_pages_1based, strict=True)
+        ):
+            if source_page not in zero_output_pages:
+                continue
+            retry_root = work_dir / "zero_output_retry" / f"page_{source_page:04d}"
+            retry_image = retry_root / "input" / image_path.name
+            _write_autocontrast_retry_image(source=image_path, target=retry_image)
+            retry_work_dir = retry_root / "module"
+            _run_surya_module_cli(
+                [retry_image],
+                lang=lang,
+                work_dir=retry_work_dir,
+                which_fn=which_fn,
+                run_cmd=run_cmd,
+            )
+            retry_sidecar = retry_work_dir / "surya_page_lines.json"
+            if not retry_sidecar.is_file():
+                raise RuntimeError(
+                    "Surya zero-output retry did not produce mandatory geometry "
+                    f"for source page {source_page}."
+                )
+            retry_texts, _, retry_errors, retry_metadata = _collect_surya_batch_outputs(
+                sidecar_path=retry_sidecar,
+                image_paths=[retry_image],
+                source_pages_1based=[source_page],
+                work_dir=work_dir,
+                attempt_count=2,
+                retry_preprocessing=_ZERO_OUTPUT_RETRY_PREPROCESSING,
+            )
+            page_texts[page_index] = retry_texts[0]
+            page_errors = [
+                item for item in page_errors if item.get("source_page") != source_page
+            ]
+            page_errors.extend(retry_errors)
+            page_metadata = [
+                item for item in page_metadata if item.get("source_page") != source_page
+            ]
+            page_metadata.extend(retry_metadata)
+        total_chars = sum(len(text) for text in page_texts)
+
+        successful_pages = {
+            int(item["source_page"])
+            for item in page_metadata
+            if item.get("ocr_outcome") in {_OCR_OUTCOME_TEXT, _OCR_OUTCOME_VERIFIED_BLANK}
+        }
         if progress_cb is not None:
             done = 0
             total_pages = len(source_pages_1based)
@@ -1111,17 +1286,12 @@ def _run_extraction_engine_pagewise(
                     continue
                 done += 1
                 progress_cb(done, total_pages, source_page)
-
-        if page_errors and not any(text.strip() for text in page_texts):
-            preview = "; ".join(
-                f"p{item['source_page']}: {item['error']}" for item in page_errors[:3]
-            )
-            raise RuntimeError(f"all sampled pages failed for {engine}: {preview}")
-        if _surya_require_geometry_sidecar() and page_errors:
+        if not defer_empty_pages and _surya_require_geometry_sidecar() and page_errors:
             preview = "; ".join(
                 f"p{item['source_page']}: {item['error']}" for item in page_errors[:3]
             )
             raise RuntimeError(f"surya geometry sidecar is required for each page: {preview}")
+
         return page_texts, total_chars, page_errors, page_metadata
 
     if engine == OCR_ENGINE_CHANDRA and len(image_paths) > 0:
@@ -1153,15 +1323,14 @@ def _run_extraction_engine_pagewise(
                 source_pages_1based=source_pages_1based,
                 work_dir=work_dir,
             )
-            if page_errors and _chandra_require_sidecar():
+            if not defer_empty_pages and page_errors and _chandra_require_sidecar():
                 preview = "; ".join(
                     f"p{item['source_page']}: {item['error']}" for item in page_errors[:3]
                 )
                 raise RuntimeError(
                     f"chandra geometry sidecar is required for each page: {preview}"
                 )
-            if any(page.strip() for page in page_texts):
-                return page_texts, total_chars, page_errors, page_metadata
+            return page_texts, total_chars, page_errors, page_metadata
         warning = "chandra sidecar missing or empty; aggregate text mapped to page 1"
         if _chandra_require_sidecar():
             raise RuntimeError(warning)
@@ -1373,7 +1542,7 @@ def _run_surya_module_cli(
             for page in pages:
                 if not isinstance(page, dict):
                     continue
-                page_payload: dict[str, Any] = {}
+                page_payload: dict[str, Any] = {"text_lines": []}
                 image_bbox = _bbox_values(page.get("image_bbox"))
                 if image_bbox is not None:
                     page_payload["image_bbox"] = list(image_bbox)
@@ -1419,10 +1588,8 @@ def _run_surya_module_cli(
                     page_payload["text_lines"] = line_payload
                     collected.extend(str(item["text"]) for item in line_payload)
                 collected.extend(fallback_texts)
-                if page_payload:
-                    image_payload["pages"].append(page_payload)
-            if image_payload["pages"]:
-                sidecar_images.append(image_payload)
+                image_payload["pages"].append(page_payload)
+            sidecar_images.append(image_payload)
 
         # Fallback for unknown payload layouts.
         if not consumed:
@@ -1890,17 +2057,15 @@ def _run_chandra_module(
                 f"(TORCH_DEVICE={selected_device!r}, model_device={model_device!r})."
             )
 
-    collected: list[str] = []
-    sidecar_images: list[dict[str, Any]] = []
-    total_pages = len(image_paths)
-    for page_idx, image_path in enumerate(image_paths, start=1):
-        pil_image = load_image(str(image_path))
-        width, height = pil_image.size
-        batch = [BatchInputItem(image=pil_image, prompt_type="ocr_layout")]
-        results = model.generate(batch, include_images=False, include_headers_footers=False)
-
+    def _parse_page_results(
+        results: Sequence[Any],
+        *,
+        width: int,
+        height: int,
+    ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
         page_texts: list[str] = []
         page_lines: list[dict[str, Any]] = []
+        labels: list[str] = []
         for result in results:
             chunks = getattr(result, "chunks", None)
             if isinstance(chunks, list):
@@ -1908,13 +2073,13 @@ def _run_chandra_module(
                     if not isinstance(chunk, dict):
                         continue
                     label = str(chunk.get("label") or "").strip().lower()
+                    if label:
+                        labels.append(label)
                     if label in _CHANDRA_NON_TEXT_LABELS:
                         continue
-
                     chunk_lines = _chandra_chunk_lines(chunk.get("content"))
                     if not chunk_lines:
                         continue
-
                     page_texts.extend(chunk_lines)
                     bbox = _safe_bbox(chunk.get("bbox"), width, height)
                     if bbox is not None:
@@ -1932,10 +2097,71 @@ def _run_chandra_module(
                         line = line.strip()
                         if line:
                             page_texts.append(line)
+        return page_texts, page_lines, labels
 
+    def _explicit_nontext(labels: Sequence[str]) -> bool:
+        normalized = {label.strip().lower() for label in labels if label.strip()}
+        return bool(normalized & _CHANDRA_GRAPHIC_LABELS) and normalized <= _CHANDRA_NON_TEXT_LABELS
+
+    collected: list[str] = []
+    sidecar_images: list[dict[str, Any]] = []
+    total_pages = len(image_paths)
+    sidecar_path = work_dir / "chandra_page_lines.json"
+    for page_idx, image_path in enumerate(image_paths, start=1):
+        pil_image = load_image(str(image_path))
+        width, height = pil_image.size
+        original_batch = [BatchInputItem(image=pil_image, prompt_type="ocr_layout")]
+        results = model.generate(
+            original_batch,
+            include_images=False,
+            include_headers_footers=False,
+        )
+        page_texts, page_lines, labels = _parse_page_results(
+            results,
+            width=width,
+            height=height,
+        )
+        observed_labels = list(labels)
+        attempts: list[dict[str, Any]] = [
+            {
+                "attempt": 1,
+                "preprocessing": "original",
+                "labels": sorted(set(labels)),
+                "text_chars": sum(len(line) for line in page_texts),
+                "geometry_lines": len(page_lines),
+                "explicit_nontext": _explicit_nontext(labels),
+            }
+        ]
         blank_page = not page_texts and _is_effectively_blank_page_image(image_path)
         if not page_texts and not blank_page:
-            raise RuntimeError(f"Chandra OCR produced no text for {image_path.name}.")
+            retry_image = ImageOps.autocontrast(pil_image.convert("RGB"), cutoff=1)
+            if retry_image.size != (width, height):
+                raise RuntimeError(
+                    "Chandra zero-output retry changed image dimensions "
+                    f"from {(width, height)} to {retry_image.size}."
+                )
+            retry_batch = [BatchInputItem(image=retry_image, prompt_type="ocr_layout")]
+            retry_results = model.generate(
+                retry_batch,
+                include_images=False,
+                include_headers_footers=False,
+            )
+            page_texts, page_lines, labels = _parse_page_results(
+                retry_results,
+                width=width,
+                height=height,
+            )
+            observed_labels.extend(labels)
+            attempts.append(
+                {
+                    "attempt": 2,
+                    "preprocessing": _ZERO_OUTPUT_RETRY_PREPROCESSING,
+                    "labels": sorted(set(labels)),
+                    "text_chars": sum(len(line) for line in page_texts),
+                    "geometry_lines": len(page_lines),
+                    "explicit_nontext": _explicit_nontext(labels),
+                }
+            )
 
         if not page_lines and page_texts:
             # Keep geometry mode usable even when upstream parser returns
@@ -1947,31 +2173,43 @@ def _run_chandra_module(
                 )
             )
 
+        explicit_nontext = not page_texts and _explicit_nontext(observed_labels)
+        if page_texts:
+            ocr_outcome = _OCR_OUTCOME_TEXT
+        elif blank_page:
+            ocr_outcome = _OCR_OUTCOME_VERIFIED_BLANK
+        elif explicit_nontext:
+            ocr_outcome = _OCR_OUTCOME_EXPLICIT_NONTEXT
+        else:
+            ocr_outcome = _OCR_OUTCOME_ZERO
+
         collected.append("\n".join(page_texts))
-        if page_lines or blank_page:
-            sidecar_images.append(
+        image_evidence: dict[str, Any] = {
+            "image_name": image_path.name,
+            "ocr_outcome": ocr_outcome,
+            "explicit_nontext": explicit_nontext,
+            "chandra_non_text_labels": sorted(
+                {label for label in observed_labels if label in _CHANDRA_NON_TEXT_LABELS}
+            ),
+            "attempt_count": len(attempts),
+            "attempts": attempts,
+            "pages": [
                 {
-                    "image_name": image_path.name,
-                    "pages": [
-                        {
-                            "image_bbox": [0.0, 0.0, float(width), float(height)],
-                            "text_lines": page_lines,
-                        }
-                    ],
+                    "image_bbox": [0.0, 0.0, float(width), float(height)],
+                    "text_lines": page_lines,
+                    "ocr_outcome": ocr_outcome,
                 }
-            )
+            ],
+        }
+        if len(attempts) == 2:
+            image_evidence["retry_preprocessing"] = _ZERO_OUTPUT_RETRY_PREPROCESSING
+        sidecar_images.append(image_evidence)
+        _write_json_atomic(sidecar_path, {"images": sidecar_images})
         if page_progress_cb is not None:
             try:
                 page_progress_cb(page_idx, total_pages)
             except Exception:
                 pass
-
-    if sidecar_images:
-        sidecar_path = work_dir / "chandra_page_lines.json"
-        sidecar_path.write_text(
-            json.dumps({"images": sidecar_images}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
 
     text = "\n".join(part for part in collected if part and not part.isspace())
     return text, len(text)
@@ -2495,6 +2733,7 @@ def run_ocr_benchmark(
     which_fn: WhichExecutable = shutil.which,
     run_cmd: RunCommand = subprocess.run,
     progress: BenchmarkProgressCallback | None = None,
+    defer_empty_pages: bool = False,
 ) -> list[OcrBenchmarkResult]:
     """Run a sampled OCR benchmark against a PDF fixture."""
     selected_engines = normalize_ocr_engines(engines)
@@ -2632,6 +2871,7 @@ def run_ocr_benchmark(
                     which_fn=which_fn,
                     run_cmd=run_cmd,
                     progress_cb=_page_progress,
+                    defer_empty_pages=defer_empty_pages,
                 )
                 _write_pagewise_text_artifacts(
                     output_dir=resolved_output,
@@ -2641,7 +2881,25 @@ def run_ocr_benchmark(
                     page_texts=page_texts,
                     aggregate_path=artifact_path,
                     page_metadata=page_metadata,
+                    page_errors=page_errors,
                 )
+                candidate_pages = {
+                    int(item["source_page"])
+                    for item in page_metadata
+                    if item.get("ocr_outcome")
+                    in {_OCR_OUTCOME_ZERO, _OCR_OUTCOME_EXPLICIT_NONTEXT}
+                    and isinstance(item.get("source_page"), int)
+                }
+                candidate_errors = [
+                    item for item in page_errors if item.get("source_page") in candidate_pages
+                ]
+                if candidate_errors and not defer_empty_pages:
+                    preview = "; ".join(
+                        f"p{item['source_page']}: {item['error']}" for item in candidate_errors[:3]
+                    )
+                    raise RuntimeError(
+                        f"{engine} has unresolved nonblank zero-output pages: {preview}"
+                    )
                 elapsed = perf_counter() - start
                 chandra_sidecar_note = next(
                     (
@@ -2654,7 +2912,11 @@ def run_ocr_benchmark(
                 results.append(
                     _make_result(
                         engine=engine,
-                        status="ok",
+                        status=(
+                            _OCR_STATUS_RECONCILIATION_PENDING
+                            if candidate_errors and defer_empty_pages
+                            else "ok"
+                        ),
                         sample_pages=sample_pages,
                         elapsed_seconds=elapsed,
                         artifact_path=artifact_path,

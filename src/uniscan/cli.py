@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hmac
+import os
 from pathlib import Path
 
 from uniscan.app import (
@@ -79,6 +81,11 @@ def main(argv: list[str] | None = None) -> int:
         "--strict",
         action="store_true",
         help="Return non-zero exit code when any engine is not ok.",
+    )
+    ocr_benchmark_parser.add_argument(
+        "--internal-reconciliation-token",
+        default=None,
+        help=argparse.SUPPRESS,
     )
 
     ocr_canonical_parser = subparsers.add_parser(
@@ -370,6 +377,18 @@ def main(argv: list[str] | None = None) -> int:
             page_numbers = parse_page_numbers(args.pages)
         except ValueError as exc:
             parser.error(str(exc))
+        internal_token = str(args.internal_reconciliation_token or "").strip()
+        expected_token = os.environ.pop(
+            "UNISCAN_INTERNAL_RECONCILIATION_TOKEN",
+            "",
+        ).strip()
+        if internal_token and (
+            len(internal_token) != 32
+            or len(expected_token) != 32
+            or not hmac.compare_digest(internal_token, expected_token)
+        ):
+            parser.error("invalid internal reconciliation context")
+        defer_empty_pages = bool(internal_token and expected_token)
         benchmark_results = run_ocr_benchmark(
             pdf_path=args.pdf,
             output_dir=args.output,
@@ -378,8 +397,11 @@ def main(argv: list[str] | None = None) -> int:
             page_numbers=page_numbers,
             dpi=args.dpi,
             lang=args.lang,
+            defer_empty_pages=defer_empty_pages,
         )
         print(summarize_ocr_benchmark(benchmark_results))
+        if any(result.status == "reconciliation_pending" for result in benchmark_results):
+            return 1
         if args.strict and any(result.status != "ok" for result in benchmark_results):
             return 1
         return 0

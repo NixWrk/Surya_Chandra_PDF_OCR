@@ -714,7 +714,11 @@ def test_run_extraction_engine_pagewise_accepts_blank_surya_page(
     assert page_texts == ["page-1", ""]
     assert chars == len("page-1")
     assert page_errors == []
-    assert page_metadata[1] == {"source_page": 2, "blank_page": True}
+    assert page_metadata[1]["source_page"] == 2
+    assert page_metadata[1]["blank_page"] is True
+    assert page_metadata[1]["ocr_outcome"] == "verified_blank"
+    assert page_metadata[1]["attempt_count"] == 1
+    assert page_metadata[1]["alnum_chars"] == 0
     assert progress_steps == [(1, 2, 1), (2, 2, 2)]
 
     pdf_path = tmp_path / "fixture.pdf"
@@ -738,7 +742,7 @@ def test_run_extraction_engine_pagewise_reports_missing_surya_page_geometry(
 ) -> None:
     image_paths = [tmp_path / f"p{idx}.png" for idx in range(1, 4)]
     for image_path in image_paths:
-        image_path.write_bytes(b"img")
+        Image.new("RGB", (200, 300), "black").save(image_path)
 
     def fake_surya_direct(_image_paths, *, lang, work_dir, which_fn, run_cmd):
         sidecar = work_dir / "surya_page_lines.json"
@@ -763,7 +767,33 @@ def test_run_extraction_engine_pagewise_reports_missing_surya_page_geometry(
         )
         return "aggregate", 9
 
+    retry_calls: list[Path] = []
+
+    def fake_surya_retry(_image_paths, *, lang, work_dir, which_fn, run_cmd):
+        assert len(_image_paths) == 1
+        retry_image = _image_paths[0]
+        retry_calls.append(retry_image)
+        with Image.open(retry_image) as image:
+            assert image.size == (200, 300)
+        sidecar = work_dir / "surya_page_lines.json"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "images": [
+                        {
+                            "image_name": retry_image.name,
+                            "pages": [{"text_lines": []}],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return "", 0
+
     monkeypatch.setattr(ocr_benchmark_mod, "_run_surya_direct", fake_surya_direct)
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_surya_module_cli", fake_surya_retry)
     monkeypatch.setenv("UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON", "0")
     progress_steps: list[tuple[int, int, int]] = []
 
@@ -785,7 +815,10 @@ def test_run_extraction_engine_pagewise_reports_missing_surya_page_geometry(
     assert page_texts == ["page-1", "", "page-3"]
     assert chars == len("page-1") + len("page-3")
     assert [item["source_page"] for item in page_errors] == [2]
-    assert [item["source_page"] for item in page_metadata] == [1, 3]
+    assert [item["source_page"] for item in page_metadata] == [1, 3, 2]
+    assert page_metadata[-1]["ocr_outcome"] == "zero_output"
+    assert page_metadata[-1]["attempt_count"] == 2
+    assert len(retry_calls) == 1
     assert progress_steps == [(1, 3, 1), (2, 3, 3)]
 
 
@@ -1027,6 +1060,89 @@ def test_run_ocr_benchmark_surfaces_chandra_sidecar_warning_in_note(
     assert results[0].page_error_count == 1
 
 
+
+def test_run_ocr_benchmark_deferred_candidate_is_pending_not_ok(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    pdf_path = _build_sample_pdf(tmp_path, [50])
+    output_dir = tmp_path / "out"
+
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "detect_ocr_engine_status",
+        lambda engine_name, **_kwargs: _ready_status(engine_name, searchable_pdf=False),
+    )
+
+    def fake_pagewise(*_args, work_dir, **_kwargs):
+        sidecar = work_dir / "page_0001" / "chandra_page_lines.json"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "images": [
+                        {
+                            "image_name": "page_0001.png",
+                            "ocr_outcome": "explicit_nontext",
+                            "explicit_nontext": True,
+                            "chandra_non_text_labels": ["figure"],
+                            "attempt_count": 2,
+                            "pages": [
+                                {
+                                    "image_bbox": [0, 0, 100, 100],
+                                    "text_lines": [],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return (
+            [""],
+            0,
+            [
+                {
+                    "code": "zero_output",
+                    "source_page": 1,
+                    "image": "page_0001.png",
+                    "error": "Chandra geometry sidecar has no text_lines",
+                }
+            ],
+            [
+                {
+                    "source_page": 1,
+                    "ocr_outcome": "explicit_nontext",
+                    "explicit_nontext": True,
+                    "attempt_count": 2,
+                    "alnum_line_count": 0,
+                    "alnum_chars": 0,
+                    "chandra_page_lines_path": str(sidecar),
+                }
+            ],
+        )
+
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_run_extraction_engine_pagewise",
+        fake_pagewise,
+    )
+
+    results = run_ocr_benchmark(
+        pdf_path=pdf_path,
+        output_dir=output_dir,
+        engines=(OCR_ENGINE_CHANDRA,),
+        sample_size=1,
+        dpi=100,
+        defer_empty_pages=True,
+    )
+
+    assert results[0].status == "reconciliation_pending"
+    assert results[0].page_error_count == 1
+    report = json.loads((output_dir / "fixture_ocr_benchmark.json").read_text(encoding="utf-8"))
+    assert report["results"][0]["status"] == "reconciliation_pending"
+
 def test_run_extraction_engine_pagewise_requires_chandra_sidecar_by_default(
     tmp_path,
     monkeypatch,
@@ -1219,6 +1335,7 @@ def test_chandra_chunk_lines_preserves_explicit_breaks() -> None:
     raw = "<p>FIRST LINE<br/>SECOND LINE</p><div>THIRD LINE</div>"
     lines = ocr_benchmark_mod._chandra_chunk_lines(raw)
     assert lines == ["FIRST LINE", "SECOND LINE", "THIRD LINE"]
+    assert ocr_benchmark_mod._chandra_chunk_lines(0) == ["0"]
 
 
 def test_chandra_expand_chunk_to_line_boxes_splits_rows() -> None:
@@ -1565,6 +1682,7 @@ def test_cli_benchmark_ocr_uses_runner_and_returns_success(monkeypatch, tmp_path
         assert kwargs["pdf_path"] == pdf_path
         assert kwargs["output_dir"] == output_dir
         assert kwargs["sample_size"] == 5
+        assert kwargs["defer_empty_pages"] is False
         return [
             SimpleNamespace(
                 engine=OCR_ENGINE_PADDLEOCR,
@@ -1592,6 +1710,38 @@ def test_cli_benchmark_ocr_uses_runner_and_returns_success(monkeypatch, tmp_path
     assert exit_code == 0
     assert "paddleocr ok" in stdout
 
+
+
+def test_cli_benchmark_ocr_rejects_manual_internal_reconciliation_token(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    pdf_path = tmp_path / "fixture.pdf"
+    pdf_path.write_bytes(b"%PDF-FAKE")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    monkeypatch.delenv("UNISCAN_INTERNAL_RECONCILIATION_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "uniscan.cli.run_ocr_benchmark",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("manual internal context must fail before benchmark")
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "benchmark-ocr",
+                "--pdf",
+                str(pdf_path),
+                "--output",
+                str(output_dir),
+                "--internal-reconciliation-token",
+                "0" * 32,
+            ]
+        )
+
+    assert exc_info.value.code == 2
 
 def test_cli_benchmark_ocr_parses_pages(monkeypatch, tmp_path, capsys) -> None:
     pdf_path = tmp_path / "fixture.pdf"

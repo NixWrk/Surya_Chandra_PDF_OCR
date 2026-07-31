@@ -772,6 +772,7 @@ def test_run_basic_ocr_benchmark_supports_engine_python_override(monkeypatch) ->
         assert timeout is None
         assert cmd[0] == str(fake_surya_python)
         assert cmd[cmd.index("--dpi") + 1] == "275"
+        assert "--internal-reconciliation-token" not in cmd
         output_dir = Path(cmd[cmd.index("--output") + 1])
         engine = cmd[cmd.index("--engines") + 1]
         report_path = output_dir / f"{pdf_path.stem}_ocr_benchmark.json"
@@ -817,6 +818,59 @@ def test_run_basic_ocr_benchmark_supports_engine_python_override(monkeypatch) ->
     assert summary.results[0].engine == "surya"
     assert summary.results[0].status == "ok"
     assert summary.failed_engines == tuple()
+
+
+
+def test_engine_subprocess_defer_uses_matching_internal_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "input.pdf"
+    pdf_path.write_bytes(b"%PDF-FAKE")
+    output_dir = tmp_path / "engine"
+
+    def fake_subprocess_run(cmd, **kwargs):
+        token_index = cmd.index("--internal-reconciliation-token") + 1
+        token = cmd[token_index]
+        assert len(token) == 32
+        assert kwargs["env"]["UNISCAN_INTERNAL_RECONCILIATION_TOKEN"] == token
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "input_ocr_benchmark.json").write_text(
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "engine": "surya",
+                            "status": "reconciliation_pending",
+                            "sample_pages": [1],
+                            "elapsed_seconds": 0.1,
+                            "artifact_path": str(output_dir / "input_surya.txt"),
+                            "text_chars": 0,
+                            "page_error_count": 1,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(ocr_pipeline.subprocess, "run", fake_subprocess_run)
+
+    result = ocr_pipeline._run_engine_benchmark_subprocess(
+        python_exe=tmp_path / "python.exe",
+        engine="surya",
+        pdf_path=pdf_path,
+        output_dir=output_dir,
+        sample_size=1,
+        page_numbers=(1,),
+        lang="eng",
+        dpi=220,
+        defer_empty_pages=True,
+    )
+
+    assert result.status == "reconciliation_pending"
+    assert result.page_error_count == 1
 
 
 def test_engine_subprocess_timeout_raises_runtime_error(monkeypatch) -> None:

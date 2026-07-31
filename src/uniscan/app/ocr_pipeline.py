@@ -8,12 +8,13 @@ import os
 import shutil
 import subprocess
 from collections.abc import Iterator
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 from uniscan.ocr import (
@@ -65,7 +66,8 @@ ProgressCallback = Callable[[int, str], None]
 
 _DEFAULT_HYBRID_CHUNK_PAGES = 10
 _HYBRID_CHUNK_MANIFEST_SCHEMA = "uniscan.hybrid-chunks.v2"
-_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v1"
+_OCR_STATUS_RECONCILIATION_PENDING = "reconciliation_pending"
+_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v2"
 _MAX_CHUNK_MANIFEST_BYTES = 16 * 1024 * 1024
 _FILE_HASH_BLOCK_BYTES = 1024 * 1024
 _HYBRID_IDENTITY_ENV_KEYS: tuple[str, ...] = (
@@ -231,6 +233,7 @@ def _run_engine_benchmark_subprocess(
     page_numbers: tuple[int, ...] | None,
     lang: str,
     dpi: int,
+    defer_empty_pages: bool = False,
 ) -> OcrBenchmarkResult:
     repo_root = Path(__file__).resolve().parents[3]
     cmd = [
@@ -251,11 +254,17 @@ def _run_engine_benchmark_subprocess(
         "--dpi",
         str(int(dpi)),
     ]
+    internal_token: str | None = None
+    if defer_empty_pages:
+        internal_token = uuid.uuid4().hex
+        cmd.extend(["--internal-reconciliation-token", internal_token])
     if page_numbers:
         page_arg = ",".join(str(int(page)) for page in page_numbers)
         cmd.extend(["--pages", page_arg])
 
     env = _build_engine_subprocess_env(engine=engine, repo_root=repo_root)
+    if internal_token is not None:
+        env["UNISCAN_INTERNAL_RECONCILIATION_TOKEN"] = internal_token
     timeout_seconds = _engine_subprocess_timeout_seconds()
     try:
         proc = subprocess.run(
@@ -314,6 +323,668 @@ def _ensure_requested_engines_succeeded(
     details.extend(f"failed: {item}" for item in benchmark.failed_engines)
     details.extend(f"skipped: {item}" for item in benchmark.skipped_engines)
     raise RuntimeError("Strict OCR benchmark is incomplete: " + " | ".join(details))
+
+
+def _load_engine_page_index(
+    *,
+    run_dir: Path,
+    engine: str,
+) -> tuple[Path, dict[str, Any], dict[int, dict[str, Any]]]:
+    pages_path = run_dir / engine / engine / "pages.json"
+    try:
+        payload = json.loads(pages_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"{engine} page evidence is unreadable: {pages_path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("engine") != engine:
+        raise RuntimeError(f"{engine} page evidence has an invalid root: {pages_path}")
+    raw_pages = payload.get("pages")
+    if not isinstance(raw_pages, list):
+        raise RuntimeError(f"{engine} page evidence has no pages list: {pages_path}")
+    by_page: dict[int, dict[str, Any]] = {}
+    for row in raw_pages:
+        if not isinstance(row, dict):
+            raise RuntimeError(f"{engine} page evidence contains a non-object row")
+        source_page = row.get("source_page")
+        if (
+            not isinstance(source_page, int)
+            or isinstance(source_page, bool)
+            or source_page <= 0
+            or source_page in by_page
+        ):
+            raise RuntimeError(
+                f"{engine} page evidence has an invalid or duplicate source_page: {source_page!r}"
+            )
+        by_page[source_page] = row
+    if not by_page:
+        raise RuntimeError(f"{engine} page evidence is empty: {pages_path}")
+    return pages_path, payload, by_page
+
+
+def _owned_page_artifact(*, engine_dir: Path, raw_name: object, label: str) -> Path:
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise RuntimeError(f"Accepted textless graphics page has no {label} artifact")
+    candidate = (engine_dir / raw_name).resolve()
+    if not _path_is_within(candidate, engine_dir) or not candidate.is_file():
+        raise RuntimeError(f"Accepted textless graphics {label} artifact is invalid: {candidate}")
+    return candidate
+
+
+def _json_bytes(payload: object) -> bytes:
+    return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _textless_geometry_bytes(path: Path) -> bytes:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("images"), list):
+        raise RuntimeError(f"Geometry sidecar is malformed: {path}")
+    page_entries = 0
+    for image in payload["images"]:
+        if not isinstance(image, dict):
+            raise RuntimeError(f"Geometry sidecar contains a non-object image: {path}")
+        image["ocr_outcome"] = "textless_graphics"
+        pages = image.get("pages")
+        if not isinstance(pages, list):
+            raise RuntimeError(f"Geometry sidecar image has no pages list: {path}")
+        for page in pages:
+            if not isinstance(page, dict):
+                raise RuntimeError(f"Geometry sidecar contains a non-object page: {path}")
+            page["text_lines"] = []
+            page["ocr_outcome"] = "textless_graphics"
+            page_entries += 1
+    if page_entries == 0:
+        raise RuntimeError(f"Geometry sidecar has no page entry: {path}")
+    return _json_bytes(payload)
+
+
+def _stage_textless_graphics_artifacts(
+    *,
+    pages_path: Path,
+    payload: dict[str, Any],
+    accepted_pages: set[int],
+    aggregate_path: Path,
+) -> tuple[int, dict[Path, bytes]]:
+    payload = deepcopy(payload)
+    engine_dir = pages_path.parent.resolve()
+    engine_output_dir = engine_dir.parent.resolve()
+    aggregate_path = aggregate_path.resolve()
+    if not _path_is_within(aggregate_path, engine_output_dir) or not aggregate_path.is_file():
+        raise RuntimeError(
+            f"Accepted textless graphics aggregate artifact is invalid: {aggregate_path}"
+        )
+    raw_pages = payload.get("pages")
+    if not isinstance(raw_pages, list):
+        raise RuntimeError(f"Page evidence has no pages list: {pages_path}")
+    updates: dict[Path, bytes] = {}
+    blocks: list[str] = []
+    total_chars = 0
+    for row in raw_pages:
+        if not isinstance(row, dict):
+            raise RuntimeError(f"Page evidence contains a non-object row: {pages_path}")
+        source_page = int(row["source_page"])
+        page_file = _owned_page_artifact(
+            engine_dir=engine_dir,
+            raw_name=row.get("file"),
+            label="text",
+        )
+        if source_page in accepted_pages:
+            geometry_file = _owned_page_artifact(
+                engine_dir=engine_dir,
+                raw_name=row.get("geometry_file"),
+                label="geometry",
+            )
+            updates[geometry_file] = _textless_geometry_bytes(geometry_file)
+            updates[page_file] = b""
+            row["text_chars"] = 0
+            row["ocr_outcome"] = "textless_graphics"
+            row["alnum_line_count"] = 0
+            row["alnum_chars"] = 0
+            original_errors = row.get("page_errors")
+            if isinstance(original_errors, list) and original_errors:
+                row["reconciled_page_errors"] = list(original_errors)
+            row["page_errors"] = []
+            row["textless_graphics"] = True
+            row["accepted_by"] = "mode_both_page_reconciliation"
+        text = "" if source_page in accepted_pages else page_file.read_text(encoding="utf-8")
+        row["text_chars"] = len(text)
+        total_chars += len(text)
+        blocks.append(f"[SOURCE PAGE {source_page:04d}]")
+        if text:
+            blocks.append(text.rstrip())
+        blocks.append("")
+    markerized = "\n".join(blocks).strip()
+    markerized = markerized + "\n" if markerized else ""
+    aggregate_file = _owned_page_artifact(
+        engine_dir=engine_dir,
+        raw_name=payload.get("aggregate_file"),
+        label="aggregate",
+    )
+    markerized_bytes = markerized.encode("utf-8")
+    updates[aggregate_file] = markerized_bytes
+    updates[aggregate_path] = markerized_bytes
+    payload["total_text_chars"] = total_chars
+    updates[pages_path] = _json_bytes(payload)
+    return total_chars, updates
+
+def _stage_bytes(target: Path, data: bytes) -> Path:
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.transaction")
+    with temporary.open("wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return temporary
+
+
+def _publish_file_transaction(updates: Mapping[Path, bytes]) -> None:
+    ordered_updates: list[tuple[Path, bytes]] = []
+    seen: set[Path] = set()
+    for raw_path, data in updates.items():
+        target = raw_path.resolve()
+        if target in seen:
+            raise RuntimeError(f"Duplicate transaction target: {target}")
+        if not target.is_file():
+            raise RuntimeError(f"Transaction target is missing: {target}")
+        seen.add(target)
+        ordered_updates.append((target, data))
+
+    originals = {target: target.read_bytes() for target, _data in ordered_updates}
+    staged: dict[Path, Path] = {}
+    published: list[Path] = []
+    try:
+        for target, data in ordered_updates:
+            staged[target] = _stage_bytes(target, data)
+        for target, _data in ordered_updates:
+            os.replace(staged[target], target)
+            published.append(target)
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for target in reversed(published):
+            restore_path: Path | None = None
+            try:
+                restore_path = _stage_bytes(target, originals[target])
+                os.replace(restore_path, target)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{target}: {rollback_exc}")
+            finally:
+                if restore_path is not None:
+                    restore_path.unlink(missing_ok=True)
+        if rollback_errors:
+            raise RuntimeError(
+                "File transaction failed and rollback was incomplete: "
+                + " | ".join(rollback_errors)
+            ) from exc
+        raise
+    finally:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)
+
+
+
+def _load_benchmark_report_index(
+    *,
+    run_dir: Path,
+    result_files: Sequence[Path],
+    expected_engines: set[str],
+) -> dict[str, tuple[Path, dict[str, Any], int]]:
+    report_by_engine: dict[str, tuple[Path, dict[str, Any], int]] = {}
+    for raw_path in result_files:
+        report_path = raw_path.resolve()
+        if not _path_is_within(report_path, run_dir) or not report_path.is_file():
+            raise RuntimeError(f"Benchmark result file is not owned by the run: {report_path}")
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Benchmark result file is unreadable: {report_path}: {exc}") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+            raise RuntimeError(f"Benchmark result file is malformed: {report_path}")
+        rows = payload["results"]
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise RuntimeError(f"Benchmark result row is malformed: {report_path}")
+            engine = str(row.get("engine") or "").strip().lower()
+            if engine not in expected_engines:
+                continue
+            if engine in report_by_engine:
+                raise RuntimeError(f"Duplicate benchmark result file for engine: {engine}")
+            report_by_engine[engine] = (report_path, payload, index)
+    missing = expected_engines - set(report_by_engine)
+    if missing:
+        raise RuntimeError(f"Missing benchmark result files for engines: {sorted(missing)}")
+    return report_by_engine
+
+
+def _page_error_records(
+    row: dict[str, Any],
+    *,
+    engine: str,
+    source_page: int,
+) -> list[dict[str, str]]:
+    raw_errors = row.get("page_errors", [])
+    if not isinstance(raw_errors, list):
+        raise RuntimeError(
+            f"{engine} page {source_page} has malformed durable page-error evidence"
+        )
+    records: list[dict[str, str]] = []
+    for item in raw_errors:
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                f"{engine} page {source_page} has an unstructured page error"
+            )
+        code = str(item.get("code") or "").strip()
+        message = str(item.get("message") or "").strip()
+        if not code or not message:
+            raise RuntimeError(
+                f"{engine} page {source_page} has an incomplete page-error record"
+            )
+        records.append({"code": code, "message": message})
+    return records
+
+
+def _stage_benchmark_reports(
+    *,
+    report_by_engine: dict[str, tuple[Path, dict[str, Any], int]],
+    results: Sequence[OcrBenchmarkResult],
+) -> dict[Path, bytes]:
+    updates: dict[Path, bytes] = {}
+    for result in results:
+        report_path, original_payload, index = report_by_engine[result.engine]
+        payload = deepcopy(original_payload)
+        rows = payload["results"]
+        assert isinstance(rows, list)
+        rows[index] = asdict(result)
+        updates[report_path] = _json_bytes(payload)
+    return updates
+
+
+def _alnum_artifact_evidence(text: str) -> tuple[int, int]:
+    lines = [line for line in text.splitlines() if any(char.isalnum() for char in line)]
+    return len(lines), sum(1 for line in lines for char in line if char.isalnum())
+
+
+def _verified_surya_quiet_evidence(
+    *,
+    row: dict[str, Any],
+    engine_dir: Path,
+    source_page: int,
+    expected_outcome: str,
+) -> tuple[int, int]:
+    page_file = _owned_page_artifact(
+        engine_dir=engine_dir,
+        raw_name=row.get("file"),
+        label="text",
+    )
+    artifact_lines, artifact_chars = _alnum_artifact_evidence(
+        page_file.read_text(encoding="utf-8")
+    )
+    stored_lines = row.get("alnum_line_count")
+    stored_chars = row.get("alnum_chars")
+    if (
+        not isinstance(stored_lines, int)
+        or isinstance(stored_lines, bool)
+        or stored_lines < 0
+        or not isinstance(stored_chars, int)
+        or isinstance(stored_chars, bool)
+        or stored_chars < 0
+        or (stored_lines, stored_chars) != (artifact_lines, artifact_chars)
+    ):
+        raise RuntimeError(
+            f"surya page {source_page} alnum evidence does not match its text artifact"
+        )
+
+    geometry_file = _owned_page_artifact(
+        engine_dir=engine_dir,
+        raw_name=row.get("geometry_file"),
+        label="geometry",
+    )
+    sidecar = json.loads(geometry_file.read_text(encoding="utf-8"))
+    images = sidecar.get("images") if isinstance(sidecar, dict) else None
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise RuntimeError(f"surya page {source_page} geometry evidence is malformed")
+    image = images[0]
+    if str(image.get("ocr_outcome") or "") != expected_outcome:
+        raise RuntimeError(f"surya page {source_page} outcome disagrees with its sidecar")
+    sidecar_chars = 0
+    pages = image.get("pages")
+    if not isinstance(pages, list) or not pages:
+        raise RuntimeError(f"surya page {source_page} sidecar has no page entry")
+    for page in pages:
+        if not isinstance(page, dict) or not isinstance(page.get("text_lines"), list):
+            raise RuntimeError(f"surya page {source_page} sidecar lines are malformed")
+        for line in page["text_lines"]:
+            if not isinstance(line, dict):
+                raise RuntimeError(f"surya page {source_page} sidecar line is malformed")
+            sidecar_chars += sum(
+                1 for char in str(line.get("text") or "") if char.isalnum()
+            )
+    if sidecar_chars != artifact_chars:
+        raise RuntimeError(
+            f"surya page {source_page} sidecar text disagrees with its text artifact"
+        )
+    return artifact_lines, artifact_chars
+
+
+def _verified_chandra_explicit_nontext(
+    *,
+    row: dict[str, Any],
+    engine_dir: Path,
+    source_page: int,
+) -> bool:
+    page_file = _owned_page_artifact(
+        engine_dir=engine_dir,
+        raw_name=row.get("file"),
+        label="text",
+    )
+    if page_file.read_text(encoding="utf-8").strip():
+        raise RuntimeError(f"chandra page {source_page} text artifact is not empty")
+    geometry_file = _owned_page_artifact(
+        engine_dir=engine_dir,
+        raw_name=row.get("geometry_file"),
+        label="geometry",
+    )
+    sidecar = json.loads(geometry_file.read_text(encoding="utf-8"))
+    images = sidecar.get("images") if isinstance(sidecar, dict) else None
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise RuntimeError(f"chandra page {source_page} geometry evidence is malformed")
+    image = images[0]
+    labels = image.get("chandra_non_text_labels")
+    if not isinstance(labels, list) or any(not isinstance(label, str) for label in labels):
+        raise RuntimeError(f"chandra page {source_page} nontext labels are malformed")
+    normalized_labels = {label.strip().lower() for label in labels if label.strip()}
+    allowed_labels = {"blank-page", "image", "figure", "diagram"}
+    graphic_labels = {"image", "figure", "diagram"}
+    pages = image.get("pages")
+    if not isinstance(pages, list) or not pages:
+        raise RuntimeError(f"chandra page {source_page} sidecar has no page entry")
+    for page in pages:
+        if not isinstance(page, dict) or page.get("text_lines") != []:
+            raise RuntimeError(f"chandra page {source_page} sidecar is not textless")
+    return (
+        str(image.get("ocr_outcome") or "") == "explicit_nontext"
+        and image.get("explicit_nontext") is True
+        and bool(normalized_labels & graphic_labels)
+        and normalized_labels <= allowed_labels
+    )
+
+
+
+def _reconcile_mode_both_pages(
+    *,
+    run_dir: Path,
+    results: list[OcrBenchmarkResult],
+    result_files: Sequence[Path],
+) -> tuple[list[OcrBenchmarkResult], str | None]:
+    result_by_engine = {
+        result.engine: result
+        for result in results
+        if result.status in {"ok", _OCR_STATUS_RECONCILIATION_PENDING}
+    }
+    if set(result_by_engine) != {"surya", "chandra"}:
+        return results, "both successful engine results are required"
+    try:
+        surya_path, surya_payload, surya_pages = _load_engine_page_index(
+            run_dir=run_dir,
+            engine="surya",
+        )
+        chandra_path, chandra_payload, chandra_pages = _load_engine_page_index(
+            run_dir=run_dir,
+            engine="chandra",
+        )
+        report_by_engine = _load_benchmark_report_index(
+            run_dir=run_dir,
+            result_files=result_files,
+            expected_engines={"surya", "chandra"},
+        )
+    except RuntimeError as exc:
+        report: dict[str, object] = {
+            "schema": "uniscan.page-reconciliation.v1",
+            "status": "error",
+            "error": str(exc),
+        }
+        _write_json_atomic(run_dir / "page_reconciliation.json", report)
+        return results, str(exc)
+
+    if set(surya_pages) != set(chandra_pages):
+        error = (
+            "engine page evidence is not bijective: "
+            f"surya={sorted(surya_pages)}, chandra={sorted(chandra_pages)}"
+        )
+        _write_json_atomic(
+            run_dir / "page_reconciliation.json",
+            {"schema": "uniscan.page-reconciliation.v1", "status": "error", "error": error},
+        )
+        return results, error
+
+    error_records_by_engine: dict[str, dict[int, list[dict[str, str]]]] = {}
+    try:
+        for engine, page_index in (
+            ("surya", surya_pages),
+            ("chandra", chandra_pages),
+        ):
+            records_by_page = {
+                source_page: _page_error_records(
+                    row,
+                    engine=engine,
+                    source_page=source_page,
+                )
+                for source_page, row in page_index.items()
+            }
+            recorded_count = sum(len(records) for records in records_by_page.values())
+            expected_count = max(0, int(result_by_engine[engine].page_error_count))
+            if recorded_count != expected_count:
+                raise RuntimeError(
+                    f"{engine} page-error evidence count mismatch: "
+                    f"report={expected_count}, pages={recorded_count}"
+                )
+            error_records_by_engine[engine] = records_by_page
+    except RuntimeError as exc:
+        error = str(exc)
+        _write_json_atomic(
+            run_dir / "page_reconciliation.json",
+            {
+                "schema": "uniscan.page-reconciliation.v1",
+                "status": "error",
+                "exact_page_bijection": True,
+                "error": error,
+            },
+        )
+        return results, error
+
+    rows: list[dict[str, Any]] = []
+    accepted_graphics: list[int] = []
+    unresolved: list[int] = []
+    ordered_pages = sorted(surya_pages)
+    for source_page in ordered_pages:
+        surya = surya_pages[source_page]
+        chandra = chandra_pages[source_page]
+        surya_outcome = str(surya.get("ocr_outcome") or "")
+        chandra_outcome = str(chandra.get("ocr_outcome") or "")
+        surya_errors = error_records_by_engine["surya"][source_page]
+        chandra_errors = error_records_by_engine["chandra"][source_page]
+        reason = ""
+        accepted = False
+        surya_alnum_lines = surya.get("alnum_line_count")
+        surya_alnum_chars = surya.get("alnum_chars")
+        if surya_outcome == "text" and chandra_outcome == "text":
+            reason = "both_text"
+            accepted = True
+        elif surya_outcome == "verified_blank" and chandra_outcome == "verified_blank":
+            reason = "both_verified_blank"
+            accepted = True
+        elif chandra_outcome == "explicit_nontext" and chandra.get("explicit_nontext") is True:
+            try:
+                surya_alnum_lines, surya_alnum_chars = _verified_surya_quiet_evidence(
+                    row=surya,
+                    engine_dir=surya_path.parent.resolve(),
+                    source_page=source_page,
+                    expected_outcome=surya_outcome,
+                )
+                verified_chandra = _verified_chandra_explicit_nontext(
+                    row=chandra,
+                    engine_dir=chandra_path.parent.resolve(),
+                    source_page=source_page,
+                )
+            except RuntimeError as exc:
+                reason = f"invalid_candidate_evidence: {exc}"
+            else:
+                surya_error_codes = [item["code"] for item in surya_errors]
+                chandra_error_codes = [item["code"] for item in chandra_errors]
+                expected_errors = (
+                    chandra_error_codes == ["zero_output"]
+                    and (
+                        (
+                            surya_outcome == "zero_output"
+                            and surya_error_codes == ["zero_output"]
+                        )
+                        or (surya_outcome == "text" and not surya_error_codes)
+                    )
+                )
+                quiet_surya = (
+                    surya_outcome in {"zero_output", "text"}
+                    and surya_alnum_lines <= 1
+                    and surya_alnum_chars <= 8
+                )
+                if verified_chandra and quiet_surya and expected_errors:
+                    reason = "explicit_chandra_nontext_with_quiet_surya"
+                    accepted = True
+                    accepted_graphics.append(source_page)
+                elif not expected_errors:
+                    reason = "unrelated_page_error"
+                elif not verified_chandra:
+                    reason = "invalid_chandra_nontext_evidence"
+        if accepted and source_page not in accepted_graphics and (
+            surya_errors or chandra_errors
+        ):
+            accepted = False
+            reason = "unrelated_page_error"
+
+        if not accepted:
+            reason = reason or "unresolved_engine_outcome"
+            unresolved.append(source_page)
+        rows.append(
+            {
+                "source_page": source_page,
+                "surya_outcome": surya_outcome,
+                "chandra_outcome": chandra_outcome,
+                "surya_alnum_line_count": surya_alnum_lines,
+                "surya_alnum_chars": surya_alnum_chars,
+                "surya_page_error_count": len(surya_errors),
+                "chandra_page_error_count": len(chandra_errors),
+                "accepted": accepted,
+                "reason": reason,
+            }
+        )
+
+    row_by_page = {int(row["source_page"]): row for row in rows}
+    recovered_by_chunk: dict[int, list[int]] = {}
+    for source_page in accepted_graphics:
+        recovered_by_chunk.setdefault((source_page - 1) // 10, []).append(source_page)
+    for recovered in recovered_by_chunk.values():
+        if len(recovered) > 1:
+            for source_page in recovered:
+                row_by_page[source_page]["accepted"] = False
+                row_by_page[source_page]["reason"] = "graphics_recovery_cap_exceeded"
+                if source_page not in unresolved:
+                    unresolved.append(source_page)
+            accepted_graphics = [
+                source_page for source_page in accepted_graphics if source_page not in recovered
+            ]
+    report = {
+        "schema": "uniscan.page-reconciliation.v1",
+        "status": "error" if unresolved else "pending",
+        "exact_page_bijection": True,
+        "accepted_textless_graphics_pages": accepted_graphics,
+        "unresolved_pages": sorted(unresolved),
+        "pages": rows,
+    }
+    reconciliation_path = run_dir / "page_reconciliation.json"
+    if unresolved:
+        error = f"unresolved pages: {sorted(unresolved)}"
+        report["error"] = error
+        _write_json_atomic(reconciliation_path, report)
+        return results, error
+
+    accepted_set = set(accepted_graphics)
+    reconciled_error_counts = {
+        engine: sum(
+            len(error_records_by_engine[engine][source_page])
+            for source_page in accepted_set
+        )
+        for engine in ("surya", "chandra")
+    }
+    _write_json_atomic(reconciliation_path, report)
+    try:
+        updates: dict[Path, bytes] = {}
+        if accepted_set:
+            surya_chars, surya_updates = _stage_textless_graphics_artifacts(
+                pages_path=surya_path,
+                payload=surya_payload,
+                accepted_pages=accepted_set,
+                aggregate_path=Path(str(result_by_engine["surya"].artifact_path)),
+            )
+            chandra_chars, chandra_updates = _stage_textless_graphics_artifacts(
+                pages_path=chandra_path,
+                payload=chandra_payload,
+                accepted_pages=accepted_set,
+                aggregate_path=Path(str(result_by_engine["chandra"].artifact_path)),
+            )
+            rewritten_chars = {"surya": surya_chars, "chandra": chandra_chars}
+            for staged_updates in (surya_updates, chandra_updates):
+                for raw_path, data in staged_updates.items():
+                    target = raw_path.resolve()
+                    if target in updates:
+                        raise RuntimeError(f"Duplicate staged artifact: {target}")
+                    updates[target] = data
+        else:
+            rewritten_chars = {
+                engine: result.text_chars for engine, result in result_by_engine.items()
+            }
+        adjusted = [
+            replace(
+                result,
+                status="ok",
+                text_chars=rewritten_chars.get(result.engine, result.text_chars),
+                page_error_count=max(
+                    0,
+                    int(result.page_error_count)
+                    - reconciled_error_counts.get(result.engine, 0),
+                ),
+                note=(
+                    f"accepted textless graphics pages: {accepted_graphics}"
+                    if accepted_graphics
+                    else result.note
+                ),
+            )
+            for result in results
+        ]
+        residual_errors = {
+            result.engine: result.page_error_count
+            for result in adjusted
+            if result.page_error_count != 0
+        }
+        if residual_errors:
+            raise RuntimeError(f"unreconciled page errors remain: {residual_errors}")
+        for raw_path, data in _stage_benchmark_reports(
+            report_by_engine=report_by_engine,
+            results=adjusted,
+        ).items():
+            target = raw_path.resolve()
+            if target in updates:
+                raise RuntimeError(f"Duplicate staged report: {target}")
+            updates[target] = data
+        report["status"] = "ok"
+        report["reconciled_page_error_counts"] = reconciled_error_counts
+        report["result_text_chars"] = rewritten_chars
+        updates[reconciliation_path.resolve()] = _json_bytes(report)
+        _publish_file_transaction(updates)
+    except Exception as exc:
+        error = f"artifact reconciliation failed: {exc}"
+        report["status"] = "error"
+        report["error"] = error
+        try:
+            _write_json_atomic(reconciliation_path, report)
+        except OSError:
+            pass
+        return results, error
+    return adjusted, None
 
 
 def normalize_pdf_mode(raw: str | None) -> str:
@@ -427,6 +1098,8 @@ def _hybrid_runtime_config() -> dict[str, object]:
     return {
         "effective_ocr_render_dpi": _resolve_ocr_render_dpi(),
         "effective_textless_dpi": _resolve_textless_dpi(),
+        "zero_output_retry_policy": "original+autocontrast-cutoff-1-max2-v1",
+        "page_reconciliation_policy": "explicit-chandra-nontext+quiet-surya-v1",
         "environment": {key: os.environ.get(key) for key in _HYBRID_IDENTITY_ENV_KEYS},
     }
 
@@ -685,7 +1358,7 @@ def _merge_pdf_chunks(
     return output_pdf
 
 
-def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -919,6 +1592,7 @@ def run_basic_ocr_benchmark(
                         page_numbers=page_numbers,
                         lang=lang,
                         dpi=render_dpi,
+                        defer_empty_pages=(selected_mode == MODE_BOTH),
                     )
                 except Exception as exc:
                     failed_engines.append(f"{engine}: {exc}")
@@ -935,6 +1609,7 @@ def run_basic_ocr_benchmark(
                     dpi=render_dpi,
                     lang=lang,
                     progress=_engine_progress,
+                    defer_empty_pages=(selected_mode == MODE_BOTH),
                 )
                 if not engine_results:
                     failed_engines.append(f"{engine}: benchmark returned no result")
@@ -951,11 +1626,24 @@ def run_basic_ocr_benchmark(
             report_path = engine_output / f"{resolved_pdf.stem}_ocr_benchmark.json"
             if report_path.exists():
                 result_files.append(report_path)
-            if result.status != "ok":
+            pending_reconciliation = (
+                selected_mode == MODE_BOTH
+                and result.status == _OCR_STATUS_RECONCILIATION_PENDING
+            )
+            if result.status != "ok" and not pending_reconciliation:
                 failed_engines.append(f"{engine}: {_result_error_text(result)}")
                 _emit_progress(progress, end_percent, f"Error: {engine}")
                 continue
             _emit_progress(progress, end_percent, f"Done: {engine}")
+
+    if selected_mode == MODE_BOTH and not failed_engines and not skipped_engines:
+        results, reconciliation_error = _reconcile_mode_both_pages(
+            run_dir=run_dir,
+            results=results,
+            result_files=result_files,
+        )
+        if reconciliation_error is not None:
+            failed_engines.append(f"page reconciliation: {reconciliation_error}")
 
     if len(failed_engines) >= len(ready_engines):
         details = "\n\n".join(failed_engines)
