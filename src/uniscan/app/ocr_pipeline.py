@@ -1374,13 +1374,12 @@ def _reconcile_mode_both_pages(
                             engine="chandra",
                             source_page=source_page,
                         )
-                        if surya_geometry is None or (
-                            chandra_geometry.image_name != surya_geometry.image_name
-                            or chandra_geometry.image_bbox != surya_geometry.image_bbox
+                        if (
+                            surya_geometry is None
+                            or chandra_geometry.image_name != surya_geometry.image_name
                         ):
                             raise RuntimeError(
-                                "Chandra page identity or image geometry disagrees with "
-                                "sealed Surya attempt 3"
+                                "Chandra page identity disagrees with sealed Surya attempt 3"
                             )
                     except RuntimeError as exc:
                         reason = "invalid_retry_text_evidence"
@@ -1737,7 +1736,7 @@ def _hybrid_runtime_config() -> dict[str, object]:
         "effective_ocr_render_dpi": _resolve_ocr_render_dpi(),
         "effective_textless_dpi": _resolve_textless_dpi(),
         "zero_output_retry_policy": _SURYA_RETRY_POLICY,
-        "page_reconciliation_policy": "explicit-chandra-nontext+quiet-surya+otsu-text-agreement-v2",
+        "page_reconciliation_policy": "explicit-chandra-nontext+quiet-surya+otsu-text-agreement-v3",
         "environment": {key: os.environ.get(key) for key in _HYBRID_IDENTITY_ENV_KEYS},
     }
 

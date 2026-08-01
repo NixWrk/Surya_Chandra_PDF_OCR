@@ -1006,7 +1006,44 @@ def test_reconcile_chandra_text_uses_benchmark_bbox_reading_order(
     assert all(result.status == "ok" for result in adjusted)
 
 
-@pytest.mark.parametrize("defect", ["wrong-name", "wrong-dimensions", "invalid-bbox"])
+def test_reconcile_accepts_chandra_model_space_geometry(
+    tmp_path: Path,
+) -> None:
+    run_dir, results, result_files = _build_reconciliation_run(
+        tmp_path,
+        surya_rows=[
+            {
+                "source_page": 1,
+                "text": "SOLD OUT",
+                "ocr_outcome": "text",
+                "alnum_line_count": 1,
+                "alnum_chars": 7,
+                **_third_retry_fields(),
+            }
+        ],
+        chandra_rows=[{"source_page": 1, "text": "SOLD OUT", "ocr_outcome": "text"}],
+    )
+    geometry_path = run_dir / "chandra" / "chandra" / "page_0001.chandra.json"
+    payload = json.loads(geometry_path.read_text(encoding="utf-8"))
+    page = payload["images"][0]["pages"][0]
+    page["image_bbox"] = [0, 0, 1535, 1550]
+    page["text_lines"] = [{"text": "SOLD OUT", "bbox": [191, 103, 1310, 714]}]
+    geometry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    adjusted, error = ocr_pipeline._reconcile_mode_both_pages(
+        run_dir=run_dir,
+        results=results,
+        result_files=result_files,
+    )
+
+    assert error is None
+    assert all(result.status == "ok" for result in adjusted)
+    reconciliation = json.loads((run_dir / "page_reconciliation.json").read_text(encoding="utf-8"))
+    assert reconciliation["pages"][0]["accepted"] is True
+    assert reconciliation["pages"][0]["reason"] == "both_text_retry_geometry_agreement"
+
+
+@pytest.mark.parametrize("defect", ["wrong-name", "line-out-of-bounds", "invalid-bbox"])
 def test_reconcile_rejects_invalid_chandra_identity_or_geometry(
     tmp_path: Path,
     defect: str,
@@ -1030,8 +1067,8 @@ def test_reconcile_rejects_invalid_chandra_identity_or_geometry(
     image = payload["images"][0]
     if defect == "wrong-name":
         image["image_name"] = "other-page.png"
-    elif defect == "wrong-dimensions":
-        image["pages"][0]["image_bbox"] = [0, 0, 99, 100]
+    elif defect == "line-out-of-bounds":
+        image["pages"][0]["image_bbox"] = [0, 0, 40, 100]
     else:
         image["pages"][0]["text_lines"][0]["bbox"] = [0, 0, 0, 10]
     geometry_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1418,7 +1455,7 @@ def test_hybrid_cache_identity_includes_retry_and_reconciliation_revision() -> N
     assert ocr_pipeline._HYBRID_CHUNK_MANIFEST_SCHEMA == "uniscan.hybrid-chunks.v3"
     assert config["zero_output_retry_policy"] == ("original+autocontrast-cutoff-1+otsu-max3-v2")
     assert config["page_reconciliation_policy"] == (
-        "explicit-chandra-nontext+quiet-surya+otsu-text-agreement-v2"
+        "explicit-chandra-nontext+quiet-surya+otsu-text-agreement-v3"
     )
 
 
