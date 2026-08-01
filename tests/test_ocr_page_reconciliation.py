@@ -305,6 +305,14 @@ def _third_retry_fields() -> dict[str, Any]:
     }
 
 
+def _third_zero_retry_fields() -> dict[str, Any]:
+    fields = _third_retry_fields()
+    fields.pop("geometry_coordinate_space")
+    fields.pop("geometry_transform")
+    fields["attempt_history"][2]["ocr_outcome"] = "zero_output"
+    return fields
+
+
 def test_inverse_scaled_retry_geometry_uses_actual_odd_axis_scales() -> None:
     raw = ocr_pipeline._SealedPageGeometry(
         image_name="00001.png",
@@ -383,7 +391,9 @@ def test_reconcile_knh_accepts_trivial_surya_without_substituting_its_text(
     assert reconciliation["accepted_textless_graphics_pages"] == [1]
 
 
-def test_reconcile_74_accepts_explicit_graphics_with_zero_surya(tmp_path: Path) -> None:
+def test_reconcile_74_accepts_explicit_graphics_with_third_zero_surya(
+    tmp_path: Path,
+) -> None:
     run_dir, results, result_files = _build_reconciliation_run(
         tmp_path,
         surya_rows=[
@@ -392,6 +402,7 @@ def test_reconcile_74_accepts_explicit_graphics_with_zero_surya(tmp_path: Path) 
                 "text": "",
                 "ocr_outcome": "zero_output",
                 "page_errors": ["Surya geometry sidecar has no text_lines"],
+                **_third_zero_retry_fields(),
             }
         ],
         chandra_rows=[_explicit_graphics_page(1)],
@@ -408,6 +419,88 @@ def test_reconcile_74_accepts_explicit_graphics_with_zero_surya(tmp_path: Path) 
         "surya": 0,
         "chandra": 0,
     }
+    reconciliation = json.loads((run_dir / "page_reconciliation.json").read_text(encoding="utf-8"))
+    assert reconciliation["pages"][0]["reason"] == ("explicit_chandra_nontext_with_quiet_surya")
+    assert reconciliation["accepted_textless_graphics_pages"] == [1]
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "history-outcome",
+        "third-sidecar-text",
+        "third-image-pixels",
+        "selected-sidecar-text",
+        "zero-transform-marker",
+    ],
+)
+def test_reconcile_rejects_tampered_third_zero_lineage(
+    tmp_path: Path,
+    defect: str,
+) -> None:
+    run_dir, results, result_files = _build_reconciliation_run(
+        tmp_path,
+        surya_rows=[
+            {
+                "source_page": 1,
+                "text": "",
+                "ocr_outcome": "zero_output",
+                "page_errors": ["Surya geometry sidecar has no text_lines"],
+                **_third_zero_retry_fields(),
+            }
+        ],
+        chandra_rows=[_explicit_graphics_page(1)],
+    )
+    engine_dir = run_dir / "surya" / "surya"
+    pages_path = engine_dir / "pages.json"
+    selected_path = engine_dir / "page_0001.surya.json"
+    pages_payload = json.loads(pages_path.read_text(encoding="utf-8"))
+    selected_payload = json.loads(selected_path.read_text(encoding="utf-8"))
+    row = pages_payload["pages"][0]
+    selected_image = selected_payload["images"][0]
+    histories = (row["attempt_history"], selected_image["attempt_history"])
+    third_image = Path(histories[0][2]["image_path"])
+    third_sidecar = Path(histories[0][2]["sidecar_path"])
+
+    if defect == "history-outcome":
+        for history in histories:
+            history[2]["ocr_outcome"] = "text"
+    elif defect == "third-sidecar-text":
+        payload = json.loads(third_sidecar.read_text(encoding="utf-8"))
+        payload["images"][0]["pages"][0]["text_lines"] = [
+            {"text": "FORGED", "bbox": [30, 30, 70, 45]}
+        ]
+        third_sidecar.write_text(json.dumps(payload), encoding="utf-8")
+        for history in histories:
+            history[2]["sidecar_sha256"] = _sha256(third_sidecar)
+            history[2]["sidecar_bytes"] = third_sidecar.stat().st_size
+    elif defect == "third-image-pixels":
+        with Image.open(third_image) as source:
+            forged = source.copy()
+        forged.putpixel((0, 0), (0, 0, 0))
+        forged.save(third_image, format="PNG")
+        for history in histories:
+            history[2]["image_sha256"] = _sha256(third_image)
+            history[2]["image_bytes"] = third_image.stat().st_size
+    elif defect == "selected-sidecar-text":
+        selected_image["pages"][0]["text_lines"] = [{"text": "FORGED", "bbox": [10, 10, 50, 30]}]
+    else:
+        for payload in (row, selected_image):
+            payload["geometry_coordinate_space"] = "source-image-v1"
+            payload["geometry_transform"] = "inverse-actual-content-size-strict-v1"
+
+    pages_path.write_text(json.dumps(pages_payload), encoding="utf-8")
+    selected_path.write_text(json.dumps(selected_payload), encoding="utf-8")
+    adjusted, error = ocr_pipeline._reconcile_mode_both_pages(
+        run_dir=run_dir,
+        results=results,
+        result_files=result_files,
+    )
+
+    assert adjusted == results
+    assert error == "unresolved pages: [1]"
+    reconciliation = json.loads((run_dir / "page_reconciliation.json").read_text(encoding="utf-8"))
+    assert reconciliation["pages"][0]["reason"].startswith("invalid_candidate_evidence:")
 
 
 def test_reconcile_29d_rejects_dense_surya_with_chandra_zero(tmp_path: Path) -> None:
@@ -1215,7 +1308,7 @@ def test_reconcile_rejects_invalid_chandra_identity_or_geometry(
                 **_third_retry_fields(),
             },
             _explicit_graphics_page(1),
-            "third_retry_nontext_forbidden",
+            "invalid_candidate_evidence: Surya zero-output retry has a coordinate transform marker",
         ),
         (
             {
@@ -1563,13 +1656,13 @@ def test_strict_app_path_rejects_reconciliation_failure() -> None:
 
 def test_hybrid_cache_identity_includes_retry_and_reconciliation_revision() -> None:
     config = ocr_pipeline._hybrid_runtime_config()
-    assert ocr_pipeline._HYBRID_CHUNK_PIPELINE_REVISION == "chandra-surya-resumable-v4"
+    assert ocr_pipeline._HYBRID_CHUNK_PIPELINE_REVISION == "chandra-surya-resumable-v5"
     assert ocr_pipeline._HYBRID_CHUNK_MANIFEST_SCHEMA == "uniscan.hybrid-chunks.v4"
     assert config["zero_output_retry_policy"] == (
         "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
     )
     assert config["page_reconciliation_policy"] == (
-        "explicit-chandra-nontext+quiet-surya+scaled-text-agreement-v4"
+        "explicit-chandra-nontext+quiet-surya+scaled-terminal-lineage-v5"
     )
 
 

@@ -6,6 +6,7 @@ import json
 import hashlib
 import math
 import queue
+import signal
 import shutil
 import sqlite3
 import sys
@@ -2091,21 +2092,40 @@ def run_http_server(
     work_root: Path | None = None,
     lang: str = DEFAULT_BASIC_GUI_LANG,
 ) -> None:
-    resolved_work_root = Path(work_root) if work_root is not None else (Path.cwd() / "outputs" / "web_runs")
-    resolved_work_root.mkdir(parents=True, exist_ok=True)
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("run_http_server must run in the main thread to handle SIGTERM.")
 
-    handler = _build_handler(work_root=resolved_work_root.resolve(), default_lang=lang)
-    server = ThreadingHTTPServer((host, int(port)), handler)
-    print(f"UniScan HTTP API listening on http://{host}:{port}")
-    print("GUI: GET /")
-    print(
-        "Async API: POST /api/jobs, GET /api/jobs, "
-        "GET /api/jobs/{job_id}, GET /api/jobs/{job_id}/result"
-    )
-    print("Sync API: POST /searchable-pdf")
+    server: ThreadingHTTPServer | None = None
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    sigterm_installed = False
+
+    def _graceful_sigterm(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
     try:
+        signal.signal(signal.SIGTERM, _graceful_sigterm)
+        sigterm_installed = True
+        resolved_work_root = (
+            Path(work_root) if work_root is not None else (Path.cwd() / "outputs" / "web_runs")
+        )
+        resolved_work_root.mkdir(parents=True, exist_ok=True)
+
+        handler = _build_handler(work_root=resolved_work_root.resolve(), default_lang=lang)
+        server = ThreadingHTTPServer((host, int(port)), handler)
+        print(f"UniScan HTTP API listening on http://{host}:{port}")
+        print("GUI: GET /")
+        print(
+            "Async API: POST /api/jobs, GET /api/jobs, "
+            "GET /api/jobs/{job_id}, GET /api/jobs/{job_id}/result"
+        )
+        print("Sync API: POST /searchable-pdf")
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
+        try:
+            if server is not None:
+                server.server_close()
+        finally:
+            if sigterm_installed:
+                signal.signal(signal.SIGTERM, previous_sigterm)

@@ -77,7 +77,7 @@ ProgressCallback = Callable[[int, str], None]
 _DEFAULT_HYBRID_CHUNK_PAGES = 10
 _HYBRID_CHUNK_MANIFEST_SCHEMA = "uniscan.hybrid-chunks.v4"
 _OCR_STATUS_RECONCILIATION_PENDING = "reconciliation_pending"
-_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v4"
+_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v5"
 _SURYA_RETRY_PREPROCESSING = "autocontrast-cutoff-1"
 _SURYA_SCALED_RETRY_PREPROCESSING = "rgb-scale-0.5-center-white-lanczos-v1"
 _SURYA_SCALED_RETRY_FACTOR = 0.5
@@ -948,10 +948,18 @@ def _strict_third_retry_provenance(
     *,
     row: dict[str, Any],
     image: dict[str, Any],
-    selected_geometry: _SealedPageGeometry,
+    selected_geometry: _SealedPageGeometry | None,
     engine_dir: Path,
     source_page: int,
+    expected_outcome: str = "text",
 ) -> _SealedPageGeometry:
+    if expected_outcome not in {"text", "zero_output"}:
+        raise RuntimeError("Surya third retry expected outcome is invalid")
+    if (
+        str(row.get("ocr_outcome") or "") != expected_outcome
+        or str(image.get("ocr_outcome") or "") != expected_outcome
+    ):
+        raise RuntimeError("Surya third retry outcome disagrees with selected evidence")
     fields = (
         "attempt_count",
         "retry_preprocessing",
@@ -967,11 +975,17 @@ def _strict_third_retry_provenance(
         raise RuntimeError("Surya third retry preprocessing marker is invalid")
     if row.get("retry_policy") != _SURYA_RETRY_POLICY:
         raise RuntimeError("Surya third retry policy marker is invalid")
-    if (
-        row.get("geometry_coordinate_space") != _SURYA_SOURCE_COORDINATE_SPACE
-        or row.get("geometry_transform") != _SURYA_SCALED_GEOMETRY_TRANSFORM
+    if expected_outcome == "text":
+        if (
+            row.get("geometry_coordinate_space") != _SURYA_SOURCE_COORDINATE_SPACE
+            or row.get("geometry_transform") != _SURYA_SCALED_GEOMETRY_TRANSFORM
+        ):
+            raise RuntimeError("Surya selected retry coordinate transform is invalid")
+    elif any(
+        row.get(field) is not None or image.get(field) is not None
+        for field in ("geometry_coordinate_space", "geometry_transform")
     ):
-        raise RuntimeError("Surya selected retry coordinate transform is invalid")
+        raise RuntimeError("Surya zero-output retry has a coordinate transform marker")
     selected_attempt = row.get("selected_attempt")
     if selected_attempt != 3 or isinstance(selected_attempt, bool):
         raise RuntimeError("Surya selected retry attempt is invalid")
@@ -981,7 +995,7 @@ def _strict_third_retry_provenance(
     expected = (
         (1, "original", "zero_output"),
         (2, _SURYA_RETRY_PREPROCESSING, "zero_output"),
-        (3, _SURYA_SCALED_RETRY_PREPROCESSING, "text"),
+        (3, _SURYA_SCALED_RETRY_PREPROCESSING, expected_outcome),
     )
     expected_image_size: list[int] | None = None
     attempt_three_geometry: _SealedPageGeometry | None = None
@@ -1122,26 +1136,27 @@ def _strict_third_retry_provenance(
         if attempt < 3 and attempt_lines:
             raise RuntimeError("Surya zero-output retry attempt contains text")
         if attempt == 3:
-            if not attempt_lines or any(not isinstance(line, dict) for line in attempt_lines):
-                raise RuntimeError("Surya third retry has no durable text geometry")
-            texts: list[str] = []
-            for line in attempt_lines:
-                assert isinstance(line, dict)
-                text = line.get("text")
-                if not isinstance(text, str) or not _canonical_retry_text(text):
-                    raise RuntimeError("Surya third retry line text is invalid")
-                line_bbox = _strict_geometry_bbox(
-                    line.get("bbox"),
-                    label="Surya third retry text line",
-                )
-                if line_bbox[2] > attempt_bbox[2] or line_bbox[3] > attempt_bbox[3]:
-                    raise RuntimeError("Surya third retry text bbox escapes image bbox")
-                texts.append(text)
+            if expected_outcome == "text":
+                if not attempt_lines or any(not isinstance(line, dict) for line in attempt_lines):
+                    raise RuntimeError("Surya third retry has no durable text geometry")
+                for line in attempt_lines:
+                    assert isinstance(line, dict)
+                    text = line.get("text")
+                    if not isinstance(text, str) or not _canonical_retry_text(text):
+                        raise RuntimeError("Surya third retry line text is invalid")
+                    line_bbox = _strict_geometry_bbox(
+                        line.get("bbox"),
+                        label="Surya third retry text line",
+                    )
+                    if line_bbox[2] > attempt_bbox[2] or line_bbox[3] > attempt_bbox[3]:
+                        raise RuntimeError("Surya third retry text bbox escapes image bbox")
+            elif attempt_lines:
+                raise RuntimeError("Surya zero-output third retry contains text")
             attempt_three_geometry = _sealed_page_geometry(
                 image=attempt_images[0],
                 label="Surya third retry",
                 reading_order=False,
-                require_text=True,
+                require_text=expected_outcome == "text",
             )
     scaled_evidence = history[2]
     content_scale = scaled_evidence.get("content_scale")
@@ -1193,14 +1208,13 @@ def _strict_third_retry_provenance(
         raise RuntimeError(f"Surya scaled retry pixel lineage is unreadable: {exc}") from exc
     if ImageChops.difference(expected_scaled, actual_scaled).getbbox() is not None:
         raise RuntimeError("Surya scaled retry pixels disagree with sealed attempt 1")
-    pages = image.get("pages")
-    if not isinstance(pages, list) or len(pages) != 1 or not isinstance(pages[0], dict):
-        raise RuntimeError("Surya selected retry geometry page is invalid")
-    selected_bbox = _strict_geometry_bbox(
-        pages[0].get("image_bbox"),
-        label="Surya selected retry image",
+    selected_retry_geometry = _sealed_page_geometry(
+        image=image,
+        label="Surya selected retry",
+        reading_order=False,
+        require_text=expected_outcome == "text",
     )
-    if selected_bbox != (
+    if selected_retry_geometry.image_bbox != (
         0.0,
         0.0,
         float(expected_image_size[0]),
@@ -1209,15 +1223,26 @@ def _strict_third_retry_provenance(
         raise RuntimeError("Surya selected image bbox disagrees with durable retry image")
     if attempt_three_geometry is None:
         raise RuntimeError("Surya third retry geometry is missing")
-    expected_selected_geometry = _inverse_scaled_retry_geometry(
-        attempt_three_geometry,
-        source_size=expected_image_size,
-        content_size=expected_content_size,
-        content_offset=expected_content_offset,
-    )
-    if selected_geometry != expected_selected_geometry:
-        raise RuntimeError("Surya selected geometry disagrees with inverse retry transform")
-    return selected_geometry
+    if expected_outcome == "text":
+        if selected_geometry is None:
+            raise RuntimeError("Surya selected text geometry is missing")
+        expected_selected_geometry = _inverse_scaled_retry_geometry(
+            attempt_three_geometry,
+            source_size=expected_image_size,
+            content_size=expected_content_size,
+            content_offset=expected_content_offset,
+        )
+        if (
+            selected_geometry != expected_selected_geometry
+            or selected_retry_geometry != selected_geometry
+        ):
+            raise RuntimeError("Surya selected geometry disagrees with inverse retry transform")
+        return selected_geometry
+    if selected_geometry is not None:
+        raise RuntimeError("Surya zero-output retry has selected text geometry")
+    if selected_retry_geometry != attempt_three_geometry:
+        raise RuntimeError("Surya selected zero-output geometry disagrees with attempt 3")
+    return selected_retry_geometry
 
 
 def _strict_surya_attempt_metadata(
@@ -1322,6 +1347,36 @@ def _surya_text_attempt(
         source_page=source_page,
     )
     return attempt, canonical, selected_geometry
+
+
+def _strict_surya_third_zero_provenance(
+    *,
+    row: dict[str, Any],
+    engine_dir: Path,
+    source_page: int,
+) -> None:
+    geometry_file = _owned_page_artifact(
+        engine_dir=engine_dir,
+        raw_name=row.get("geometry_file"),
+        label="geometry",
+    )
+    try:
+        sidecar = json.loads(geometry_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Surya page {source_page} zero-output geometry is unreadable: {exc}"
+        ) from exc
+    images = sidecar.get("images") if isinstance(sidecar, dict) else None
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise RuntimeError(f"Surya page {source_page} zero-output geometry is malformed")
+    _strict_third_retry_provenance(
+        row=row,
+        image=images[0],
+        selected_geometry=None,
+        engine_dir=engine_dir,
+        source_page=source_page,
+        expected_outcome="zero_output",
+    )
 
 
 def _reconcile_mode_both_pages(
@@ -1442,7 +1497,21 @@ def _reconcile_mode_both_pages(
             and surya_attempt == 3
             and not (surya_outcome == "text" and chandra_outcome == "text")
         ):
-            reason = "third_retry_nontext_forbidden"
+            if (
+                surya_outcome == "zero_output"
+                and chandra_outcome == "explicit_nontext"
+                and chandra.get("explicit_nontext") is True
+            ):
+                try:
+                    _strict_surya_third_zero_provenance(
+                        row=surya,
+                        engine_dir=surya_path.parent.resolve(),
+                        source_page=source_page,
+                    )
+                except RuntimeError as exc:
+                    reason = f"invalid_candidate_evidence: {exc}"
+            else:
+                reason = "third_retry_nontext_forbidden"
         if not reason and surya_outcome == "text" and chandra_outcome == "text":
             try:
                 attempt, surya_canonical, surya_geometry = _surya_text_attempt(
@@ -1832,7 +1901,7 @@ def _hybrid_runtime_config() -> dict[str, object]:
         "effective_textless_dpi": _resolve_textless_dpi(),
         "zero_output_retry_policy": _SURYA_RETRY_POLICY,
         "page_reconciliation_policy": (
-            "explicit-chandra-nontext+quiet-surya+scaled-text-agreement-v4"
+            "explicit-chandra-nontext+quiet-surya+scaled-terminal-lineage-v5"
         ),
         "environment": {key: os.environ.get(key) for key in _HYBRID_IDENTITY_ENV_KEYS},
     }

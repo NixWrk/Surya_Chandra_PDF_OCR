@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from urllib.parse import quote, urlparse
 
 import pytest
+from uniscan.web import service as web_service
 
 from uniscan.web.service import (
     UNISCAN_OCR_WORKER_CONCURRENCY,
@@ -26,6 +27,111 @@ from uniscan.web.service import (
     _query_bool,
     _request_fingerprint,
 )
+
+
+def test_run_http_server_closes_cleanly_on_sigterm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handlers: dict[int, object] = {web_service.signal.SIGTERM: web_service.signal.SIG_DFL}
+    registrations: list[tuple[int, object]] = []
+    servers: list[object] = []
+
+    def fake_getsignal(signum: int) -> object:
+        return handlers[signum]
+
+    def fake_signal(signum: int, handler: object) -> object:
+        previous = handlers[signum]
+        handlers[signum] = handler
+        registrations.append((signum, handler))
+        return previous
+
+    class FakeServer:
+        def __init__(self, address: tuple[str, int], handler: object) -> None:
+            self.address = address
+            self.handler = handler
+            self.closed = False
+            servers.append(self)
+
+        def serve_forever(self) -> None:
+            handler = handlers[web_service.signal.SIGTERM]
+            assert callable(handler)
+            handler(web_service.signal.SIGTERM, None)
+
+        def server_close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(web_service.signal, "getsignal", fake_getsignal)
+    monkeypatch.setattr(web_service.signal, "signal", fake_signal)
+    monkeypatch.setattr(web_service, "ThreadingHTTPServer", FakeServer)
+
+    web_service.run_http_server(
+        host="127.0.0.1",
+        port=0,
+        work_root=tmp_path / "work",
+        lang="rus+eng",
+    )
+
+    assert len(servers) == 1
+    assert servers[0].closed is True
+    assert len(registrations) == 2
+    assert callable(registrations[0][1])
+    assert registrations[1] == (
+        web_service.signal.SIGTERM,
+        web_service.signal.SIG_DFL,
+    )
+
+
+def test_run_http_server_rejects_non_main_thread_before_allocating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = object()
+    main = object()
+    monkeypatch.setattr(web_service.threading, "current_thread", lambda: current)
+    monkeypatch.setattr(web_service.threading, "main_thread", lambda: main)
+    monkeypatch.setattr(
+        web_service,
+        "ThreadingHTTPServer",
+        lambda *_args, **_kwargs: pytest.fail("server must not be allocated"),
+    )
+    work_root = tmp_path / "must_not_exist"
+
+    with pytest.raises(RuntimeError, match="main thread"):
+        web_service.run_http_server(work_root=work_root)
+
+    assert not work_root.exists()
+
+
+def test_run_http_server_restores_sigterm_when_initialization_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handlers: dict[int, object] = {web_service.signal.SIGTERM: web_service.signal.SIG_DFL}
+    registrations: list[tuple[int, object]] = []
+
+    def fake_signal(signum: int, handler: object) -> object:
+        previous = handlers[signum]
+        handlers[signum] = handler
+        registrations.append((signum, handler))
+        return previous
+
+    class InterruptingServer:
+        def __init__(self, _address: tuple[str, int], _handler: object) -> None:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(web_service.signal, "getsignal", lambda signum: handlers[signum])
+    monkeypatch.setattr(web_service.signal, "signal", fake_signal)
+    monkeypatch.setattr(web_service, "ThreadingHTTPServer", InterruptingServer)
+
+    web_service.run_http_server(work_root=tmp_path / "work")
+
+    assert len(registrations) == 2
+    assert callable(registrations[0][1])
+    assert registrations[1] == (
+        web_service.signal.SIGTERM,
+        web_service.signal.SIG_DFL,
+    )
 
 
 def test_query_bool_parsing() -> None:
