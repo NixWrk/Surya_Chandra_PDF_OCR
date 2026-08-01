@@ -119,10 +119,7 @@ def test_safe_render_dpi_caps_extreme_page_memory() -> None:
         safe_dpi = _safe_render_dpi(page_rect, 220)
 
     assert 1 <= safe_dpi < 220
-    rendered_pixels = (
-        page_rect.width / 72.0 * safe_dpi
-        * (page_rect.height / 72.0 * safe_dpi)
-    )
+    rendered_pixels = page_rect.width / 72.0 * safe_dpi * (page_rect.height / 72.0 * safe_dpi)
     assert rendered_pixels <= _MAX_RENDER_PIXELS
 
 
@@ -158,9 +155,7 @@ def test_run_ocr_benchmark_writes_report_and_artifacts(tmp_path, monkeypatch) ->
                             "pages": [
                                 {
                                     "image_bbox": [0, 0, 1, 1],
-                                    "text_lines": [
-                                        {"text": "x" * 13, "bbox": [0, 0, 1, 1]}
-                                    ],
+                                    "text_lines": [{"text": "x" * 13, "bbox": [0, 0, 1, 1]}],
                                 }
                             ],
                         }
@@ -259,7 +254,9 @@ def test_run_ocr_benchmark_uses_explicit_page_numbers(tmp_path, monkeypatch) -> 
     output_dir = tmp_path / "out"
 
     def fake_sample(_page_count: int, *, sample_size: int = 5) -> list[int]:
-        raise AssertionError(f"sample_pdf_page_indices should not be called, sample_size={sample_size}")
+        raise AssertionError(
+            f"sample_pdf_page_indices should not be called, sample_size={sample_size}"
+        )
 
     def fake_status(engine_name: str, **_kwargs):
         return _ready_status(engine_name, searchable_pdf=False)
@@ -503,14 +500,16 @@ def test_run_extraction_engine_pagewise_keeps_partial_results(tmp_path, monkeypa
 
     monkeypatch.setattr(ocr_benchmark_mod, "_run_extraction_engine", fake_extract)
 
-    page_texts, chars, page_errors, page_metadata = ocr_benchmark_mod._run_extraction_engine_pagewise(
-        OCR_ENGINE_OLMOCR,
-        image_paths,
-        source_pages_1based=[1, 2],
-        lang="rus",
-        work_dir=tmp_path / "work",
-        which_fn=lambda _name: None,
-        run_cmd=lambda *_args, **_kwargs: None,
+    page_texts, chars, page_errors, page_metadata = (
+        ocr_benchmark_mod._run_extraction_engine_pagewise(
+            OCR_ENGINE_OLMOCR,
+            image_paths,
+            source_pages_1based=[1, 2],
+            lang="rus",
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: None,
+            run_cmd=lambda *_args, **_kwargs: None,
+        )
     )
 
     assert page_texts == ["ok-page", ""]
@@ -583,17 +582,19 @@ def test_run_extraction_engine_pagewise_collects_surya_sidecar(tmp_path, monkeyp
 
     monkeypatch.setattr(ocr_benchmark_mod, "_run_surya_direct", fake_surya_direct)
 
-    page_texts, chars, page_errors, page_metadata = ocr_benchmark_mod._run_extraction_engine_pagewise(
-        OCR_ENGINE_SURYA,
-        image_paths,
-        source_pages_1based=[2, 4, 6],
-        lang="rus",
-        work_dir=tmp_path / "work",
-        which_fn=lambda _name: None,
-        run_cmd=lambda *_args, **_kwargs: None,
-        progress_cb=lambda done, total, source_page: progress_steps.append(
-            (done, total, source_page)
-        ),
+    page_texts, chars, page_errors, page_metadata = (
+        ocr_benchmark_mod._run_extraction_engine_pagewise(
+            OCR_ENGINE_SURYA,
+            image_paths,
+            source_pages_1based=[2, 4, 6],
+            lang="rus",
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: None,
+            run_cmd=lambda *_args, **_kwargs: None,
+            progress_cb=lambda done, total, source_page: progress_steps.append(
+                (done, total, source_page)
+            ),
+        )
     )
 
     assert call_count["value"] == 1
@@ -625,7 +626,9 @@ def test_run_extraction_engine_pagewise_collects_surya_sidecar(tmp_path, monkeyp
     assert all(item["geometry_type"] == "surya_text_lines" for item in pages_payload["pages"])
 
 
-def test_run_extraction_engine_pagewise_requires_surya_sidecar_by_default(tmp_path, monkeypatch) -> None:
+def test_run_extraction_engine_pagewise_requires_surya_sidecar_by_default(
+    tmp_path, monkeypatch
+) -> None:
     image_paths = [tmp_path / "p1.png"]
     image_paths[0].write_bytes(b"img")
 
@@ -750,17 +753,25 @@ def test_run_extraction_engine_pagewise_reports_missing_surya_page_geometry(
         sidecar.write_text(
             json.dumps(
                 {
+                    "execution_path": "module",
                     "images": [
                         {
                             "image_name": f"{idx:04d}_{image_path.name}",
                             "pages": (
-                                [{"text_lines": [{"text": f"page-{idx}", "bbox": [0, 0, 10, 10]}]}]
+                                [
+                                    {
+                                        "image_bbox": [0, 0, 200, 300],
+                                        "text_lines": [
+                                            {"text": f"page-{idx}", "bbox": [0, 0, 10, 10]}
+                                        ],
+                                    }
+                                ]
                                 if idx != 2
-                                else [{"text_lines": []}]
+                                else [{"image_bbox": [0, 0, 200, 300], "text_lines": []}]
                             ),
                         }
                         for idx, image_path in enumerate(_image_paths, start=1)
-                    ]
+                    ],
                 }
             ),
             encoding="utf-8",
@@ -780,12 +791,13 @@ def test_run_extraction_engine_pagewise_reports_missing_surya_page_geometry(
         sidecar.write_text(
             json.dumps(
                 {
+                    "execution_path": "module",
                     "images": [
                         {
                             "image_name": retry_image.name,
-                            "pages": [{"text_lines": []}],
+                            "pages": [{"image_bbox": [0, 0, 200, 300], "text_lines": []}],
                         }
-                    ]
+                    ],
                 }
             ),
             encoding="utf-8",
@@ -817,8 +829,8 @@ def test_run_extraction_engine_pagewise_reports_missing_surya_page_geometry(
     assert [item["source_page"] for item in page_errors] == [2]
     assert [item["source_page"] for item in page_metadata] == [1, 3, 2]
     assert page_metadata[-1]["ocr_outcome"] == "zero_output"
-    assert page_metadata[-1]["attempt_count"] == 2
-    assert len(retry_calls) == 1
+    assert page_metadata[-1]["attempt_count"] == 3
+    assert len(retry_calls) == 2
     assert progress_steps == [(1, 3, 1), (2, 3, 3)]
 
 
@@ -863,15 +875,19 @@ def test_run_extraction_engine_pagewise_collects_chandra_sidecar(tmp_path, monke
 
     monkeypatch.setattr(ocr_benchmark_mod, "_run_chandra_direct", fake_chandra_direct)
 
-    page_texts, chars, page_errors, page_metadata = ocr_benchmark_mod._run_extraction_engine_pagewise(
-        OCR_ENGINE_CHANDRA,
-        image_paths,
-        source_pages_1based=[1, 2],
-        lang="rus",
-        work_dir=tmp_path / "work",
-        which_fn=lambda _name: None,
-        run_cmd=lambda *_args, **_kwargs: None,
-        progress_cb=lambda done, total, source_page: progress_steps.append((done, total, source_page)),
+    page_texts, chars, page_errors, page_metadata = (
+        ocr_benchmark_mod._run_extraction_engine_pagewise(
+            OCR_ENGINE_CHANDRA,
+            image_paths,
+            source_pages_1based=[1, 2],
+            lang="rus",
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: None,
+            run_cmd=lambda *_args, **_kwargs: None,
+            progress_cb=lambda done, total, source_page: progress_steps.append(
+                (done, total, source_page)
+            ),
+        )
     )
 
     assert call_count["count"] == 1
@@ -904,11 +920,7 @@ def test_run_extraction_engine_pagewise_reports_partial_chandra_sidecar(
                         {
                             "image_name": _image_paths[0].name,
                             "pages": [
-                                {
-                                    "text_lines": [
-                                        {"text": "page-one", "bbox": [0, 0, 10, 10]}
-                                    ]
-                                }
+                                {"text_lines": [{"text": "page-one", "bbox": [0, 0, 10, 10]}]}
                             ],
                         }
                     ]
@@ -957,11 +969,7 @@ def test_run_extraction_engine_pagewise_rejects_partial_chandra_sidecar_by_defau
                         {
                             "image_name": _image_paths[0].name,
                             "pages": [
-                                {
-                                    "text_lines": [
-                                        {"text": "page-one", "bbox": [0, 0, 10, 10]}
-                                    ]
-                                }
+                                {"text_lines": [{"text": "page-one", "bbox": [0, 0, 10, 10]}]}
                             ],
                         }
                     ]
@@ -1060,7 +1068,6 @@ def test_run_ocr_benchmark_surfaces_chandra_sidecar_warning_in_note(
     assert results[0].page_error_count == 1
 
 
-
 def test_run_ocr_benchmark_deferred_candidate_is_pending_not_ok(
     tmp_path,
     monkeypatch,
@@ -1143,6 +1150,7 @@ def test_run_ocr_benchmark_deferred_candidate_is_pending_not_ok(
     report = json.loads((output_dir / "fixture_ocr_benchmark.json").read_text(encoding="utf-8"))
     assert report["results"][0]["status"] == "reconciliation_pending"
 
+
 def test_run_extraction_engine_pagewise_requires_chandra_sidecar_by_default(
     tmp_path,
     monkeypatch,
@@ -1213,14 +1221,16 @@ def test_run_extraction_engine_pagewise_orders_chandra_columns(tmp_path, monkeyp
 
     monkeypatch.setattr(ocr_benchmark_mod, "_run_chandra_direct", fake_chandra_direct)
 
-    page_texts, chars, page_errors, page_metadata = ocr_benchmark_mod._run_extraction_engine_pagewise(
-        OCR_ENGINE_CHANDRA,
-        [image_path],
-        source_pages_1based=[1],
-        lang="rus",
-        work_dir=tmp_path / "work",
-        which_fn=lambda _name: None,
-        run_cmd=lambda *_args, **_kwargs: None,
+    page_texts, chars, page_errors, page_metadata = (
+        ocr_benchmark_mod._run_extraction_engine_pagewise(
+            OCR_ENGINE_CHANDRA,
+            [image_path],
+            source_pages_1based=[1],
+            lang="rus",
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: None,
+            run_cmd=lambda *_args, **_kwargs: None,
+        )
     )
 
     assert page_texts == ["L1\nL2\nL3\nR1\nR2\nR3"]
@@ -1275,7 +1285,9 @@ def test_configure_chandra_runtime_device_prefers_cuda(monkeypatch) -> None:
     assert os.environ.get("TORCH_DEVICE") == "cuda:0"
 
 
-def test_configure_chandra_runtime_device_raises_when_gpu_required_without_cuda(monkeypatch) -> None:
+def test_configure_chandra_runtime_device_raises_when_gpu_required_without_cuda(
+    monkeypatch,
+) -> None:
     class _Cuda:
         @staticmethod
         def is_available() -> bool:
@@ -1545,13 +1557,7 @@ def test_surya_module_cli_uses_only_staged_inputs(tmp_path, monkeypatch) -> None
             input_dir = Path(args[0])
             output_root = Path(args[2])
             payload = {
-                name: [
-                    {
-                        "text_lines": [
-                            {"text": f"TEXT::{name}", "bbox": [0, 0, 100, 20]}
-                        ]
-                    }
-                ]
+                name: [{"text_lines": [{"text": f"TEXT::{name}", "bbox": [0, 0, 100, 20]}]}]
                 for name in sorted(path.name for path in input_dir.iterdir() if path.is_file())
             }
             # Simulate unrelated page accidentally present in raw model output.
@@ -1575,9 +1581,7 @@ def test_surya_module_cli_uses_only_staged_inputs(tmp_path, monkeypatch) -> None
     assert "TEXT::page_0001.png" in text
     assert "FOREIGN" not in text
     assert chars == len(text)
-    sidecar_payload = json.loads(
-        (work_dir / "surya_page_lines.json").read_text(encoding="utf-8")
-    )
+    sidecar_payload = json.loads((work_dir / "surya_page_lines.json").read_text(encoding="utf-8"))
     assert sidecar_payload["execution_path"] == "module"
     assert "stale.png" not in text
 
@@ -1601,15 +1605,7 @@ def test_surya_cli_fallback_cannot_reuse_partial_module_output(tmp_path, monkeyp
             result_file.parent.mkdir(parents=True, exist_ok=True)
             result_file.write_text(
                 json.dumps(
-                    {
-                        image_path.name: [
-                            {
-                                "text_lines": [
-                                    {"text": "STALE", "bbox": [0, 0, 10, 10]}
-                                ]
-                            }
-                        ]
-                    }
+                    {image_path.name: [{"text_lines": [{"text": "STALE", "bbox": [0, 0, 10, 10]}]}]}
                 ),
                 encoding="utf-8",
             )
@@ -1711,7 +1707,6 @@ def test_cli_benchmark_ocr_uses_runner_and_returns_success(monkeypatch, tmp_path
     assert "paddleocr ok" in stdout
 
 
-
 def test_cli_benchmark_ocr_rejects_manual_internal_reconciliation_token(
     monkeypatch,
     tmp_path,
@@ -1742,6 +1737,7 @@ def test_cli_benchmark_ocr_rejects_manual_internal_reconciliation_token(
         )
 
     assert exc_info.value.code == 2
+
 
 def test_cli_benchmark_ocr_parses_pages(monkeypatch, tmp_path, capsys) -> None:
     pdf_path = tmp_path / "fixture.pdf"
@@ -1785,7 +1781,9 @@ def test_cli_benchmark_ocr_parses_pages(monkeypatch, tmp_path, capsys) -> None:
     assert "ok" in stdout
 
 
-def test_cli_benchmark_ocr_strict_fails_when_any_engine_not_ok(monkeypatch, tmp_path, capsys) -> None:
+def test_cli_benchmark_ocr_strict_fails_when_any_engine_not_ok(
+    monkeypatch, tmp_path, capsys
+) -> None:
     pdf_path = tmp_path / "fixture.pdf"
     pdf_path.write_bytes(b"%PDF-FAKE")
     output_dir = tmp_path / "out"
@@ -1818,7 +1816,9 @@ def test_cli_benchmark_ocr_strict_fails_when_any_engine_not_ok(monkeypatch, tmp_
         ]
 
     monkeypatch.setattr("uniscan.cli.run_ocr_benchmark", fake_run_ocr_benchmark)
-    monkeypatch.setattr("uniscan.cli.summarize_ocr_benchmark", lambda results: f"rows={len(results)}")
+    monkeypatch.setattr(
+        "uniscan.cli.summarize_ocr_benchmark", lambda results: f"rows={len(results)}"
+    )
 
     exit_code = main(
         ["benchmark-ocr", "--pdf", str(pdf_path), "--output", str(output_dir), "--strict"]

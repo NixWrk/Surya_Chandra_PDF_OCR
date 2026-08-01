@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -51,6 +53,10 @@ _MAX_OCR_TEXT_ARTIFACT_BYTES = 64 * 1024 * 1024
 _CHANDRA_MODEL_REPO_ID = "datalab-to/chandra-ocr-2"
 _MODEL_CACHE_CHECK_MEMO: dict[str, str] = {}
 _ZERO_OUTPUT_RETRY_PREPROCESSING = "autocontrast-cutoff-1"
+_ZERO_OUTPUT_OTSU_RETRY_PREPROCESSING = "grayscale-autocontrast-otsu-v1"
+_ZERO_OUTPUT_RETRY_POLICY = "original+autocontrast-cutoff-1+otsu-max3-v2"
+_SURYA_DIRECT_EXECUTION_PATHS = ("cli", "module")
+_SURYA_MODULE_EXECUTION_PATHS = ("module",)
 _OCR_OUTCOME_TEXT = "text"
 _OCR_OUTCOME_VERIFIED_BLANK = "verified_blank"
 _OCR_OUTCOME_EXPLICIT_NONTEXT = "explicit_nontext"
@@ -80,7 +86,25 @@ def _write_json_atomic(path: Path, payload: object) -> None:
         candidate.unlink(missing_ok=True)
 
 
-def _write_autocontrast_retry_image(*, source: Path, target: Path) -> None:
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _image_attempt_evidence(path: Path) -> dict[str, object]:
+    with Image.open(path) as image:
+        image_size = [int(image.width), int(image.height)]
+    return {
+        "image_size": image_size,
+        "image_sha256": _sha256_path(path),
+        "image_bytes": int(path.stat().st_size),
+    }
+
+
+def _write_autocontrast_retry_image(*, source: Path, target: Path) -> dict[str, object]:
     with Image.open(source) as original:
         original_size = original.size
         enhanced = ImageOps.autocontrast(original.convert("RGB"), cutoff=1)
@@ -91,6 +115,251 @@ def _write_autocontrast_retry_image(*, source: Path, target: Path) -> None:
             )
         target.parent.mkdir(parents=True, exist_ok=True)
         enhanced.save(target, format="PNG")
+    return _image_attempt_evidence(target)
+
+
+def _otsu_threshold(histogram: Sequence[int]) -> int:
+    pixel_count = sum(histogram)
+    if pixel_count <= 0:
+        raise RuntimeError("Cannot compute Otsu threshold for an empty image.")
+    weighted_total = sum(level * count for level, count in enumerate(histogram))
+    background_count = 0
+    background_total = 0
+    best_variance = -1.0
+    best_threshold = 0
+    for level, count in enumerate(histogram):
+        background_count += count
+        background_total += level * count
+        foreground_count = pixel_count - background_count
+        if background_count == 0:
+            continue
+        if foreground_count == 0:
+            break
+        background_mean = background_total / background_count
+        foreground_mean = (weighted_total - background_total) / foreground_count
+        variance = background_count * foreground_count * (background_mean - foreground_mean) ** 2
+        if variance > best_variance:
+            best_variance = variance
+            best_threshold = level
+    return best_threshold
+
+
+def _write_otsu_retry_image(*, source: Path, target: Path) -> dict[str, object]:
+    with Image.open(source) as original:
+        original_size = original.size
+        enhanced = ImageOps.autocontrast(original.convert("L"), cutoff=1)
+        threshold = _otsu_threshold(enhanced.histogram())
+        lookup = [0 if value <= threshold else 255 for value in range(256)]
+        binary = enhanced.point(lookup, mode="L")
+        if binary.size != original_size:
+            raise RuntimeError(
+                f"OCR Otsu retry changed image dimensions from {original_size} to {binary.size}."
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        binary.save(target, format="PNG")
+    return {**_image_attempt_evidence(target), "otsu_threshold": threshold}
+
+
+def _strict_numeric_bbox(
+    value: object,
+    *,
+    label: str,
+) -> tuple[float, float, float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise RuntimeError(f"Invalid {label}: bbox must contain exactly four numbers.")
+    if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in value):
+        raise RuntimeError(f"Invalid {label}: bbox values must be numeric and not bool.")
+    bbox = tuple(float(item) for item in value)
+    if not all(math.isfinite(item) for item in bbox):
+        raise RuntimeError(f"Invalid {label}: bbox values must be finite.")
+    x0, y0, x1, y1 = bbox
+    if x0 < 0.0 or y0 < 0.0 or x1 <= x0 or y1 <= y0:
+        raise RuntimeError(f"Invalid {label}: bbox must have positive in-bounds area.")
+    return x0, y0, x1, y1
+
+
+def _strict_surya_single_page_geometry(
+    *,
+    sidecar_path: Path,
+    image_path: Path,
+    require_text: bool,
+    permitted_execution_paths: Sequence[str],
+    label: str,
+) -> tuple[str, ...]:
+    try:
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Invalid {label}: sidecar is unreadable: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid {label}: sidecar root must be an object.")
+    execution_path = payload.get("execution_path")
+    if not isinstance(execution_path, str) or execution_path not in permitted_execution_paths:
+        raise RuntimeError(f"Invalid {label}: execution_path is not permitted.")
+    images = payload.get("images")
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise RuntimeError(f"Invalid {label}: exactly one image is required.")
+    image = images[0]
+    if image.get("image_name") != image_path.name:
+        raise RuntimeError(f"Invalid {label}: image_name does not match the retry image.")
+    pages = image.get("pages")
+    if not isinstance(pages, list) or len(pages) != 1 or not isinstance(pages[0], dict):
+        raise RuntimeError(f"Invalid {label}: exactly one page is required.")
+    page = pages[0]
+    image_bbox = _strict_numeric_bbox(page.get("image_bbox"), label=f"{label} image")
+    with Image.open(image_path) as retry_image:
+        expected_bbox = (0.0, 0.0, float(retry_image.width), float(retry_image.height))
+    if image_bbox != expected_bbox:
+        raise RuntimeError(f"Invalid {label}: image_bbox does not match image dimensions.")
+    raw_lines = page.get("text_lines")
+    if not isinstance(raw_lines, list):
+        raise RuntimeError(f"Invalid {label}: text_lines must be an array.")
+    if not require_text:
+        if raw_lines != []:
+            raise RuntimeError(f"Invalid {label}: zero_output text_lines must be empty.")
+        return ()
+    if not raw_lines:
+        raise RuntimeError(f"Invalid {label}: text geometry is empty.")
+
+    lines: list[str] = []
+    for raw_line in raw_lines:
+        if not isinstance(raw_line, dict):
+            raise RuntimeError(f"Invalid {label}: every text line must be an object.")
+        raw_text = raw_line.get("text")
+        if not isinstance(raw_text, str):
+            raise RuntimeError(f"Invalid {label}: line text must be a string.")
+        text = _clean_overlay_line(raw_text)
+        if not text or not any(char.isalnum() for char in text):
+            raise RuntimeError(f"Invalid {label}: line text has no alphanumeric evidence.")
+        bbox = _strict_numeric_bbox(raw_line.get("bbox"), label=f"{label} text line")
+        if (
+            bbox[0] < image_bbox[0]
+            or bbox[1] < image_bbox[1]
+            or bbox[2] > image_bbox[2]
+            or bbox[3] > image_bbox[3]
+        ):
+            raise RuntimeError(f"Invalid {label}: text bbox escapes image_bbox.")
+        lines.append(text)
+    return tuple(lines)
+
+
+def _structured_surya_zero_output(
+    *,
+    page_errors: Sequence[dict[str, Any]],
+    page_metadata: Sequence[dict[str, Any]],
+    source_page: int,
+    image_path: Path,
+    expected_attempt: int,
+    expected_preprocessing: str | None,
+    permitted_execution_paths: Sequence[str],
+    label: str,
+) -> dict[str, Any] | None:
+    rows = [item for item in page_metadata if item.get("source_page") == source_page]
+    if not rows or rows[0].get("ocr_outcome") != _OCR_OUTCOME_ZERO:
+        return None
+    if len(rows) != 1:
+        raise RuntimeError(f"Invalid {label}: duplicate page metadata.")
+    row = rows[0]
+    attempt_count = row.get("attempt_count")
+    if (
+        not isinstance(attempt_count, int)
+        or isinstance(attempt_count, bool)
+        or attempt_count != expected_attempt
+    ):
+        raise RuntimeError(f"Invalid {label}: attempt_count is inconsistent.")
+    if row.get("retry_preprocessing") != expected_preprocessing:
+        raise RuntimeError(f"Invalid {label}: retry preprocessing is inconsistent.")
+    errors = [item for item in page_errors if item.get("source_page") == source_page]
+    if (
+        len(errors) != 1
+        or errors[0].get("code") != _PAGE_ERROR_ZERO_OUTPUT
+        or not isinstance(errors[0].get("error"), str)
+        or not str(errors[0]["error"]).strip()
+    ):
+        raise RuntimeError(f"Invalid {label}: structured zero_output error is missing.")
+    raw_sidecar = row.get("surya_page_lines_path")
+    if not isinstance(raw_sidecar, str):
+        raise RuntimeError(f"Invalid {label}: durable geometry path is missing.")
+    sidecar_path = Path(raw_sidecar)
+    if not sidecar_path.is_file():
+        raise RuntimeError(f"Invalid {label}: durable geometry sidecar is missing.")
+    _strict_surya_single_page_geometry(
+        sidecar_path=sidecar_path,
+        image_path=image_path,
+        require_text=False,
+        permitted_execution_paths=permitted_execution_paths,
+        label=label,
+    )
+    return row
+
+
+def _copy_retry_evidence(*, source: Path, target: Path) -> Path:
+    if not source.is_file():
+        raise RuntimeError(f"OCR retry evidence source is missing: {source}")
+    if target.exists():
+        raise RuntimeError(f"OCR retry evidence target already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    if _sha256_path(target) != _sha256_path(source):
+        target.unlink(missing_ok=True)
+        raise RuntimeError(f"OCR retry evidence copy failed verification: {target}")
+    return target
+
+
+def _attempt_history_record(
+    *,
+    attempt: int,
+    preprocessing: str,
+    ocr_outcome: str,
+    image_path: Path,
+    sidecar_path: Path,
+    image_evidence: dict[str, object] | None = None,
+) -> dict[str, object]:
+    evidence = dict(image_evidence or _image_attempt_evidence(image_path))
+    evidence.update(
+        {
+            "attempt": attempt,
+            "image_path": str(image_path.resolve()),
+            "sidecar_path": str(sidecar_path.resolve()),
+            "preprocessing": preprocessing,
+            "ocr_outcome": ocr_outcome,
+            "sidecar_sha256": _sha256_path(sidecar_path),
+            "sidecar_bytes": int(sidecar_path.stat().st_size),
+        }
+    )
+    return evidence
+
+
+def _attach_surya_retry_provenance(
+    *,
+    page_metadata: Sequence[dict[str, Any]],
+    source_page: int,
+    selected_attempt: int,
+    attempt_history: Sequence[dict[str, object]],
+) -> None:
+    rows = [item for item in page_metadata if item.get("source_page") == source_page]
+    if len(rows) != 1:
+        raise RuntimeError("Cannot attach Surya retry provenance without exact page metadata.")
+    row = rows[0]
+    raw_sidecar = row.get("surya_page_lines_path")
+    if not isinstance(raw_sidecar, str):
+        raise RuntimeError("Cannot attach Surya retry provenance without a geometry sidecar.")
+    sidecar_path = Path(raw_sidecar)
+    try:
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Cannot attach Surya retry provenance: {exc}") from exc
+    images = payload.get("images") if isinstance(payload, dict) else None
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise RuntimeError("Cannot attach Surya retry provenance to malformed geometry.")
+    history = [dict(item) for item in attempt_history]
+    fields: dict[str, object] = {
+        "selected_attempt": selected_attempt,
+        "retry_policy": _ZERO_OUTPUT_RETRY_POLICY,
+        "attempt_history": history,
+    }
+    row.update(fields)
+    images[0].update(fields)
+    _write_json_atomic(sidecar_path, payload)
 
 
 def _read_utf8_artifact(path: Path) -> str:
@@ -116,10 +385,7 @@ def _is_effectively_blank_page_image(path: Path) -> bool:
         return False
     nonwhite = int(sum(histogram[:245]))
     dark = int(sum(histogram[:200]))
-    return bool(
-        nonwhite <= max(8, int(pixels * 0.0005))
-        and dark <= max(2, int(pixels * 0.00005))
-    )
+    return bool(nonwhite <= max(8, int(pixels * 0.0005)) and dark <= max(2, int(pixels * 0.00005)))
 
 
 @dataclass(slots=True)
@@ -216,7 +482,9 @@ def _pdf_page_count(pdf_path: Path) -> int:
     try:
         import fitz
     except Exception as exc:
-        raise RuntimeError("PDF import requires PyMuPDF. Install with: pip install pymupdf") from exc
+        raise RuntimeError(
+            "PDF import requires PyMuPDF. Install with: pip install pymupdf"
+        ) from exc
 
     doc = fitz.open(str(pdf_path))
     try:
@@ -308,7 +576,9 @@ def _extract_pdf_text(pdf_path: Path) -> str:
     try:
         import fitz
     except Exception as exc:
-        raise RuntimeError("PDF import requires PyMuPDF. Install with: pip install pymupdf") from exc
+        raise RuntimeError(
+            "PDF import requires PyMuPDF. Install with: pip install pymupdf"
+        ) from exc
 
     doc = fitz.open(str(pdf_path))
     try:
@@ -483,9 +753,7 @@ def _ensure_chandra_cache_ready() -> None:
         incomplete_files = sorted(blobs_dir.glob("*.incomplete")) if blobs_dir.exists() else []
         if incomplete_files:
             preview = _preview_paths(incomplete_files)
-            candidate_issues.append(
-                f"{candidate}: found incomplete weight downloads: {preview}"
-            )
+            candidate_issues.append(f"{candidate}: found incomplete weight downloads: {preview}")
             continue
 
         snapshots = _candidate_snapshot_dirs(candidate)
@@ -553,15 +821,16 @@ def _ensure_surya_cache_ready() -> None:
                 f"{component_root}: no ready version with manifest + weights ({version_preview})"
             )
 
-    incomplete_files = sorted(model_cache_root.rglob("*.incomplete")) if model_cache_root.exists() else []
+    incomplete_files = (
+        sorted(model_cache_root.rglob("*.incomplete")) if model_cache_root.exists() else []
+    )
     if incomplete_files:
-        problems.append(f"{model_cache_root}: incomplete files present: {_preview_paths(incomplete_files)}")
+        problems.append(
+            f"{model_cache_root}: incomplete files present: {_preview_paths(incomplete_files)}"
+        )
 
     if problems:
-        raise RuntimeError(
-            "Surya cache/weights preflight failed. "
-            + " | ".join(problems)
-        )
+        raise RuntimeError("Surya cache/weights preflight failed. " + " | ".join(problems))
 
     _MODEL_CACHE_CHECK_MEMO[cache_key] = str(model_cache_root)
 
@@ -573,8 +842,8 @@ def _configure_chandra_runtime_device() -> str:
     require_gpu = _env_bool("UNISCAN_CHANDRA_REQUIRE_GPU", default=True)
     default_policy = "cuda" if require_gpu else "auto"
     device_policy = (
-        os.environ.get("UNISCAN_CHANDRA_DEVICE_POLICY") or default_policy
-    ).strip().lower()
+        (os.environ.get("UNISCAN_CHANDRA_DEVICE_POLICY") or default_policy).strip().lower()
+    )
     prefer_gpu = _env_bool("UNISCAN_CHANDRA_PREFER_GPU", default=True)
 
     if explicit:
@@ -800,6 +1069,87 @@ def _markerized_pages_text(
     return payload + "\n" if payload else ""
 
 
+def _persist_surya_retry_history(
+    *,
+    engine_dir: Path,
+    page_meta: dict[str, Any],
+    source_page: int,
+) -> None:
+    raw_history = page_meta.get("attempt_history")
+    if not isinstance(raw_history, list) or not raw_history:
+        raise RuntimeError(f"Surya page {source_page} retry history is missing or malformed.")
+    durable_history: list[dict[str, object]] = []
+    seen_attempts: set[int] = set()
+    for raw_item in raw_history:
+        if not isinstance(raw_item, dict):
+            raise RuntimeError(f"Surya page {source_page} retry history is malformed.")
+        attempt = raw_item.get("attempt")
+        if (
+            not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt <= 0
+            or attempt in seen_attempts
+        ):
+            raise RuntimeError(f"Surya page {source_page} retry attempt is invalid.")
+        seen_attempts.add(attempt)
+        raw_image_path = raw_item.get("image_path")
+        raw_sidecar_path = raw_item.get("sidecar_path")
+        if not isinstance(raw_image_path, str) or not isinstance(raw_sidecar_path, str):
+            raise RuntimeError(f"Surya page {source_page} retry history has no linked artifacts.")
+        source_image = Path(raw_image_path)
+        source_sidecar = Path(raw_sidecar_path)
+        if not source_image.is_file() or not source_sidecar.is_file():
+            raise RuntimeError(f"Surya page {source_page} retry history artifact is missing.")
+        if raw_item.get("image_sha256") != _sha256_path(source_image):
+            raise RuntimeError(f"Surya page {source_page} retry image digest changed.")
+        if raw_item.get("sidecar_sha256") != _sha256_path(source_sidecar):
+            raise RuntimeError(f"Surya page {source_page} retry sidecar digest changed.")
+        with Image.open(source_image) as image:
+            actual_image_size = [int(image.width), int(image.height)]
+        if raw_item.get("image_size") != actual_image_size:
+            raise RuntimeError(f"Surya page {source_page} retry image size changed.")
+
+        attempt_dir = engine_dir / f"page_{source_page:04d}.retry" / f"attempt_{attempt}"
+        durable_image = _copy_retry_evidence(
+            source=source_image,
+            target=attempt_dir / source_image.name,
+        )
+        durable_sidecar = _copy_retry_evidence(
+            source=source_sidecar,
+            target=attempt_dir / "surya_page_lines.json",
+        )
+        item = dict(raw_item)
+        item.update(
+            {
+                "image_path": str(durable_image.resolve()),
+                "sidecar_path": str(durable_sidecar.resolve()),
+                "image_sha256": _sha256_path(durable_image),
+                "image_bytes": int(durable_image.stat().st_size),
+                "sidecar_sha256": _sha256_path(durable_sidecar),
+                "sidecar_bytes": int(durable_sidecar.stat().st_size),
+            }
+        )
+        durable_history.append(item)
+
+    page_meta["attempt_history"] = durable_history
+    raw_selected_sidecar = page_meta.get("surya_page_lines_path")
+    if not isinstance(raw_selected_sidecar, str):
+        raise RuntimeError(f"Surya page {source_page} selected sidecar is missing.")
+    selected_sidecar = Path(raw_selected_sidecar)
+    try:
+        payload = json.loads(selected_sidecar.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Surya page {source_page} selected sidecar is unreadable: {exc}"
+        ) from exc
+    images = payload.get("images") if isinstance(payload, dict) else None
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise RuntimeError(f"Surya page {source_page} selected sidecar is malformed.")
+    for key in ("selected_attempt", "retry_policy", "attempt_history"):
+        images[0][key] = page_meta[key]
+    _write_json_atomic(selected_sidecar, payload)
+
+
 def _write_pagewise_text_artifacts(
     *,
     output_dir: Path,
@@ -821,7 +1171,11 @@ def _write_pagewise_text_artifacts(
             if not isinstance(item, dict):
                 continue
             source_page = item.get("source_page")
-            if isinstance(source_page, int) and not isinstance(source_page, bool) and source_page > 0:
+            if (
+                isinstance(source_page, int)
+                and not isinstance(source_page, bool)
+                and source_page > 0
+            ):
                 metadata_by_page[source_page] = item
 
     errors_by_page: dict[int, list[dict[str, str]]] = {}
@@ -835,9 +1189,7 @@ def _write_pagewise_text_artifacts(
             error = str(item.get("error") or "").strip()
             if error:
                 code = str(item.get("code") or _PAGE_ERROR_UNCLASSIFIED).strip()
-                errors_by_page.setdefault(source_page, []).append(
-                    {"code": code, "message": error}
-                )
+                errors_by_page.setdefault(source_page, []).append({"code": code, "message": error})
 
     total_chars = 0
     for source_page, text in zip(source_pages_1based, page_texts, strict=True):
@@ -851,6 +1203,12 @@ def _write_pagewise_text_artifacts(
             "text_chars": chars,
         }
         page_meta = metadata_by_page.get(source_page, {})
+        if engine == OCR_ENGINE_SURYA and page_meta.get("attempt_history") is not None:
+            _persist_surya_retry_history(
+                engine_dir=engine_dir,
+                page_meta=page_meta,
+                source_page=source_page,
+            )
         if page_meta.get("blank_page") is True:
             page_info["blank_page"] = True
         for evidence_key in (
@@ -858,6 +1216,9 @@ def _write_pagewise_text_artifacts(
             "explicit_nontext",
             "attempt_count",
             "retry_preprocessing",
+            "selected_attempt",
+            "retry_policy",
+            "attempt_history",
             "alnum_line_count",
             "alnum_chars",
         ):
@@ -1060,6 +1421,65 @@ def _collect_chandra_batch_outputs(
     return page_texts, total_chars, page_errors, page_metadata
 
 
+def _strict_surya_batch_images(
+    *,
+    images: object,
+    image_paths: Sequence[Path],
+) -> list[dict[str, Any]]:
+    if not isinstance(images, list):
+        raise RuntimeError("Surya sidecar payload has no 'images' list.")
+
+    validated_images: list[tuple[str, dict[str, Any]]] = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(images, start=1):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Surya sidecar image entry {index} must be an object.")
+        image_name = item.get("image_name")
+        if not isinstance(image_name, str) or not image_name.strip():
+            raise RuntimeError(f"Surya sidecar image entry {index} has no nonempty image_name.")
+        if image_name in seen_names:
+            raise RuntimeError(f"Surya sidecar contains duplicate image_name: {image_name!r}.")
+        seen_names.add(image_name)
+        pages = item.get("pages")
+        if not isinstance(pages, list) or len(pages) != 1 or not isinstance(pages[0], dict):
+            raise RuntimeError(
+                f"Surya sidecar image entry must contain exactly one page object: {image_name!r}."
+            )
+        validated_images.append((image_name, item))
+
+    expected_count = len(image_paths)
+    if len(images) != expected_count:
+        raise RuntimeError(
+            "Surya sidecar image cardinality does not match requested raster count: "
+            f"expected {expected_count}, got {len(images)}."
+        )
+
+    source_names = [Path(path).name for path in image_paths]
+    expected_names = source_names
+    if expected_count > 1:
+        staged_names = [
+            f"{index:04d}_{source_name}" for index, source_name in enumerate(source_names, start=1)
+        ]
+        raw_names = seen_names
+        if raw_names == set(staged_names):
+            expected_names = staged_names
+        elif len(set(source_names)) == expected_count and raw_names == set(source_names):
+            expected_names = source_names
+        else:
+            raise RuntimeError(
+                "Surya sidecar image names do not form an exact unambiguous "
+                "bijection to requested rasters."
+            )
+    elif seen_names != set(source_names):
+        raise RuntimeError(
+            "Surya sidecar image names do not form an exact unambiguous "
+            "bijection to requested rasters."
+        )
+
+    by_name = dict(validated_images)
+    return [by_name[name] for name in expected_names]
+
+
 def _collect_surya_batch_outputs(
     *,
     sidecar_path: Path,
@@ -1073,39 +1493,33 @@ def _collect_surya_batch_outputs(
     if not isinstance(payload, dict):
         raise RuntimeError("Surya sidecar payload has unexpected format.")
     images = payload.get("images")
-    if not isinstance(images, list):
-        raise RuntimeError("Surya sidecar payload has no 'images' list.")
-
-    by_name = {
-        str(item.get("image_name")): item
-        for item in images
-        if isinstance(item, dict) and str(item.get("image_name") or "")
-    }
+    image_payloads = _strict_surya_batch_images(
+        images=images,
+        image_paths=image_paths,
+    )
     execution_path = str(payload.get("execution_path") or "").strip()
     page_texts: list[str] = []
     total_chars = 0
     page_errors: list[dict[str, Any]] = []
     page_metadata: list[dict[str, Any]] = []
-    multi_image = len(image_paths) > 1
 
-    for image_index, (image_path, source_page) in enumerate(
-        zip(image_paths, source_pages_1based, strict=True),
-        start=1,
+    for image_path, source_page, image_payload in zip(
+        image_paths,
+        source_pages_1based,
+        image_payloads,
+        strict=True,
     ):
-        staged_name = f"{image_index:04d}_{image_path.name}" if multi_image else image_path.name
-        image_payload = by_name.get(staged_name) or by_name.get(image_path.name)
         text_lines: list[str] = []
         page_meta: dict[str, Any] = {"source_page": source_page}
-        if isinstance(image_payload, dict):
-            for page in image_payload.get("pages", []):
-                if not isinstance(page, dict):
+        for page in image_payload.get("pages", []):
+            if not isinstance(page, dict):
+                continue
+            for line in page.get("text_lines", []):
+                if not isinstance(line, dict):
                     continue
-                for line in page.get("text_lines", []):
-                    if not isinstance(line, dict):
-                        continue
-                    text = _clean_overlay_line(str(line.get("text") or ""))
-                    if text:
-                        text_lines.append(text)
+                text = _clean_overlay_line(str(line.get("text") or ""))
+                if text:
+                    text_lines.append(text)
 
         page_text = "\n".join(_dehyphenate_line_breaks(text_lines))
         page_texts.append(page_text)
@@ -1225,22 +1639,52 @@ def _run_extraction_engine_pagewise(
             ]
             page_metadata = []
 
-        zero_output_pages = {
-            int(item["source_page"])
-            for item in page_metadata
-            if item.get("ocr_outcome") == _OCR_OUTCOME_ZERO
-            and isinstance(item.get("source_page"), int)
-            and isinstance(item.get("surya_page_lines_path"), str)
-        }
         for page_index, (image_path, source_page) in enumerate(
             zip(image_paths, source_pages_1based, strict=True)
         ):
-            if source_page not in zero_output_pages:
+            initial_row = _structured_surya_zero_output(
+                page_errors=page_errors,
+                page_metadata=page_metadata,
+                source_page=source_page,
+                image_path=image_path,
+                expected_attempt=1,
+                expected_preprocessing=None,
+                permitted_execution_paths=_SURYA_DIRECT_EXECUTION_PATHS,
+                label="initial zero-output evidence",
+            )
+            if initial_row is None:
                 continue
+            initial_sidecar_raw = initial_row.get("surya_page_lines_path")
+            if not isinstance(initial_sidecar_raw, str):
+                raise RuntimeError(
+                    "Invalid initial zero-output evidence: durable geometry path is missing."
+                )
+            initial_sidecar = Path(initial_sidecar_raw)
             retry_root = work_dir / "zero_output_retry" / f"page_{source_page:04d}"
-            retry_image = retry_root / "input" / image_path.name
-            _write_autocontrast_retry_image(source=image_path, target=retry_image)
-            retry_work_dir = retry_root / "module"
+            retained_initial_image = _copy_retry_evidence(
+                source=image_path,
+                target=retry_root / "attempt_1_original" / "input" / image_path.name,
+            )
+            retained_initial_sidecar = _copy_retry_evidence(
+                source=initial_sidecar,
+                target=(retry_root / "attempt_1_original" / "module" / "surya_page_lines.json"),
+            )
+            attempt_history = [
+                _attempt_history_record(
+                    attempt=1,
+                    preprocessing="original",
+                    ocr_outcome=_OCR_OUTCOME_ZERO,
+                    image_path=retained_initial_image,
+                    sidecar_path=retained_initial_sidecar,
+                )
+            ]
+
+            retry_image = retry_root / "attempt_2_autocontrast" / "input" / image_path.name
+            retry_image_evidence = _write_autocontrast_retry_image(
+                source=image_path,
+                target=retry_image,
+            )
+            retry_work_dir = retry_root / "attempt_2_autocontrast" / "module"
             _run_surya_module_cli(
                 [retry_image],
                 lang=lang,
@@ -1262,15 +1706,134 @@ def _run_extraction_engine_pagewise(
                 attempt_count=2,
                 retry_preprocessing=_ZERO_OUTPUT_RETRY_PREPROCESSING,
             )
-            page_texts[page_index] = retry_texts[0]
-            page_errors = [
-                item for item in page_errors if item.get("source_page") != source_page
-            ]
-            page_errors.extend(retry_errors)
+            if len(retry_metadata) != 1:
+                raise RuntimeError(
+                    "Invalid second zero-output evidence: exact page metadata is required."
+                )
+            retry_outcome = retry_metadata[0].get("ocr_outcome")
+            if retry_outcome == _OCR_OUTCOME_ZERO:
+                _structured_surya_zero_output(
+                    page_errors=retry_errors,
+                    page_metadata=retry_metadata,
+                    source_page=source_page,
+                    image_path=retry_image,
+                    expected_attempt=2,
+                    expected_preprocessing=_ZERO_OUTPUT_RETRY_PREPROCESSING,
+                    permitted_execution_paths=_SURYA_MODULE_EXECUTION_PATHS,
+                    label="second zero-output evidence",
+                )
+            elif retry_outcome in {_OCR_OUTCOME_TEXT, _OCR_OUTCOME_VERIFIED_BLANK}:
+                _strict_surya_single_page_geometry(
+                    sidecar_path=retry_sidecar,
+                    image_path=retry_image,
+                    require_text=retry_outcome == _OCR_OUTCOME_TEXT,
+                    permitted_execution_paths=_SURYA_MODULE_EXECUTION_PATHS,
+                    label="second-attempt geometry",
+                )
+            else:
+                raise RuntimeError(
+                    "Invalid second zero-output evidence: retry output is missing or malformed."
+                )
+            attempt_history.append(
+                _attempt_history_record(
+                    attempt=2,
+                    preprocessing=_ZERO_OUTPUT_RETRY_PREPROCESSING,
+                    ocr_outcome=str(retry_outcome),
+                    image_path=retry_image,
+                    sidecar_path=retry_sidecar,
+                    image_evidence=retry_image_evidence,
+                )
+            )
+
+            selected_texts = retry_texts
+            selected_errors = retry_errors
+            selected_metadata = retry_metadata
+            selected_attempt = 2
+            if retry_outcome == _OCR_OUTCOME_ZERO:
+                otsu_root = retry_root / "attempt_3_otsu"
+                otsu_image = otsu_root / "input" / image_path.name
+                otsu_image_evidence = _write_otsu_retry_image(
+                    source=image_path,
+                    target=otsu_image,
+                )
+                otsu_work_dir = otsu_root / "module"
+                _run_surya_module_cli(
+                    [otsu_image],
+                    lang=lang,
+                    work_dir=otsu_work_dir,
+                    which_fn=which_fn,
+                    run_cmd=run_cmd,
+                )
+                otsu_sidecar = otsu_work_dir / "surya_page_lines.json"
+                if not otsu_sidecar.is_file():
+                    raise RuntimeError(
+                        "Surya third zero-output retry did not produce mandatory geometry "
+                        f"for source page {source_page}."
+                    )
+                otsu_texts, _, otsu_errors, otsu_metadata = _collect_surya_batch_outputs(
+                    sidecar_path=otsu_sidecar,
+                    image_paths=[otsu_image],
+                    source_pages_1based=[source_page],
+                    work_dir=work_dir,
+                    attempt_count=3,
+                    retry_preprocessing=_ZERO_OUTPUT_OTSU_RETRY_PREPROCESSING,
+                )
+                if len(otsu_metadata) != 1:
+                    raise RuntimeError(
+                        "Invalid third-attempt geometry: exact page metadata is required."
+                    )
+                otsu_outcome = otsu_metadata[0].get("ocr_outcome")
+                if otsu_outcome == _OCR_OUTCOME_ZERO:
+                    _structured_surya_zero_output(
+                        page_errors=otsu_errors,
+                        page_metadata=otsu_metadata,
+                        source_page=source_page,
+                        image_path=otsu_image,
+                        expected_attempt=3,
+                        expected_preprocessing=_ZERO_OUTPUT_OTSU_RETRY_PREPROCESSING,
+                        permitted_execution_paths=_SURYA_MODULE_EXECUTION_PATHS,
+                        label="third-attempt geometry",
+                    )
+                elif otsu_outcome in {_OCR_OUTCOME_TEXT, _OCR_OUTCOME_VERIFIED_BLANK}:
+                    _strict_surya_single_page_geometry(
+                        sidecar_path=otsu_sidecar,
+                        image_path=otsu_image,
+                        require_text=otsu_outcome == _OCR_OUTCOME_TEXT,
+                        permitted_execution_paths=_SURYA_MODULE_EXECUTION_PATHS,
+                        label="third-attempt geometry",
+                    )
+                else:
+                    raise RuntimeError(
+                        "Invalid third-attempt geometry: output is missing or malformed."
+                    )
+                attempt_history.append(
+                    _attempt_history_record(
+                        attempt=3,
+                        preprocessing=_ZERO_OUTPUT_OTSU_RETRY_PREPROCESSING,
+                        ocr_outcome=str(otsu_outcome),
+                        image_path=otsu_image,
+                        sidecar_path=otsu_sidecar,
+                        image_evidence=otsu_image_evidence,
+                    )
+                )
+                selected_texts = otsu_texts
+                selected_errors = otsu_errors
+                selected_metadata = otsu_metadata
+                selected_attempt = 3
+
+            _attach_surya_retry_provenance(
+                page_metadata=selected_metadata,
+                source_page=source_page,
+                selected_attempt=selected_attempt,
+                attempt_history=attempt_history,
+            )
+            page_texts[page_index] = selected_texts[0]
+            page_errors = [item for item in page_errors if item.get("source_page") != source_page]
+            page_errors.extend(selected_errors)
             page_metadata = [
                 item for item in page_metadata if item.get("source_page") != source_page
             ]
-            page_metadata.extend(retry_metadata)
+            page_metadata.extend(selected_metadata)
         total_chars = sum(len(text) for text in page_texts)
 
         successful_pages = {
@@ -1327,9 +1890,7 @@ def _run_extraction_engine_pagewise(
                 preview = "; ".join(
                     f"p{item['source_page']}: {item['error']}" for item in page_errors[:3]
                 )
-                raise RuntimeError(
-                    f"chandra geometry sidecar is required for each page: {preview}"
-                )
+                raise RuntimeError(f"chandra geometry sidecar is required for each page: {preview}")
             return page_texts, total_chars, page_errors, page_metadata
         warning = "chandra sidecar missing or empty; aggregate text mapped to page 1"
         if _chandra_require_sidecar():
@@ -1686,6 +2247,7 @@ def _run_surya_module_cli(
     # guard so it can process high-resolution pages.
     try:
         from PIL import Image as _PIL_Image
+
         _PIL_Image.MAX_IMAGE_PIXELS = None
     except Exception:
         pass
@@ -1767,6 +2329,7 @@ def _run_mineru_module_cli(
         # Unsupported language — fall back to "en" which at least handles
         # Latin subset; MinerU has no Cyrillic/Russian model.
         import warnings
+
         warnings.warn(
             f"MinerU does not support language '{lang}'; falling back to 'en'.",
             stacklevel=2,
@@ -1776,6 +2339,7 @@ def _run_mineru_module_cli(
     # decompression-bomb guard before importing the module.
     try:
         from PIL import Image as _PIL_Image
+
         _PIL_Image.MAX_IMAGE_PIXELS = None
     except Exception:
         pass
@@ -1855,7 +2419,9 @@ def _run_text_engine_from_cli(
             binary_path = which_fn(binary) or which_fn(f"{binary}.exe")
             if binary_path is None:
                 continue
-            args = [str(binary_path)] + [part.format(image=str(image_path), lang=lang) for part in template[1:]]
+            args = [str(binary_path)] + [
+                part.format(image=str(image_path), lang=lang) for part in template[1:]
+            ]
             proc = run_cmd(args, capture_output=True, text=True)
             if int(getattr(proc, "returncode", 1)) == 0:
                 stdout = getattr(proc, "stdout", "") or ""
@@ -1877,7 +2443,9 @@ def _run_text_engine_from_cli(
         if page_text is None:
             if not errors:
                 raise RuntimeError(f"Engine '{engine}' has no runnable CLI candidates in PATH.")
-            raise RuntimeError(f"Engine '{engine}' failed on {image_path.name}: {' | '.join(errors)}")
+            raise RuntimeError(
+                f"Engine '{engine}' failed on {image_path.name}: {' | '.join(errors)}"
+            )
 
     text = "\n".join(part for part in collected if part and not part.isspace())
     return text, len(text)
@@ -2019,6 +2587,7 @@ def _run_chandra_module(
     # Chandra uses PIL internally; lift the decompression-bomb guard.
     try:
         from PIL import Image as _PIL_Image
+
         _PIL_Image.MAX_IMAGE_PIXELS = None
     except Exception:
         pass
@@ -2444,7 +3013,9 @@ def _render_images_to_pdf(image_paths: Sequence[Path], out_pdf: Path) -> None:
     try:
         import fitz
     except Exception as exc:
-        raise RuntimeError("olmOCR docker fallback requires PyMuPDF. Install with: pip install pymupdf") from exc
+        raise RuntimeError(
+            "olmOCR docker fallback requires PyMuPDF. Install with: pip install pymupdf"
+        ) from exc
 
     output_doc = fitz.open()
     try:
@@ -2501,7 +3072,9 @@ def _run_olmocr_docker(
         os.environ.get("UNISCAN_OLMOCR_DOCKER_MAX_PAGE_ERROR_RATE") or default_error_rate
     ).strip()
 
-    cache_dir_raw = (os.environ.get("UNISCAN_OLMOCR_DOCKER_CACHE") or str(_REPO_ROOT / ".hf_cache_ocrflux")).strip()
+    cache_dir_raw = (
+        os.environ.get("UNISCAN_OLMOCR_DOCKER_CACHE") or str(_REPO_ROOT / ".hf_cache_ocrflux")
+    ).strip()
     cache_dir = Path(cache_dir_raw)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2630,7 +3203,9 @@ def _run_olmocr_direct(
                 if command_path.exists():
                     bin_dir = str(command_path.resolve().parent)
                     current_path = command_env.get("PATH", "")
-                    command_env["PATH"] = f"{bin_dir}{os.pathsep}{current_path}" if current_path else bin_dir
+                    command_env["PATH"] = (
+                        f"{bin_dir}{os.pathsep}{current_path}" if current_path else bin_dir
+                    )
                 proc = run_cmd(command, capture_output=True, text=True, env=command_env)
                 if int(getattr(proc, "returncode", 1)) == 0:
                     return _collect_olmocr_workspace_text(workspace)
@@ -2862,16 +3437,18 @@ def run_ocr_benchmark(
                         f"{_engine}: page {done}/{total} (source {source_page})",
                     )
 
-                page_texts, text_chars, page_errors, page_metadata = _run_extraction_engine_pagewise(
-                    engine,
-                    sampled_image_paths,
-                    source_pages_1based=source_pages_1based,
-                    lang=lang,
-                    work_dir=tmp_dir / f"{engine}_work",
-                    which_fn=which_fn,
-                    run_cmd=run_cmd,
-                    progress_cb=_page_progress,
-                    defer_empty_pages=defer_empty_pages,
+                page_texts, text_chars, page_errors, page_metadata = (
+                    _run_extraction_engine_pagewise(
+                        engine,
+                        sampled_image_paths,
+                        source_pages_1based=source_pages_1based,
+                        lang=lang,
+                        work_dir=tmp_dir / f"{engine}_work",
+                        which_fn=which_fn,
+                        run_cmd=run_cmd,
+                        progress_cb=_page_progress,
+                        defer_empty_pages=defer_empty_pages,
+                    )
                 )
                 _write_pagewise_text_artifacts(
                     output_dir=resolved_output,
@@ -2886,8 +3463,7 @@ def run_ocr_benchmark(
                 candidate_pages = {
                     int(item["source_page"])
                     for item in page_metadata
-                    if item.get("ocr_outcome")
-                    in {_OCR_OUTCOME_ZERO, _OCR_OUTCOME_EXPLICIT_NONTEXT}
+                    if item.get("ocr_outcome") in {_OCR_OUTCOME_ZERO, _OCR_OUTCOME_EXPLICIT_NONTEXT}
                     and isinstance(item.get("source_page"), int)
                 }
                 candidate_errors = [
@@ -2971,7 +3547,9 @@ def summarize_ocr_benchmark(results: Sequence[OcrBenchmarkResult]) -> str:
     """Format a concise human-readable benchmark summary."""
     lines: list[str] = []
     for result in results:
-        memory_part = "" if result.memory_delta_mb is None else f" mem={result.memory_delta_mb:+.2f}MB"
+        memory_part = (
+            "" if result.memory_delta_mb is None else f" mem={result.memory_delta_mb:+.2f}MB"
+        )
         if result.status == "ok":
             lines.append(
                 f"{result.engine}: ok {result.elapsed_seconds:.2f}s "

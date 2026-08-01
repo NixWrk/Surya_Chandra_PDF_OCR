@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -78,6 +79,198 @@ def _write_numbered_pdf(path: Path, *, page_count: int) -> None:
         document.close()
 
 
+def _write_complete_hybrid_summary(
+    *,
+    chunk_pdf: Path,
+    run_dir: Path,
+    output_pdf: Path | None = None,
+    include_retry: bool = False,
+) -> SearchablePdfSummary:
+    import fitz
+
+    chunk_pdf = chunk_pdf.resolve()
+    run_dir = run_dir.resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    artifact_source = run_dir.parent / "_source_pdf_without_text_fixture" / chunk_pdf.name
+    artifact_source.parent.mkdir(parents=True, exist_ok=True)
+    if not artifact_source.exists():
+        shutil.copy2(chunk_pdf, artifact_source)
+    artifact_source = artifact_source.resolve()
+    compare_dir = run_dir / "_compare_txt"
+    compare_dir.mkdir(parents=True, exist_ok=True)
+    if output_pdf is None:
+        output_pdf = run_dir / "result.pdf"
+    output_pdf = output_pdf.resolve()
+    shutil.copy2(chunk_pdf, output_pdf)
+    document = fitz.open(str(chunk_pdf))
+    try:
+        page_count = int(document.page_count)
+    finally:
+        document.close()
+    local_pages = list(range(1, page_count + 1))
+    reconciliation = run_dir / "page_reconciliation.json"
+    reconciliation.write_text(
+        json.dumps({"schema": "uniscan.page-reconciliation.v1", "status": "ok"}),
+        encoding="utf-8",
+    )
+
+    benchmark_results: list[OcrBenchmarkResult] = []
+    result_files: list[Path] = []
+    benchmark_artifacts: dict[str, Path] = {}
+    for engine in ("chandra", "surya"):
+        output_dir = run_dir / engine
+        engine_dir = output_dir / engine
+        engine_dir.mkdir(parents=True, exist_ok=True)
+        page_rows: list[dict[str, object]] = []
+        aggregate_blocks: list[str] = []
+        for source_page in local_pages:
+            text = f"{engine.upper()} PAGE {source_page}"
+            text_path = engine_dir / f"page_{source_page:04d}.txt"
+            text_path.write_text(text, encoding="utf-8")
+            geometry_path = engine_dir / f"page_{source_page:04d}.{engine}.json"
+            geometry_path.write_text(
+                json.dumps(
+                    {
+                        "images": [
+                            {
+                                "image_name": f"page_{source_page:04d}.png",
+                                "ocr_outcome": "text",
+                                "pages": [
+                                    {
+                                        "image_bbox": [0, 0, 100, 100],
+                                        "text_lines": [{"text": text, "bbox": [0, 0, 80, 10]}],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            row: dict[str, object] = {
+                "source_page": source_page,
+                "file": text_path.name,
+                "geometry_file": geometry_path.name,
+                "ocr_outcome": "text",
+            }
+            if engine == "surya":
+                row["attempt_count"] = 1
+            if include_retry and engine == "surya" and source_page == 1:
+                retry_history: list[dict[str, object]] = []
+                preprocessings = (
+                    "original",
+                    "autocontrast-cutoff-1",
+                    "grayscale-autocontrast-otsu-v1",
+                )
+                for attempt, preprocessing in enumerate(preprocessings, start=1):
+                    retry_dir = engine_dir / "page_0001.retry" / f"attempt_{attempt}"
+                    retry_dir.mkdir(parents=True)
+                    retry_image = retry_dir / "page_0001.png"
+                    retry_image.write_bytes(f"durable retry png evidence {attempt}".encode())
+                    retry_sidecar = retry_dir / "surya_page_lines.json"
+                    retry_sidecar.write_text(
+                        json.dumps({"images": [{"image_name": retry_image.name}]}),
+                        encoding="utf-8",
+                    )
+                    retry_history.append(
+                        {
+                            "attempt": attempt,
+                            "preprocessing": preprocessing,
+                            "image_path": str(retry_image.resolve()),
+                            "sidecar_path": str(retry_sidecar.resolve()),
+                        }
+                    )
+                row.update(
+                    {
+                        "attempt_count": 3,
+                        "retry_preprocessing": "grayscale-autocontrast-otsu-v1",
+                        "retry_policy": "original+autocontrast-cutoff-1+otsu-max3-v2",
+                        "selected_attempt": 3,
+                        "attempt_history": retry_history,
+                    }
+                )
+            page_rows.append(row)
+            aggregate_blocks.extend([f"[SOURCE PAGE {source_page:04d}]", text, ""])
+        aggregate_path = engine_dir / "all_pages.txt"
+        aggregate_text = "\n".join(aggregate_blocks).strip() + "\n"
+        aggregate_path.write_text(aggregate_text, encoding="utf-8")
+        pages_path = engine_dir / "pages.json"
+        pages_path.write_text(
+            json.dumps(
+                {
+                    "engine": engine,
+                    "pages": page_rows,
+                    "aggregate_file": aggregate_path.name,
+                }
+            ),
+            encoding="utf-8",
+        )
+        artifact_path = output_dir / f"document_{engine}.txt"
+        artifact_path.write_text(aggregate_text, encoding="utf-8")
+        benchmark_artifacts[engine] = artifact_path
+        result = OcrBenchmarkResult(
+            engine=engine,
+            status="ok",
+            sample_pages=list(local_pages),
+            elapsed_seconds=0.1,
+            artifact_path=str(artifact_path),
+            text_chars=len(aggregate_text),
+        )
+        benchmark_results.append(result)
+        report_path = output_dir / "document_ocr_benchmark.json"
+        report_path.write_text(
+            json.dumps({"results": [asdict(result)]}),
+            encoding="utf-8",
+        )
+        result_files.append(report_path)
+    result_files.append(reconciliation)
+
+    compare_results: list[CompareTxtBuildResult] = []
+    for engine in ("chandra", "surya"):
+        compare_path = compare_dir / f"chunk__{engine}.txt"
+        compare_path.write_text(f"{engine} compare", encoding="utf-8")
+        compare_results.append(
+            CompareTxtBuildResult(
+                engine=engine,
+                status="ok",
+                source_artifact_path=str(benchmark_artifacts[engine]),
+                compare_txt_path=str(compare_path),
+            )
+        )
+    geometry_log = run_dir / "searchable_pdf_final" / "geometry.json"
+    geometry_log.parent.mkdir(parents=True, exist_ok=True)
+    geometry_log.write_text("{}", encoding="utf-8")
+    artifact_result = ArtifactSearchableResult(
+        document=chunk_pdf.stem,
+        engine="chandra",
+        status="ok",
+        source_pdf_path=str(artifact_source),
+        text_artifact_path=str(compare_results[0].compare_txt_path),
+        searchable_pdf_path=str(output_pdf),
+        page_count=page_count,
+        text_chars=page_count,
+        elapsed_seconds=0.01,
+        geometry_log_path=str(geometry_log),
+    )
+    return SearchablePdfSummary(
+        mode="chandra+surya",
+        run_dir=run_dir,
+        compare_dir=compare_dir,
+        output_pdf_path=output_pdf,
+        output_pdf_bytes=None,
+        overwritten_input_path=None,
+        benchmark=BasicOcrRunSummary(
+            run_dir=run_dir,
+            results=tuple(benchmark_results),
+            result_files=tuple(result_files),
+            failed_engines=tuple(),
+            skipped_engines=tuple(),
+        ),
+        compare_results=tuple(compare_results),
+        artifact_results=(artifact_result,),
+    )
+
+
 def test_hybrid_chunk_pages_defaults_to_ten_and_can_be_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -150,10 +343,6 @@ def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
         chunk_pdf = Path(str(kwargs["pdf_path"]))
         work_root = Path(str(kwargs["work_root"]))
         run_dir = work_root / "run"
-        compare_dir = run_dir / "_compare_txt"
-        compare_dir.mkdir(parents=True, exist_ok=True)
-        output_pdf = run_dir / "result.pdf"
-        shutil.copy2(chunk_pdf, output_pdf)
         chunk_document = fitz.open(str(chunk_pdf))
         try:
             pages = int(chunk_document.page_count)
@@ -171,32 +360,9 @@ def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
         assert callable(callback)
         callback(0, "starting")
         callback(100, "done")
-        benchmark = BasicOcrRunSummary(
+        return _write_complete_hybrid_summary(
+            chunk_pdf=chunk_pdf,
             run_dir=run_dir,
-            results=(
-                OcrBenchmarkResult(
-                    engine="chandra",
-                    status="ok",
-                    sample_pages=list(range(1, pages + 1)),
-                    elapsed_seconds=0.1,
-                    artifact_path=str(output_pdf),
-                    text_chars=pages,
-                ),
-            ),
-            result_files=tuple(),
-            failed_engines=tuple(),
-            skipped_engines=tuple(),
-        )
-        return SearchablePdfSummary(
-            mode="chandra+surya",
-            run_dir=run_dir,
-            compare_dir=compare_dir,
-            output_pdf_path=output_pdf,
-            output_pdf_bytes=None,
-            overwritten_input_path=None,
-            benchmark=benchmark,
-            compare_results=(_ok_compare_result("chandra", compare_dir / "chunk__chandra.txt"),),
-            artifact_results=(_ok_artifact_result(output_pdf, engine="chandra"),),
         )
 
     monkeypatch.setattr(ocr_pipeline, "build_searchable_pdf", fake_build_searchable_pdf)
@@ -242,13 +408,16 @@ def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
     assert progress_values[-1] == 100
     assert [result.sample_pages for result in summary.benchmark.results] == [
         list(range(1, 11)),
+        list(range(1, 11)),
         list(range(11, 21)),
+        list(range(11, 21)),
+        list(range(21, 24)),
         list(range(21, 24)),
     ]
     manifest = json.loads(summary.chunk_manifest_path.read_text(encoding="utf-8"))
     assert manifest["status"] == "done"
     assert [item["status"] for item in manifest["chunks"]] == ["done", "done", "done"]
-    assert manifest["schema"] == "uniscan.hybrid-chunks.v2"
+    assert manifest["schema"] == "uniscan.hybrid-chunks.v3"
     assert all(item["output_sha256"] for item in manifest["chunks"])
 
     calls_before_resume = len(calls)
@@ -310,9 +479,7 @@ def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
     )
 
     assert len(calls) == calls_before_resume + 4
-    recovered_manifest = json.loads(
-        recovered.chunk_manifest_path.read_text(encoding="utf-8")
-    )
+    recovered_manifest = json.loads(recovered.chunk_manifest_path.read_text(encoding="utf-8"))
     assert "ignored unreadable manifest" in recovered_manifest["recovery_reason"]
     assert [item["reused"] for item in recovered_manifest["chunks"]] == [
         False,
@@ -346,6 +513,551 @@ def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
     assert changed_summary.run_dir != recovered.run_dir
 
 
+def test_chunk_manifest_v3_rejects_stale_v2_record() -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    chunk_pdf = tmp_path / "chunk.pdf"
+    source_pdf.write_bytes(b"source")
+    chunk_pdf.write_bytes(b"chunk")
+    manifest_path = tmp_path / "chunk_manifest.json"
+    identity = {"pipeline_revision": "chandra-surya-resumable-v3"}
+    run_key = "f" * 64
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": "uniscan.hybrid-chunks.v2",
+                "status": "done",
+                "run_key": run_key,
+                "identity": identity,
+                "chunks": [
+                    {
+                        "index": 1,
+                        "start_page": 1,
+                        "end_page": 1,
+                        "status": "done",
+                        "output_pdf": str(tmp_path / "stale.pdf"),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest, records = ocr_pipeline._prepare_chunk_manifest(
+        manifest_path=manifest_path,
+        identity=identity,
+        run_key=run_key,
+        input_path=source_pdf,
+        input_chunks=[ocr_pipeline._PdfChunk(1, 1, 1, chunk_pdf)],
+        mode="chandra+surya",
+        page_count=1,
+        chunk_pages=10,
+    )
+
+    assert manifest["schema"] == "uniscan.hybrid-chunks.v3"
+    assert manifest["recovery_reason"] == "ignored incompatible manifest identity"
+    assert records[0]["status"] == "pending"
+    assert "output_pdf" not in records[0]
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "reconciliation-tamper",
+        "pages-tamper",
+        "geometry-delete",
+        "retry-image-tamper",
+        "retry-sidecar-tamper",
+        "unexpected-sidecar-add",
+    ],
+)
+def test_reusable_chunk_rejects_tampered_critical_evidence(defect: str) -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+        include_retry=True,
+    )
+    run_dir = summary.run_dir
+    reconciliation = run_dir / "page_reconciliation.json"
+    engine_dir = run_dir / "surya" / "surya"
+    retry_dir = engine_dir / "page_0001.retry" / "attempt_3"
+    pages_path = engine_dir / "pages.json"
+    geometry_path = engine_dir / "page_0001.surya.json"
+    retry_image = retry_dir / "page_0001.png"
+    retry_sidecar = retry_dir / "surya_page_lines.json"
+    source = fitz.open(str(source_pdf))
+    try:
+        source_sizes = [(float(source[0].rect.width), float(source[0].rect.height))]
+    finally:
+        source.close()
+    chunk = ocr_pipeline._PdfChunk(1, 1, 1, source_pdf)
+    record: dict[str, object] = {}
+
+    ocr_pipeline._complete_chunk_record(
+        record=record,
+        chunk=chunk,
+        summary=summary,
+        run_dir=tmp_path,
+        source_sizes=source_sizes,
+    )
+
+    evidence_manifest = Path(str(record["evidence_manifest"]))
+    assert evidence_manifest.is_file()
+    assert len(str(record["evidence_manifest_sha256"])) == 64
+    assert (
+        ocr_pipeline._reusable_chunk_summary(
+            record=record,
+            chunk=chunk,
+            run_dir=tmp_path,
+            source_sizes=source_sizes,
+        )
+        is not None
+    )
+
+    if defect == "reconciliation-tamper":
+        reconciliation.write_text('{"status":"tampered"}', encoding="utf-8")
+    elif defect == "pages-tamper":
+        pages_path.write_text('{"engine":"surya","pages":[1]}', encoding="utf-8")
+    elif defect == "geometry-delete":
+        geometry_path.unlink()
+    elif defect == "retry-image-tamper":
+        retry_image.write_bytes(b"tampered retry png evidence")
+    elif defect == "retry-sidecar-tamper":
+        retry_sidecar.write_text('{"images":["tampered"]}', encoding="utf-8")
+    else:
+        (engine_dir / "page_0002.surya.json").write_text(
+            '{"images":[]}',
+            encoding="utf-8",
+        )
+
+    assert (
+        ocr_pipeline._reusable_chunk_summary(
+            record=record,
+            chunk=chunk,
+            run_dir=tmp_path,
+            source_sizes=source_sizes,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing-benchmark-result",
+        "out-of-tree-compare",
+        "missing-page-geometry",
+        "missing-reconciliation",
+        "missing-retry-history",
+        "empty-retry-history",
+    ],
+)
+def test_complete_chunk_refuses_incomplete_or_out_of_tree_claims(defect: str) -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+        include_retry=True,
+    )
+    if defect == "missing-benchmark-result":
+        summary.benchmark.result_files[0].unlink()
+    elif defect == "out-of-tree-compare":
+        escaped = tmp_path / "escaped-compare.txt"
+        escaped.write_text("escaped", encoding="utf-8")
+        first_compare = replace(
+            summary.compare_results[0],
+            compare_txt_path=str(escaped),
+        )
+        summary = replace(
+            summary,
+            compare_results=(first_compare, *summary.compare_results[1:]),
+        )
+    elif defect == "missing-page-geometry":
+        (summary.run_dir / "chandra" / "chandra" / "page_0001.chandra.json").unlink()
+    elif defect == "missing-reconciliation":
+        (summary.run_dir / "page_reconciliation.json").unlink()
+    else:
+        pages_path = summary.run_dir / "surya" / "surya" / "pages.json"
+        pages_payload = json.loads(pages_path.read_text(encoding="utf-8"))
+        first_page = pages_payload["pages"][0]
+        assert isinstance(first_page, dict)
+        if defect == "missing-retry-history":
+            first_page.pop("attempt_history")
+        else:
+            first_page["attempt_history"] = []
+        pages_path.write_text(json.dumps(pages_payload), encoding="utf-8")
+    source = fitz.open(str(source_pdf))
+    try:
+        source_sizes = [(float(source[0].rect.width), float(source[0].rect.height))]
+    finally:
+        source.close()
+    record: dict[str, object] = {"status": "running"}
+
+    with pytest.raises(RuntimeError):
+        ocr_pipeline._complete_chunk_record(
+            record=record,
+            chunk=ocr_pipeline._PdfChunk(1, 1, 1, source_pdf),
+            summary=summary,
+            run_dir=tmp_path,
+            source_sizes=source_sizes,
+        )
+
+    assert record.get("status") != "done"
+
+
+def test_complete_chunk_rejects_pages_changed_after_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+    )
+    source = fitz.open(str(source_pdf))
+    try:
+        source_sizes = [(float(source[0].rect.width), float(source[0].rect.height))]
+    finally:
+        source.close()
+    pages_path = summary.run_dir / "surya" / "surya" / "pages.json"
+    original_entries = ocr_pipeline._complete_chunk_evidence_entries
+    mutated = False
+
+    def _mutating_entries(
+        *,
+        required: ocr_pipeline._RequiredChunkEvidence,
+        manifest_path: Path,
+    ) -> list[dict[str, object]]:
+        nonlocal mutated
+        if not mutated:
+            payload = json.loads(pages_path.read_text(encoding="utf-8"))
+            payload["engine"] = "tampered-after-validation"
+            pages_path.write_text(json.dumps(payload), encoding="utf-8")
+            mutated = True
+        return original_entries(required=required, manifest_path=manifest_path)
+
+    monkeypatch.setattr(
+        ocr_pipeline,
+        "_complete_chunk_evidence_entries",
+        _mutating_entries,
+    )
+    record: dict[str, object] = {"status": "running"}
+    with pytest.raises(RuntimeError, match="changed before it could be sealed"):
+        ocr_pipeline._complete_chunk_record(
+            record=record,
+            chunk=ocr_pipeline._PdfChunk(1, 1, 1, source_pdf),
+            summary=summary,
+            run_dir=tmp_path,
+            source_sizes=source_sizes,
+        )
+
+    assert mutated is True
+    assert record.get("status") != "done"
+
+
+def test_chunk_evidence_manifest_records_required_and_outer_paths() -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+        include_retry=True,
+    )
+    source = fitz.open(str(source_pdf))
+    try:
+        source_sizes = [(float(source[0].rect.width), float(source[0].rect.height))]
+    finally:
+        source.close()
+    record: dict[str, object] = {}
+    ocr_pipeline._complete_chunk_record(
+        record=record,
+        chunk=ocr_pipeline._PdfChunk(1, 1, 1, source_pdf),
+        summary=summary,
+        run_dir=tmp_path,
+        source_sizes=source_sizes,
+    )
+
+    manifest_path = Path(str(record["evidence_manifest"]))
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    required_paths = set(payload["required_paths"])
+    sealed_paths = {item["path"] for item in payload["files"]}
+    outer_required = set(payload["outer_required_paths"])
+    outer_sealed = {item["path"] for item in payload["outer_files"]}
+
+    assert payload["evidence_root"] == str(summary.run_dir)
+    assert payload["outer_root"] == str(tmp_path)
+    assert required_paths <= sealed_paths
+    assert {
+        "page_reconciliation.json",
+        "surya/surya/pages.json",
+        "chandra/chandra/pages.json",
+        "surya/surya/page_0001.txt",
+        "chandra/chandra/page_0001.chandra.json",
+    } <= required_paths
+    assert outer_required == outer_sealed
+    assert len(outer_required) == 1
+    assert all(len(item["sha256"]) == 64 and item["size"] > 0 for item in payload["outer_files"])
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "partial-count-string",
+        "status-bool",
+        "sample-out-of-range",
+        "path-not-string",
+        "artifact-count-float",
+        "unexpected-key",
+    ],
+)
+def test_reusable_chunk_rejects_malformed_strict_summary(defect: str) -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+    )
+    source = fitz.open(str(source_pdf))
+    try:
+        source_sizes = [(float(source[0].rect.width), float(source[0].rect.height))]
+    finally:
+        source.close()
+    chunk = ocr_pipeline._PdfChunk(1, 1, 1, source_pdf)
+    record: dict[str, object] = {}
+    ocr_pipeline._complete_chunk_record(
+        record=record,
+        chunk=chunk,
+        summary=summary,
+        run_dir=tmp_path,
+        source_sizes=source_sizes,
+    )
+    summary_payload = record["summary"]
+    assert isinstance(summary_payload, dict)
+    benchmark = summary_payload["benchmark"]
+    assert isinstance(benchmark, dict)
+    results = benchmark["results"]
+    artifacts = summary_payload["artifact_results"]
+    assert isinstance(results, list) and isinstance(results[0], dict)
+    assert isinstance(artifacts, list) and isinstance(artifacts[0], dict)
+    if defect == "partial-count-string":
+        summary_payload["partial_page_failures"] = "0"
+    elif defect == "status-bool":
+        results[0]["status"] = True
+    elif defect == "sample-out-of-range":
+        results[0]["sample_pages"] = [2]
+    elif defect == "path-not-string":
+        benchmark["run_dir"] = 7
+    elif defect == "artifact-count-float":
+        artifacts[0]["page_count"] = 1.0
+    else:
+        summary_payload["unexpected"] = True
+
+    assert (
+        ocr_pipeline._reusable_chunk_summary(
+            record=record,
+            chunk=chunk,
+            run_dir=tmp_path,
+            source_sizes=source_sizes,
+        )
+        is None
+    )
+
+
+def test_complete_chunk_rejects_hardlinked_required_evidence() -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+    )
+    geometry = summary.run_dir / "surya" / "surya" / "page_0001.surya.json"
+    original = tmp_path / "hardlink-target.json"
+    original.write_bytes(geometry.read_bytes())
+    geometry.unlink()
+    try:
+        os.link(original, geometry)
+    except OSError as exc:
+        pytest.skip(f"hardlink creation is unavailable: {exc}")
+    source = fitz.open(str(source_pdf))
+    try:
+        source_sizes = [(float(source[0].rect.width), float(source[0].rect.height))]
+    finally:
+        source.close()
+
+    with pytest.raises(RuntimeError, match="hard-linked"):
+        ocr_pipeline._complete_chunk_record(
+            record={},
+            chunk=ocr_pipeline._PdfChunk(1, 1, 1, source_pdf),
+            summary=summary,
+            run_dir=tmp_path,
+            source_sizes=source_sizes,
+        )
+
+
+def test_reusable_chunk_rejects_hardlinked_cached_output() -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+    )
+    source = fitz.open(str(source_pdf))
+    try:
+        source_sizes = [(float(source[0].rect.width), float(source[0].rect.height))]
+    finally:
+        source.close()
+    chunk = ocr_pipeline._PdfChunk(1, 1, 1, source_pdf)
+    record: dict[str, object] = {}
+    ocr_pipeline._complete_chunk_record(
+        record=record,
+        chunk=chunk,
+        summary=summary,
+        run_dir=tmp_path,
+        source_sizes=source_sizes,
+    )
+    output_pdf = summary.output_pdf_path
+    hardlink_target = tmp_path / "cached-output-target.pdf"
+    shutil.copy2(output_pdf, hardlink_target)
+    output_pdf.unlink()
+    try:
+        os.link(hardlink_target, output_pdf)
+    except OSError as exc:
+        pytest.skip(f"hardlink creation is unavailable: {exc}")
+
+    assert (
+        ocr_pipeline._reusable_chunk_summary(
+            record=record,
+            chunk=chunk,
+            run_dir=tmp_path,
+            source_sizes=source_sizes,
+        )
+        is None
+    )
+
+
+def test_complete_chunk_rejects_symlinked_directory_component() -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+    )
+    compare_dir = summary.compare_dir
+    compare_target = summary.run_dir / "_compare_txt_target"
+    compare_dir.rename(compare_target)
+    try:
+        os.symlink(compare_target, compare_dir, target_is_directory=True)
+    except OSError as exc:
+        compare_target.rename(compare_dir)
+        pytest.skip(f"directory symlink creation is unavailable: {exc}")
+    source = fitz.open(str(source_pdf))
+    try:
+        source_sizes = [(float(source[0].rect.width), float(source[0].rect.height))]
+    finally:
+        source.close()
+
+    with pytest.raises(RuntimeError, match="link|reparse"):
+        ocr_pipeline._complete_chunk_record(
+            record={},
+            chunk=ocr_pipeline._PdfChunk(1, 1, 1, source_pdf),
+            summary=summary,
+            run_dir=tmp_path,
+            source_sizes=source_sizes,
+        )
+
+
+def test_reusable_chunk_rejects_non_root_evidence_manifest_path() -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+    )
+    source = fitz.open(str(source_pdf))
+    try:
+        source_sizes = [(float(source[0].rect.width), float(source[0].rect.height))]
+    finally:
+        source.close()
+    chunk = ocr_pipeline._PdfChunk(1, 1, 1, source_pdf)
+    record: dict[str, object] = {}
+    ocr_pipeline._complete_chunk_record(
+        record=record,
+        chunk=chunk,
+        summary=summary,
+        run_dir=tmp_path,
+        source_sizes=source_sizes,
+    )
+    relocated = tmp_path / "relocated-evidence-manifest.json"
+    shutil.copy2(Path(str(record["evidence_manifest"])), relocated)
+    fingerprint = ocr_pipeline._stable_file_fingerprint(relocated)
+    record["evidence_manifest"] = str(relocated)
+    record["evidence_manifest_sha256"] = fingerprint["sha256"]
+    record["evidence_manifest_size"] = fingerprint["size"]
+
+    assert (
+        ocr_pipeline._reusable_chunk_summary(
+            record=record,
+            chunk=chunk,
+            run_dir=tmp_path,
+            source_sizes=source_sizes,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("link_kind", ["hardlink", "symlink"])
+def test_chunk_manifest_reader_rejects_linked_file(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    target = tmp_path / "manifest-target.json"
+    target.write_text('{"schema":"uniscan.hybrid-chunks.v3"}', encoding="utf-8")
+    manifest = tmp_path / "chunk_manifest.json"
+    try:
+        if link_kind == "hardlink":
+            os.link(target, manifest)
+        else:
+            os.symlink(target, manifest)
+    except OSError as exc:
+        pytest.skip(f"{link_kind} creation is unavailable: {exc}")
+
+    payload, error = ocr_pipeline._read_chunk_manifest(manifest)
+
+    assert payload is None
+    assert error is not None
+    assert "link" in error.lower() or "reparse" in error.lower()
+
+
 def test_chunked_hybrid_pipeline_records_failed_page_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -360,27 +1072,9 @@ def test_chunked_hybrid_pipeline_records_failed_page_range(
         if attempts == 2:
             raise RuntimeError("CUDA out of memory")
         chunk_pdf = Path(str(kwargs["pdf_path"]))
-        run_dir = Path(str(kwargs["work_root"])) / "run"
-        compare_dir = run_dir / "_compare_txt"
-        compare_dir.mkdir(parents=True, exist_ok=True)
-        output_pdf = run_dir / "result.pdf"
-        shutil.copy2(chunk_pdf, output_pdf)
-        return SearchablePdfSummary(
-            mode="chandra+surya",
-            run_dir=run_dir,
-            compare_dir=compare_dir,
-            output_pdf_path=output_pdf,
-            output_pdf_bytes=None,
-            overwritten_input_path=None,
-            benchmark=BasicOcrRunSummary(
-                run_dir=run_dir,
-                results=(_ok_benchmark_result("chandra"),),
-                result_files=tuple(),
-                failed_engines=tuple(),
-                skipped_engines=tuple(),
-            ),
-            compare_results=tuple(),
-            artifact_results=tuple(),
+        return _write_complete_hybrid_summary(
+            chunk_pdf=chunk_pdf,
+            run_dir=Path(str(kwargs["work_root"])) / "run",
         )
 
     monkeypatch.setattr(ocr_pipeline, "build_searchable_pdf", fail_second_chunk)
@@ -818,7 +1512,6 @@ def test_run_basic_ocr_benchmark_supports_engine_python_override(monkeypatch) ->
     assert summary.results[0].engine == "surya"
     assert summary.results[0].status == "ok"
     assert summary.failed_engines == tuple()
-
 
 
 def test_engine_subprocess_defer_uses_matching_internal_token(
