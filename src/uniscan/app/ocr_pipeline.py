@@ -77,7 +77,7 @@ ProgressCallback = Callable[[int, str], None]
 _DEFAULT_HYBRID_CHUNK_PAGES = 10
 _HYBRID_CHUNK_MANIFEST_SCHEMA = "uniscan.hybrid-chunks.v4"
 _OCR_STATUS_RECONCILIATION_PENDING = "reconciliation_pending"
-_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v5"
+_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v6"
 _SURYA_RETRY_PREPROCESSING = "autocontrast-cutoff-1"
 _SURYA_SCALED_RETRY_PREPROCESSING = "rgb-scale-0.5-center-white-lanczos-v1"
 _SURYA_SCALED_RETRY_FACTOR = 0.5
@@ -3444,6 +3444,9 @@ def build_searchable_pdf(
                 output_dir=output_root,
                 engines=build_engines,
                 require_page_markers=True,
+                reconciliation_root=(
+                    benchmark.run_dir if normalized_mode == PDF_MODE_HYBRID else None
+                ),
             )
         )
     if strict:
@@ -3961,6 +3964,7 @@ def build_chandra_geometry_variants(
             output_dir=output_chandra,
             engines=("chandra",),
             require_page_markers=True,
+            reconciliation_root=resolved_run,
         )
     )
     if strict:
@@ -3975,6 +3979,7 @@ def build_chandra_geometry_variants(
                 output_dir=output_surya,
                 engines=("chandra",),
                 require_page_markers=True,
+                reconciliation_root=resolved_run,
             )
         )
     if strict:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import difflib
+import hashlib
 import json
 import math
 import os
@@ -14,7 +15,7 @@ from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Sequence
+from typing import Any, NoReturn, Sequence
 
 from uniscan.io.loaders import _safe_render_dpi
 
@@ -2792,11 +2793,22 @@ def _build_searchable_pdf_from_text(
     return page_count, len(text)
 
 
-def _validate_searchable_text_retention(*, source_text: str, extracted_text: str) -> None:
+def _validate_searchable_text_retention(
+    *,
+    source_text: str,
+    extracted_text: str,
+    expect_empty_text_layer: bool = False,
+) -> None:
     source_clean = "\n".join(_split_page_text_lines(source_text))
     source_chars = len(re.sub(r"\s+", "", source_clean))
     extracted_chars = len(re.sub(r"\s+", "", extracted_text))
     if source_chars == 0:
+        if expect_empty_text_layer:
+            if extracted_chars != 0:
+                raise RuntimeError(
+                    "Verified textless-graphics output gained an unexpected text layer."
+                )
+            return
         if extracted_chars == 0:
             raise RuntimeError("Output PDF has empty extracted text layer.")
         return
@@ -2806,6 +2818,378 @@ def _validate_searchable_text_retention(*, source_text: str, extracted_text: str
             "Output PDF retained too little searchable text: "
             f"{extracted_chars}/{source_chars} non-whitespace characters ({retention:.1%})."
         )
+
+
+def _json_object_or_none(path: Path) -> dict[str, object] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _is_exact_zero(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value == 0
+
+
+def _owned_exact_evidence_file(root: Path, raw_name: object, expected_name: str) -> Path | None:
+    if raw_name != expected_name:
+        return None
+    resolved_root = root.resolve()
+    candidate = root / expected_name
+    try:
+        resolved_candidate = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    if resolved_candidate.parent != resolved_root or not resolved_candidate.is_file():
+        return None
+    return resolved_candidate
+
+
+def _textless_geometry_is_valid(path: Path, *, engine: str) -> bool:
+    payload = _json_object_or_none(path)
+    images = payload.get("images") if payload is not None else None
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        return False
+    image = images[0]
+    if image.get("ocr_outcome") != "textless_graphics":
+        return False
+    if engine == "chandra":
+        labels = image.get("chandra_non_text_labels")
+        if (
+            image.get("explicit_nontext") is not True
+            or not isinstance(labels, list)
+            or any(not isinstance(label, str) for label in labels)
+        ):
+            return False
+        normalized_labels = {label.strip().lower() for label in labels if label.strip()}
+        if not normalized_labels & {"image", "figure", "diagram"}:
+            return False
+        if not normalized_labels <= {"blank-page", "image", "figure", "diagram"}:
+            return False
+    pages = image.get("pages")
+    return bool(
+        isinstance(pages, list)
+        and pages
+        and all(
+            isinstance(page, dict)
+            and page.get("text_lines") == []
+            and page.get("ocr_outcome") == "textless_graphics"
+            for page in pages
+        )
+    )
+
+
+def _validated_all_textless_graphics_pages(
+    *,
+    reconciliation_root: Path | None,
+    compare_dir: Path,
+    artifact_path: Path,
+    artifact_text: str,
+    document: str,
+    source_pdf: Path,
+) -> frozenset[int]:
+    if reconciliation_root is None:
+        return frozenset()
+    resolved_root = Path(reconciliation_root).resolve()
+    if resolved_root != compare_dir.resolve().parent:
+        return frozenset()
+    reconciliation = _json_object_or_none(resolved_root / "page_reconciliation.json")
+    if (
+        reconciliation is None
+        or reconciliation.get("schema") != "uniscan.page-reconciliation.v1"
+        or reconciliation.get("status") != "ok"
+        or reconciliation.get("exact_page_bijection") is not True
+        or reconciliation.get("unresolved_pages") != []
+    ):
+        return frozenset()
+
+    accepted_raw = reconciliation.get("accepted_textless_graphics_pages")
+    rows_raw = reconciliation.get("pages")
+    if not isinstance(accepted_raw, list) or not accepted_raw:
+        return frozenset()
+    if not isinstance(rows_raw, list) or not rows_raw:
+        return frozenset()
+    if any(not isinstance(page, int) or isinstance(page, bool) or page < 1 for page in accepted_raw):
+        return frozenset()
+    accepted: frozenset[int] = frozenset(accepted_raw)
+    if len(accepted) != len(accepted_raw):
+        return frozenset()
+
+    rows: dict[int, dict[str, object]] = {}
+    for raw_row in rows_raw:
+        if not isinstance(raw_row, dict):
+            return frozenset()
+        source_page = raw_row.get("source_page")
+        if (
+            not isinstance(source_page, int)
+            or isinstance(source_page, bool)
+            or source_page < 1
+            or source_page in rows
+        ):
+            return frozenset()
+        rows[source_page] = raw_row
+    expected_pages = frozenset(range(1, len(rows) + 1))
+    if accepted != expected_pages or frozenset(rows) != expected_pages:
+        return frozenset()
+
+    def reject_claim(reason: str) -> NoReturn:
+        raise ValueError(f"Verified all-textless graphics evidence is invalid: {reason}")
+
+    identity_payloads: dict[str, dict[str, object]] = {}
+    identity_stems: set[str] = set()
+    for engine in ("surya", "chandra"):
+        payload = _json_object_or_none(resolved_root / engine / engine / "pages.json")
+        if payload is None or payload.get("engine") != engine:
+            reject_claim(f"{engine} pages index is missing or has the wrong identity")
+        raw_pdf_path = payload.get("pdf_path")
+        if not isinstance(raw_pdf_path, str) or not raw_pdf_path.strip():
+            reject_claim(f"{engine} pages index has no source PDF identity")
+        identity_payloads[engine] = payload
+        identity_stems.add(_normalize_key(Path(raw_pdf_path).stem))
+    normalized_document = _normalize_key(document)
+    if normalized_document not in identity_stems:
+        return frozenset()
+    if identity_stems != {normalized_document}:
+        reject_claim("engine source PDF document identities disagree")
+    try:
+        resolved_source = source_pdf.resolve(strict=True)
+    except OSError:
+        reject_claim("the source PDF is unreadable")
+    for engine, payload in identity_payloads.items():
+        raw_pdf_path = payload["pdf_path"]
+        assert isinstance(raw_pdf_path, str)
+        try:
+            resolved_evidence_pdf = Path(raw_pdf_path).resolve(strict=True)
+        except OSError:
+            reject_claim(f"{engine} source PDF identity does not resolve")
+        if resolved_evidence_pdf != resolved_source:
+            reject_claim(f"{engine} source PDF identity disagrees with the build source")
+    result_chars = reconciliation.get("result_text_chars")
+    error_totals = reconciliation.get("reconciled_page_error_counts")
+    if not isinstance(result_chars, dict) or set(result_chars) != {"surya", "chandra"}:
+        reject_claim("result text counters are incomplete")
+    if any(
+        not isinstance(result_chars.get(engine), int)
+        or isinstance(result_chars.get(engine), bool)
+        or result_chars.get(engine) != 0
+        for engine in ("surya", "chandra")
+    ):
+        reject_claim("result text counters are nonzero")
+    if not isinstance(error_totals, dict) or set(error_totals) != {"surya", "chandra"}:
+        reject_claim("reconciled error counters are incomplete")
+
+    computed_errors = {"surya": 0, "chandra": 0}
+    for source_page in sorted(rows):
+        raw_row = rows[source_page]
+        surya_errors = raw_row.get("surya_page_error_count")
+        chandra_errors = raw_row.get("chandra_page_error_count")
+        surya_lines = raw_row.get("surya_alnum_line_count")
+        surya_chars = raw_row.get("surya_alnum_chars")
+        if (
+            raw_row.get("accepted") is not True
+            or raw_row.get("reason") != "explicit_chandra_nontext_with_quiet_surya"
+            or raw_row.get("chandra_outcome") != "explicit_nontext"
+            or raw_row.get("surya_outcome") not in {"zero_output", "text"}
+            or not isinstance(surya_lines, int)
+            or isinstance(surya_lines, bool)
+            or not 0 <= surya_lines <= 1
+            or not isinstance(surya_chars, int)
+            or isinstance(surya_chars, bool)
+            or not 0 <= surya_chars <= 8
+            or not isinstance(surya_errors, int)
+            or isinstance(surya_errors, bool)
+            or surya_errors < 0
+            or not isinstance(chandra_errors, int)
+            or isinstance(chandra_errors, bool)
+            or chandra_errors < 0
+        ):
+            reject_claim(f"page {source_page} reconciliation row is inconsistent")
+        computed_errors["surya"] += surya_errors
+        computed_errors["chandra"] += chandra_errors
+    if any(
+        not isinstance(error_totals.get(engine), int)
+        or isinstance(error_totals.get(engine), bool)
+        or error_totals[engine] != computed_errors[engine]
+        for engine in ("surya", "chandra")
+    ):
+        reject_claim("reconciled error counters disagree with page rows")
+
+    marker_pages = tuple(int(match.group(1)) for match in _PAGE_MARKER_RE.finditer(artifact_text))
+    if (
+        len(marker_pages) != len(set(marker_pages))
+        or frozenset(marker_pages) != expected_pages
+        or _split_page_text_lines(artifact_text)
+    ):
+        reject_claim("the selected artifact is not exact marker-only text")
+    try:
+        artifact_bytes = artifact_path.read_bytes()
+    except OSError:
+        reject_claim("the selected artifact is unreadable")
+
+    engine_pdf_path: str | None = None
+    for engine in ("surya", "chandra"):
+        engine_dir = (resolved_root / engine / engine).resolve()
+        try:
+            engine_dir.relative_to(resolved_root)
+        except ValueError:
+            reject_claim(f"{engine} evidence directory escapes the run root")
+        pages_payload = identity_payloads[engine]
+        raw_pdf_path = pages_payload.get("pdf_path")
+        if not isinstance(raw_pdf_path, str) or not raw_pdf_path.strip():
+            reject_claim(f"{engine} pages index has no source PDF identity")
+        try:
+            resolved_evidence_pdf = Path(raw_pdf_path).resolve(strict=True)
+        except OSError:
+            reject_claim(f"{engine} source PDF identity does not resolve")
+        if resolved_evidence_pdf != resolved_source:
+            reject_claim(f"{engine} source PDF identity disagrees with the build source")
+        if _normalize_key(resolved_evidence_pdf.stem) != _normalize_key(document):
+            reject_claim(f"{engine} source PDF identity disagrees with the artifact document")
+        if engine_pdf_path is None:
+            engine_pdf_path = str(resolved_evidence_pdf)
+        elif engine_pdf_path != str(resolved_evidence_pdf):
+            reject_claim("engine source PDF identities disagree")
+        if (
+            not _is_exact_zero(pages_payload.get("total_text_chars"))
+            or pages_payload.get("aggregate_has_page_markers") is not True
+        ):
+            reject_claim(f"{engine} text counters or aggregate marker seal are invalid")
+        aggregate = _owned_exact_evidence_file(
+            engine_dir,
+            pages_payload.get("aggregate_file"),
+            "all_pages.txt",
+        )
+        if aggregate is None:
+            reject_claim(f"{engine} aggregate artifact is not root-exact")
+        try:
+            if aggregate.read_bytes() != artifact_bytes:
+                reject_claim(f"{engine} aggregate differs from the selected compare artifact")
+        except OSError:
+            reject_claim(f"{engine} aggregate artifact is unreadable")
+        engine_rows_raw = pages_payload.get("pages")
+        if not isinstance(engine_rows_raw, list) or len(engine_rows_raw) != len(expected_pages):
+            reject_claim(f"{engine} pages index is not complete")
+        engine_pages: set[int] = set()
+        for raw_row in engine_rows_raw:
+            if not isinstance(raw_row, dict):
+                reject_claim(f"{engine} pages index contains a non-object row")
+            source_page = raw_row.get("source_page")
+            if (
+                not isinstance(source_page, int)
+                or isinstance(source_page, bool)
+                or source_page in engine_pages
+            ):
+                reject_claim(f"{engine} pages index contains an invalid page identity")
+            engine_pages.add(source_page)
+            if (
+                not _is_exact_zero(raw_row.get("text_chars"))
+                or raw_row.get("ocr_outcome") != "textless_graphics"
+                or raw_row.get("page_errors") != []
+                or raw_row.get("textless_graphics") is not True
+                or raw_row.get("accepted_by") != "mode_both_page_reconciliation"
+                or not _is_exact_zero(raw_row.get("alnum_line_count"))
+                or not _is_exact_zero(raw_row.get("alnum_chars"))
+                or (engine == "chandra" and raw_row.get("explicit_nontext") is not True)
+            ):
+                reject_claim(f"{engine} page {source_page} published evidence is inconsistent")
+            page_text = _owned_exact_evidence_file(
+                engine_dir,
+                raw_row.get("file"),
+                f"page_{source_page:04d}.txt",
+            )
+            geometry = _owned_exact_evidence_file(
+                engine_dir,
+                raw_row.get("geometry_file"),
+                f"page_{source_page:04d}.{engine}.json",
+            )
+            if page_text is None or geometry is None:
+                reject_claim(f"{engine} page {source_page} owned evidence is incomplete")
+            try:
+                if page_text.read_bytes() != b"":
+                    reject_claim(f"{engine} page {source_page} text artifact is not empty")
+            except OSError:
+                reject_claim(f"{engine} page {source_page} text artifact is unreadable")
+            if not _textless_geometry_is_valid(geometry, engine=engine):
+                reject_claim(f"{engine} page {source_page} geometry evidence is invalid")
+        if frozenset(engine_pages) != expected_pages:
+            reject_claim(f"{engine} pages index is not contiguous")
+
+    try:
+        import fitz
+
+        with fitz.open(str(resolved_source)) as source_document:
+            if source_document.page_count != len(expected_pages):
+                reject_claim("the source PDF page count disagrees with reconciliation")
+    except ValueError:
+        raise
+    except Exception as exc:
+        reject_claim(f"the source PDF is unreadable: {exc}")
+    return expected_pages
+
+
+def _validate_textless_visual_retention(
+    *,
+    source_pdf: Path,
+    candidate_pdf: Path,
+    expected_pages: frozenset[int],
+) -> None:
+    import fitz
+
+    try:
+        with fitz.open(str(source_pdf)) as source_document, fitz.open(
+            str(candidate_pdf)
+        ) as candidate_document:
+            expected = frozenset(range(1, source_document.page_count + 1))
+            if expected_pages != expected or candidate_document.page_count != source_document.page_count:
+                raise RuntimeError("Textless-graphics output page count changed.")
+            matrix = fitz.Matrix(1.0, 1.0)
+            for page_number in sorted(expected_pages):
+                source_page = source_document[page_number - 1]
+                candidate_page = candidate_document[page_number - 1]
+                source_rect = tuple(float(value) for value in source_page.rect)
+                candidate_rect = tuple(float(value) for value in candidate_page.rect)
+                if any(
+                    abs(left - right) > 1e-4
+                    for left, right in zip(source_rect, candidate_rect)
+                ):
+                    raise RuntimeError(f"Textless-graphics page {page_number} dimensions changed.")
+                if source_page.rotation != candidate_page.rotation:
+                    raise RuntimeError(f"Textless-graphics page {page_number} rotation changed.")
+                if source_page.get_text("text") != "" or candidate_page.get_text("text") != "":
+                    raise RuntimeError(
+                        f"Textless-graphics page {page_number} gained an unexpected native text layer."
+                    )
+                source_pixmap = source_page.get_pixmap(
+                    matrix=matrix,
+                    colorspace=fitz.csRGB,
+                    alpha=False,
+                )
+                candidate_pixmap = candidate_page.get_pixmap(
+                    matrix=matrix,
+                    colorspace=fitz.csRGB,
+                    alpha=False,
+                )
+                source_render = (
+                    source_pixmap.width,
+                    source_pixmap.height,
+                    source_pixmap.n,
+                    hashlib.sha256(source_pixmap.samples).digest(),
+                )
+                candidate_render = (
+                    candidate_pixmap.width,
+                    candidate_pixmap.height,
+                    candidate_pixmap.n,
+                    hashlib.sha256(candidate_pixmap.samples).digest(),
+                )
+                if candidate_render != source_render:
+                    raise RuntimeError(f"Textless-graphics page {page_number} render changed.")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"Textless-graphics PDF validation could not open or render output: {exc}"
+        ) from exc
 
 
 def _resolve_textless_dpi() -> int:
@@ -2830,6 +3214,7 @@ def run_artifact_searchable_package(
     chandra_geometry_policy: str | None = None,
     chandra_blend_primary_y_weight: float | None = None,
     geometry_debug_log: bool = False,
+    reconciliation_root: Path | None = None,
 ) -> list[ArtifactSearchableResult]:
     resolved_compare = Path(compare_dir)
     resolved_pdf_root = Path(pdf_root)
@@ -2969,6 +3354,14 @@ def run_artifact_searchable_package(
                     "TXT artifact has no explicit page markers. "
                     "Expected '[SOURCE PAGE N]' blocks or form-feed separators."
                 )
+            expected_textless_pages = _validated_all_textless_graphics_pages(
+                reconciliation_root=reconciliation_root,
+                compare_dir=resolved_compare,
+                artifact_path=artifact_path,
+                artifact_text=text,
+                document=document,
+                source_pdf=source_pdf_for_build,
+            )
             surya_geometry_by_page = None
             fallback_geometry_by_page = None
             if engine == "surya":
@@ -3001,6 +3394,12 @@ def run_artifact_searchable_package(
                         geometry_types=("chandra_text_lines",),
                         warnings=result_warnings,
                     )
+            if expected_textless_pages:
+                # Marker-only verified graphics need no overlay. Keeping geometry
+                # disabled makes the builder clone each source page byte-structure
+                # without normalizing /Rotate or merging an empty content stream.
+                surya_geometry_by_page = None
+                fallback_geometry_by_page = None
             geometry_debug_rows: list[dict[str, object]] | None = [] if (debug_enabled and engine == "chandra") else None
             out_pdf = resolved_output / document / f"{document}__{engine}_searchable.pdf"
             candidate_pdf = out_pdf.with_name(
@@ -3019,10 +3418,21 @@ def run_artifact_searchable_package(
                 warnings=result_warnings,
             )
             extracted = _extract_pdf_text(candidate_pdf)
+            if expected_textless_pages:
+                _validate_textless_visual_retention(
+                    source_pdf=source_pdf_for_build,
+                    candidate_pdf=candidate_pdf,
+                    expected_pages=expected_textless_pages,
+                )
             _validate_searchable_text_retention(
                 source_text=text,
                 extracted_text=extracted,
+                expect_empty_text_layer=bool(expected_textless_pages),
             )
+            if expected_textless_pages:
+                result_warnings.append(
+                    "empty text layer accepted from verified all-textless graphics evidence"
+                )
 
             geometry_log_path: Path | None = None
             if geometry_debug_rows or (debug_enabled and result_warnings):

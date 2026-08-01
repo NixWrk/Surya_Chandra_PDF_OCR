@@ -44,6 +44,7 @@ from uniscan.ocr.artifact_searchable import (
     _split_text_to_pages_by_token_weights,
     _split_text_to_pages,
     _validate_searchable_text_retention,
+    _validated_all_textless_graphics_pages,
     build_compare_txt_from_benchmark,
     run_artifact_searchable_package,
 )
@@ -57,6 +58,126 @@ def _build_sample_pdf(tmp_path: Path, name: str, page_values: list[int]) -> Path
     pdf_path = tmp_path / f"{name}.pdf"
     export_pages_as_pdf(pages, out_pdf=pdf_path, dpi=120)
     return pdf_path
+
+
+def _write_textless_graphics_fixture(
+    tmp_path: Path,
+    *,
+    page_values: list[int] | None = None,
+    marker_pages: list[int] | None = None,
+) -> SimpleNamespace:
+    values = page_values or [50]
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source_pdf = _build_sample_pdf(source_root, "document", values).resolve()
+    pages = marker_pages or list(range(1, len(values) + 1))
+    run_root = tmp_path / "run"
+    compare_dir = run_root / "_compare_txt"
+    compare_dir.mkdir(parents=True)
+    artifact_text = "".join(f"[SOURCE PAGE {page:04d}]\n" for page in pages)
+    artifact_path = compare_dir / "document__chandra.txt"
+    artifact_path.write_text(artifact_text, encoding="utf-8")
+    (compare_dir / "document__surya.txt").write_text(artifact_text, encoding="utf-8")
+
+    for engine in ("surya", "chandra"):
+        engine_dir = run_root / engine / engine
+        engine_dir.mkdir(parents=True)
+        engine_rows: list[dict[str, object]] = []
+        for page in pages:
+            page_text = engine_dir / f"page_{page:04d}.txt"
+            page_text.write_bytes(b"")
+            geometry = engine_dir / f"page_{page:04d}.{engine}.json"
+            image: dict[str, object] = {
+                "image_name": f"page_{page:04d}.png",
+                "ocr_outcome": "textless_graphics",
+                "pages": [
+                    {
+                        "image_bbox": [0.0, 0.0, 300.0, 200.0],
+                        "text_lines": [],
+                        "ocr_outcome": "textless_graphics",
+                    }
+                ],
+            }
+            if engine == "chandra":
+                image.update(
+                    {
+                        "explicit_nontext": True,
+                        "chandra_non_text_labels": ["image"],
+                    }
+                )
+            geometry.write_text(json.dumps({"images": [image]}), encoding="utf-8")
+            row: dict[str, object] = {
+                "source_page": page,
+                "file": page_text.name,
+                "text_chars": 0,
+                "ocr_outcome": "textless_graphics",
+                "alnum_line_count": 0,
+                "alnum_chars": 0,
+                "page_errors": [],
+                "geometry_file": geometry.name,
+                "textless_graphics": True,
+                "accepted_by": "mode_both_page_reconciliation",
+            }
+            if engine == "chandra":
+                row["explicit_nontext"] = True
+            engine_rows.append(row)
+        (engine_dir / "all_pages.txt").write_text(artifact_text, encoding="utf-8")
+        (engine_dir / "pages.json").write_text(
+            json.dumps(
+                {
+                    "pdf_path": str(source_pdf),
+                    "engine": engine,
+                    "pages": engine_rows,
+                    "total_text_chars": 0,
+                    "aggregate_file": "all_pages.txt",
+                    "aggregate_has_page_markers": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    reconciliation_rows = [
+        {
+            "source_page": page,
+            "surya_outcome": "zero_output",
+            "chandra_outcome": "explicit_nontext",
+            "surya_alnum_line_count": 0,
+            "surya_alnum_chars": 0,
+            "surya_page_error_count": 1,
+            "chandra_page_error_count": 1,
+            "accepted": True,
+            "reason": "explicit_chandra_nontext_with_quiet_surya",
+        }
+        for page in pages
+    ]
+    reconciliation_path = run_root / "page_reconciliation.json"
+    reconciliation_path.write_text(
+        json.dumps(
+            {
+                "schema": "uniscan.page-reconciliation.v1",
+                "status": "ok",
+                "exact_page_bijection": True,
+                "accepted_textless_graphics_pages": pages,
+                "unresolved_pages": [],
+                "pages": reconciliation_rows,
+                "reconciled_page_error_counts": {
+                    "surya": len(pages),
+                    "chandra": len(pages),
+                },
+                "result_text_chars": {"surya": 0, "chandra": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return SimpleNamespace(
+        source_pdf=source_pdf,
+        source_root=source_root,
+        run_root=run_root,
+        compare_dir=compare_dir,
+        artifact_path=artifact_path,
+        artifact_text=artifact_text,
+        reconciliation_path=reconciliation_path,
+    )
 
 
 def _rotate_pdf_90(source_pdf: Path, out_pdf: Path) -> Path:
@@ -78,6 +199,245 @@ def test_validate_searchable_text_retention_rejects_catastrophic_loss() -> None:
     _validate_searchable_text_retention(source_text=source, extracted_text="searchable content " * 15)
     with pytest.raises(RuntimeError, match="retained too little searchable text"):
         _validate_searchable_text_retention(source_text=source, extracted_text="tiny")
+
+
+def test_validate_searchable_text_retention_requires_verified_empty_contract() -> None:
+    source = "[SOURCE PAGE 0001]\n"
+
+    with pytest.raises(RuntimeError, match="empty extracted text layer"):
+        _validate_searchable_text_retention(source_text=source, extracted_text="")
+    _validate_searchable_text_retention(
+        source_text=source,
+        extracted_text="",
+        expect_empty_text_layer=True,
+    )
+    with pytest.raises(RuntimeError, match="gained an unexpected text layer"):
+        _validate_searchable_text_retention(
+            source_text=source,
+            extracted_text="hallucinated placeholder",
+            expect_empty_text_layer=True,
+        )
+
+
+def test_artifact_package_accepts_verified_image_only_pdf_without_placeholder_text(
+    tmp_path: Path,
+) -> None:
+    fixture = _write_textless_graphics_fixture(tmp_path)
+    evidence_pages = _validated_all_textless_graphics_pages(
+        reconciliation_root=fixture.run_root,
+        compare_dir=fixture.compare_dir,
+        artifact_path=fixture.artifact_path,
+        artifact_text=fixture.artifact_text,
+        document="document",
+        source_pdf=fixture.source_pdf,
+    )
+    assert evidence_pages == frozenset({1})
+
+    results = run_artifact_searchable_package(
+        compare_dir=fixture.compare_dir,
+        pdf_root=fixture.source_root,
+        output_dir=tmp_path / "output",
+        engines=("chandra",),
+        require_page_markers=True,
+        reconciliation_root=fixture.run_root,
+    )
+
+    assert len(results) == 1
+    assert results[0].status == "ok"
+    assert results[0].text_chars == len(fixture.artifact_text)
+    assert "verified all-textless graphics evidence" in " ".join(results[0].warnings)
+    output_pdf = Path(str(results[0].searchable_pdf_path))
+    assert output_pdf.is_file()
+
+    import fitz  # type: ignore
+
+    with fitz.open(str(fixture.source_pdf)) as source, fitz.open(str(output_pdf)) as output:
+        assert source.page_count == output.page_count == 1
+        assert source[0].rect == output[0].rect
+        assert source[0].rotation == output[0].rotation
+        assert output[0].get_text("text") == ""
+        matrix = fitz.Matrix(1.0, 1.0)
+        assert source[0].get_pixmap(matrix=matrix, alpha=False).samples == output[0].get_pixmap(
+            matrix=matrix,
+            alpha=False,
+        ).samples
+
+
+def test_artifact_package_still_rejects_marker_only_pdf_without_evidence(tmp_path: Path) -> None:
+    fixture = _write_textless_graphics_fixture(tmp_path)
+
+    results = run_artifact_searchable_package(
+        compare_dir=fixture.compare_dir,
+        pdf_root=fixture.source_root,
+        output_dir=tmp_path / "output",
+        engines=("chandra",),
+        require_page_markers=True,
+    )
+
+    assert results[0].status == "error"
+    assert "empty extracted text layer" in str(results[0].error)
+
+
+@pytest.mark.parametrize(
+    "tampering",
+    ("duplicate_markers", "out_of_range", "unexpected_text", "engine_row"),
+)
+def test_artifact_package_rejects_tampered_all_textless_evidence(
+    tmp_path: Path,
+    tampering: str,
+) -> None:
+    fixture = _write_textless_graphics_fixture(tmp_path)
+    if tampering in {"duplicate_markers", "out_of_range", "unexpected_text"}:
+        if tampering == "duplicate_markers":
+            artifact_text = "[SOURCE PAGE 0001]\n[SOURCE PAGE 0001]\n"
+        elif tampering == "out_of_range":
+            artifact_text = "[SOURCE PAGE 0002]\n"
+        else:
+            artifact_text = "[SOURCE PAGE 0001]\nhallucinated placeholder\n"
+        fixture.artifact_path.write_text(artifact_text, encoding="utf-8")
+        for engine in ("surya", "chandra"):
+            (fixture.run_root / engine / engine / "all_pages.txt").write_text(
+                artifact_text,
+                encoding="utf-8",
+            )
+    else:
+        pages_path = fixture.run_root / "chandra" / "chandra" / "pages.json"
+        payload = json.loads(pages_path.read_text(encoding="utf-8"))
+        payload["pages"][0]["accepted_by"] = "forged"
+        pages_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    results = run_artifact_searchable_package(
+        compare_dir=fixture.compare_dir,
+        pdf_root=fixture.source_root,
+        output_dir=tmp_path / "output",
+        engines=("chandra",),
+        require_page_markers=True,
+        reconciliation_root=fixture.run_root,
+    )
+
+    assert results[0].status == "error"
+    assert "all-textless graphics evidence is invalid" in str(results[0].error)
+
+
+@pytest.mark.parametrize("other_document", ("aaa", "zzz"))
+def test_all_textless_evidence_does_not_authorize_a_second_document(
+    tmp_path: Path,
+    other_document: str,
+) -> None:
+    fixture = _write_textless_graphics_fixture(tmp_path)
+    _build_sample_pdf(fixture.source_root, other_document, [90])
+    (fixture.compare_dir / f"{other_document}__chandra.txt").write_text(
+        "[SOURCE PAGE 0001]\n",
+        encoding="utf-8",
+    )
+
+    results = run_artifact_searchable_package(
+        compare_dir=fixture.compare_dir,
+        pdf_root=fixture.source_root,
+        output_dir=tmp_path / "output",
+        engines=("chandra",),
+        require_page_markers=True,
+        reconciliation_root=fixture.run_root,
+    )
+
+    result_by_document = {result.document: result for result in results}
+    assert result_by_document["document"].status == "ok"
+    assert result_by_document[other_document].status == "error"
+    assert "empty extracted text layer" in str(result_by_document[other_document].error)
+
+
+def test_all_textless_output_preserves_source_rotation(tmp_path: Path) -> None:
+    fixture = _write_textless_graphics_fixture(tmp_path)
+    rotated = _rotate_pdf_90(fixture.source_pdf, tmp_path / "rotated.pdf")
+    os.replace(rotated, fixture.source_pdf)
+
+    results = run_artifact_searchable_package(
+        compare_dir=fixture.compare_dir,
+        pdf_root=fixture.source_root,
+        output_dir=tmp_path / "output",
+        engines=("chandra",),
+        require_page_markers=True,
+        reconciliation_root=fixture.run_root,
+    )
+
+    assert results[0].status == "ok"
+    import fitz  # type: ignore
+
+    with fitz.open(str(fixture.source_pdf)) as source, fitz.open(
+        str(results[0].searchable_pdf_path)
+    ) as output:
+        assert source[0].rotation == output[0].rotation == 90
+        assert source[0].rect == output[0].rect
+        assert output[0].get_text("text") == ""
+
+
+def test_all_textless_output_rejects_a_visually_blank_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _write_textless_graphics_fixture(tmp_path)
+
+    def build_blank_candidate(*, source_pdf: Path, text: str, out_pdf: Path, **_kwargs) -> tuple[int, int]:
+        import fitz  # type: ignore
+
+        with fitz.open(str(source_pdf)) as source:
+            rect = source[0].rect
+        blank = fitz.open()
+        try:
+            blank.new_page(width=rect.width, height=rect.height)
+            out_pdf.parent.mkdir(parents=True, exist_ok=True)
+            blank.save(str(out_pdf))
+        finally:
+            blank.close()
+        return 1, len(text)
+
+    monkeypatch.setattr(
+        "uniscan.ocr.artifact_searchable._build_searchable_pdf_from_text",
+        build_blank_candidate,
+    )
+    results = run_artifact_searchable_package(
+        compare_dir=fixture.compare_dir,
+        pdf_root=fixture.source_root,
+        output_dir=tmp_path / "output",
+        engines=("chandra",),
+        require_page_markers=True,
+        reconciliation_root=fixture.run_root,
+    )
+
+    assert results[0].status == "error"
+    assert "render changed" in str(results[0].error)
+
+
+def test_mixed_marker_document_uses_normal_retention_and_keeps_empty_page_zero_text(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    _build_sample_pdf(source_root, "mixed", [70, 110])
+    run_root = tmp_path / "run"
+    compare_dir = run_root / "_compare_txt"
+    compare_dir.mkdir(parents=True)
+    (compare_dir / "mixed__chandra.txt").write_text(
+        "[SOURCE PAGE 0001]\n[SOURCE PAGE 0002]\nSEARCHABLE TEXT\n",
+        encoding="utf-8",
+    )
+
+    results = run_artifact_searchable_package(
+        compare_dir=compare_dir,
+        pdf_root=source_root,
+        output_dir=tmp_path / "output",
+        engines=("chandra",),
+        require_page_markers=True,
+        reconciliation_root=run_root,
+    )
+
+    assert results[0].status == "ok"
+    import fitz  # type: ignore
+
+    with fitz.open(str(results[0].searchable_pdf_path)) as output:
+        assert output.page_count == 2
+        assert output[0].get_text("text") == ""
+        assert "SEARCHABLE TEXT" in output[1].get_text("text")
 
 
 def test_build_searchable_pdf_write_is_atomic(tmp_path: Path, monkeypatch) -> None:

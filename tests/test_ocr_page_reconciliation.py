@@ -1656,7 +1656,7 @@ def test_strict_app_path_rejects_reconciliation_failure() -> None:
 
 def test_hybrid_cache_identity_includes_retry_and_reconciliation_revision() -> None:
     config = ocr_pipeline._hybrid_runtime_config()
-    assert ocr_pipeline._HYBRID_CHUNK_PIPELINE_REVISION == "chandra-surya-resumable-v5"
+    assert ocr_pipeline._HYBRID_CHUNK_PIPELINE_REVISION == "chandra-surya-resumable-v6"
     assert ocr_pipeline._HYBRID_CHUNK_MANIFEST_SCHEMA == "uniscan.hybrid-chunks.v4"
     assert config["zero_output_retry_policy"] == (
         "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"

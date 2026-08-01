@@ -1186,6 +1186,7 @@ def test_build_searchable_pdf_overwrites_input_path(monkeypatch) -> None:
     def fake_run_artifact_searchable_package(**kwargs):
         assert kwargs["engines"] == ("chandra",)
         assert kwargs["pdf_root"] == seen["textless_pdf"].parent
+        assert kwargs["reconciliation_root"] == run_dir
         expected_geometry = str((run_dir / "surya").resolve())
         assert os.environ.get("UNISCAN_CHANDRA_GEOMETRY_DIR") == expected_geometry
         return [_ok_artifact_result(produced_pdf, engine="chandra")]
@@ -1278,6 +1279,7 @@ def test_build_searchable_pdf_from_bytes_returns_bytes(monkeypatch) -> None:
     def fake_run_artifact_searchable_package(**kwargs):
         assert kwargs["engines"] == ("chandra",)
         assert kwargs["pdf_root"] == seen_textless_path["value"].parent
+        assert kwargs["reconciliation_root"] == tmp_path / "inline_run"
         assert os.environ.get("UNISCAN_CHANDRA_GEOMETRY_DIR") == str(
             tmp_path / "inline_run" / "surya"
         )
@@ -1345,6 +1347,7 @@ def test_build_searchable_pdf_uses_textless_source_when_delete_enabled(monkeypat
     def fake_run_artifact_searchable_package(**kwargs):
         assert kwargs["engines"] == ("chandra",)
         assert kwargs["pdf_root"] == seen["textless_pdf"].parent
+        assert kwargs["reconciliation_root"] == run_dir
         assert seen["textless_pdf"].exists()
         assert os.environ.get("UNISCAN_CHANDRA_GEOMETRY_DIR") == str(run_dir / "surya")
         return [_ok_artifact_result(produced_pdf, engine="chandra")]
