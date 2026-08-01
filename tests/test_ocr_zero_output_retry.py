@@ -430,6 +430,23 @@ def test_surya_zero_output_retry_succeeds_once(tmp_path: Path, monkeypatch) -> N
     assert page_errors == []
     assert page_metadata[0]["attempt_count"] == 2
     assert page_metadata[0]["retry_preprocessing"] == "autocontrast-cutoff-1"
+    retry_attempt = page_metadata[0]["attempt_history"][1]
+    retry_sidecar_path = Path(retry_attempt["sidecar_path"])
+    retry_sidecar = json.loads(retry_sidecar_path.read_text(encoding="utf-8"))
+    retry_image = retry_sidecar["images"][0]
+    assert retry_image["ocr_outcome"] == "text"
+    assert retry_image["attempt_count"] == 2
+    assert retry_image["retry_preprocessing"] == "autocontrast-cutoff-1"
+    assert (
+        hashlib.sha256(retry_sidecar_path.read_bytes()).hexdigest()
+        == (retry_attempt["sidecar_sha256"])
+    )
+    raw_initial = json.loads(
+        (tmp_path / "work" / "batch" / "surya_page_lines.json").read_text(encoding="utf-8")
+    )["images"][0]
+    assert "ocr_outcome" not in raw_initial
+    assert "attempt_count" not in raw_initial
+    assert "retry_preprocessing" not in raw_initial
 
 
 def test_surya_third_retry_scales_content_and_recovers(
@@ -515,6 +532,16 @@ def test_surya_third_retry_scales_content_and_recovers(
     assert durable["geometry_transform"] == "inverse-actual-content-size-strict-v1"
     assert durable["pages"][0]["text_lines"][0]["bbox"] == [10.0, 10.0, 50.0, 30.0]
     raw_attempt = json.loads(Path(attempts[2]["sidecar_path"]).read_text(encoding="utf-8"))
+    second_attempt = json.loads(Path(attempts[1]["sidecar_path"]).read_text(encoding="utf-8"))[
+        "images"
+    ][0]
+    assert second_attempt["ocr_outcome"] == "zero_output"
+    assert second_attempt["attempt_count"] == 2
+    assert second_attempt["retry_preprocessing"] == "autocontrast-cutoff-1"
+    raw_attempt_image = raw_attempt["images"][0]
+    assert raw_attempt_image["ocr_outcome"] == "text"
+    assert raw_attempt_image["attempt_count"] == 3
+    assert raw_attempt_image["retry_preprocessing"] == ("rgb-scale-0.5-center-white-lanczos-v1")
     assert raw_attempt["images"][0]["pages"][0]["text_lines"][0]["bbox"] == [
         35,
         25,
@@ -650,6 +677,22 @@ def test_surya_zero_output_retry_failure_is_durable_for_reconciliation(
     assert [item["source_page"] for item in page_errors] == [1]
     assert page_metadata[0]["ocr_outcome"] == "zero_output"
     assert page_metadata[0]["attempt_count"] == 3
+    attempts = page_metadata[0]["attempt_history"]
+    for attempt, expected_count, expected_preprocessing in zip(
+        attempts[1:],
+        (2, 3),
+        (
+            "autocontrast-cutoff-1",
+            "rgb-scale-0.5-center-white-lanczos-v1",
+        ),
+        strict=True,
+    ):
+        sidecar_path = Path(attempt["sidecar_path"])
+        image = json.loads(sidecar_path.read_text(encoding="utf-8"))["images"][0]
+        assert image["ocr_outcome"] == "zero_output"
+        assert image["attempt_count"] == expected_count
+        assert image["retry_preprocessing"] == expected_preprocessing
+        assert hashlib.sha256(sidecar_path.read_bytes()).hexdigest() == (attempt["sidecar_sha256"])
 
 
 def test_surya_retry_exception_propagates_without_another_attempt(
@@ -969,6 +1012,19 @@ def test_surya_malformed_second_zero_output_never_reaches_third_attempt(
     with pytest.raises(RuntimeError, match=expected_error):
         _run_surya_pagewise(tmp_path, defer_empty_pages=True)
     assert retry_calls == 1
+    raw_sidecar = (
+        tmp_path
+        / "work"
+        / "zero_output_retry"
+        / "page_0001"
+        / "attempt_2_autocontrast"
+        / "module"
+        / "surya_page_lines.json"
+    )
+    raw_image = json.loads(raw_sidecar.read_text(encoding="utf-8"))["images"][0]
+    assert "ocr_outcome" not in raw_image
+    assert "attempt_count" not in raw_image
+    assert "retry_preprocessing" not in raw_image
 
 
 @pytest.mark.parametrize(

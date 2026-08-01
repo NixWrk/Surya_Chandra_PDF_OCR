@@ -1989,6 +1989,64 @@ def _collect_surya_batch_outputs(
     return page_texts, total_chars, page_errors, page_metadata
 
 
+def _persist_validated_surya_attempt_metadata(
+    *,
+    sidecar_path: Path,
+    image_path: Path,
+    page_metadata: Sequence[dict[str, Any]],
+    source_page: int,
+    attempt: int,
+    preprocessing: str,
+) -> None:
+    expected_preprocessing = {
+        2: _ZERO_OUTPUT_RETRY_PREPROCESSING,
+        3: _ZERO_OUTPUT_SCALED_RETRY_PREPROCESSING,
+    }.get(attempt)
+    if expected_preprocessing is None or preprocessing != expected_preprocessing:
+        raise RuntimeError("Surya retry attempt metadata request is invalid.")
+    rows = [item for item in page_metadata if item.get("source_page") == source_page]
+    if len(rows) != 1:
+        raise RuntimeError("Cannot persist Surya retry metadata without exact page evidence.")
+    row = rows[0]
+    outcome = row.get("ocr_outcome")
+    if outcome not in {
+        _OCR_OUTCOME_ZERO,
+        _OCR_OUTCOME_TEXT,
+        _OCR_OUTCOME_VERIFIED_BLANK,
+    }:
+        raise RuntimeError("Cannot persist invalid Surya retry outcome.")
+    if (
+        row.get("attempt_count") != attempt
+        or isinstance(row.get("attempt_count"), bool)
+        or row.get("retry_preprocessing") != preprocessing
+    ):
+        raise RuntimeError("Surya retry metadata disagrees with its validated attempt.")
+    normalized_sidecar_raw = row.get("surya_page_lines_path")
+    if not isinstance(normalized_sidecar_raw, str):
+        raise RuntimeError("Validated Surya retry metadata has no normalized sidecar.")
+    normalized_sidecar = Path(normalized_sidecar_raw)
+    try:
+        payload = json.loads(normalized_sidecar.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Cannot read normalized Surya retry metadata: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Normalized Surya retry metadata is not an object.")
+    images = _strict_surya_batch_images(
+        images=payload.get("images"),
+        image_paths=[image_path],
+    )
+    image = images[0]
+    if (
+        payload.get("execution_path") not in _SURYA_MODULE_EXECUTION_PATHS
+        or image.get("ocr_outcome") != outcome
+        or image.get("attempt_count") != attempt
+        or isinstance(image.get("attempt_count"), bool)
+        or image.get("retry_preprocessing") != preprocessing
+    ):
+        raise RuntimeError("Normalized Surya retry metadata is inconsistent.")
+    _write_json_atomic(sidecar_path, payload)
+
+
 def _run_extraction_engine_pagewise(
     engine: str,
     image_paths: Sequence[Path],
@@ -2138,6 +2196,14 @@ def _run_extraction_engine_pagewise(
                 raise RuntimeError(
                     "Invalid second zero-output evidence: retry output is missing or malformed."
                 )
+            _persist_validated_surya_attempt_metadata(
+                sidecar_path=retry_sidecar,
+                image_path=retry_image,
+                page_metadata=retry_metadata,
+                source_page=source_page,
+                attempt=2,
+                preprocessing=_ZERO_OUTPUT_RETRY_PREPROCESSING,
+            )
             attempt_history.append(
                 _attempt_history_record(
                     attempt=2,
@@ -2252,6 +2318,14 @@ def _run_extraction_engine_pagewise(
                     scaled_texts = raw_scaled_texts
                     scaled_errors = raw_scaled_errors
                     scaled_metadata = raw_scaled_metadata
+                _persist_validated_surya_attempt_metadata(
+                    sidecar_path=scaled_sidecar,
+                    image_path=scaled_image,
+                    page_metadata=raw_scaled_metadata,
+                    source_page=source_page,
+                    attempt=3,
+                    preprocessing=_ZERO_OUTPUT_SCALED_RETRY_PREPROCESSING,
+                )
                 attempt_history.append(
                     _attempt_history_record(
                         attempt=3,

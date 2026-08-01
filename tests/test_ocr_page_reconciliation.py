@@ -35,6 +35,7 @@ def _build_reconciliation_run(
     *,
     surya_rows: list[dict[str, Any]],
     chandra_rows: list[dict[str, Any]],
+    retry_leaf_metadata: bool = False,
 ) -> tuple[Path, list[OcrBenchmarkResult], list[Path]]:
     run_dir = tmp_path / "run"
     results: list[OcrBenchmarkResult] = []
@@ -79,25 +80,32 @@ def _build_reconciliation_run(
                     attempt_text = text if attempt == 3 else ""
                     attempt_bbox = [30, 30, 50, 40]
                     sidecar_path = attempt_dir / "surya_page_lines.json"
+                    attempt_image: dict[str, Any] = {
+                        "image_name": image_path.name,
+                        "pages": [
+                            {
+                                "image_bbox": [0, 0, 100, 100],
+                                "text_lines": (
+                                    [{"text": attempt_text, "bbox": attempt_bbox}]
+                                    if attempt_text
+                                    else []
+                                ),
+                            }
+                        ],
+                    }
+                    if retry_leaf_metadata:
+                        attempt_image.update(
+                            {
+                                "ocr_outcome": item["ocr_outcome"],
+                                "attempt_count": attempt,
+                                "retry_preprocessing": item["preprocessing"],
+                            }
+                        )
                     sidecar_path.write_text(
                         json.dumps(
                             {
                                 "execution_path": "module",
-                                "images": [
-                                    {
-                                        "image_name": image_path.name,
-                                        "pages": [
-                                            {
-                                                "image_bbox": [0, 0, 100, 100],
-                                                "text_lines": (
-                                                    [{"text": attempt_text, "bbox": attempt_bbox}]
-                                                    if attempt_text
-                                                    else []
-                                                ),
-                                            }
-                                        ],
-                                    }
-                                ],
+                                "images": [attempt_image],
                             }
                         ),
                         encoding="utf-8",
@@ -391,8 +399,10 @@ def test_reconcile_knh_accepts_trivial_surya_without_substituting_its_text(
     assert reconciliation["accepted_textless_graphics_pages"] == [1]
 
 
+@pytest.mark.parametrize("retry_leaf_metadata", [False, True])
 def test_reconcile_74_accepts_explicit_graphics_with_third_zero_surya(
     tmp_path: Path,
+    retry_leaf_metadata: bool,
 ) -> None:
     run_dir, results, result_files = _build_reconciliation_run(
         tmp_path,
@@ -406,6 +416,7 @@ def test_reconcile_74_accepts_explicit_graphics_with_third_zero_surya(
             }
         ],
         chandra_rows=[_explicit_graphics_page(1)],
+        retry_leaf_metadata=retry_leaf_metadata,
     )
 
     adjusted, error = ocr_pipeline._reconcile_mode_both_pages(
@@ -432,6 +443,9 @@ def test_reconcile_74_accepts_explicit_graphics_with_third_zero_surya(
         "third-image-pixels",
         "selected-sidecar-text",
         "zero-transform-marker",
+        "leaf-outcome",
+        "leaf-count",
+        "leaf-preprocessing",
     ],
 )
 def test_reconcile_rejects_tampered_third_zero_lineage(
@@ -484,10 +498,23 @@ def test_reconcile_rejects_tampered_third_zero_lineage(
             history[2]["image_bytes"] = third_image.stat().st_size
     elif defect == "selected-sidecar-text":
         selected_image["pages"][0]["text_lines"] = [{"text": "FORGED", "bbox": [10, 10, 50, 30]}]
-    else:
+    elif defect == "zero-transform-marker":
         for payload in (row, selected_image):
             payload["geometry_coordinate_space"] = "source-image-v1"
             payload["geometry_transform"] = "inverse-actual-content-size-strict-v1"
+    else:
+        payload = json.loads(third_sidecar.read_text(encoding="utf-8"))
+        leaf_image = payload["images"][0]
+        field, value = {
+            "leaf-outcome": ("ocr_outcome", "text"),
+            "leaf-count": ("attempt_count", 2),
+            "leaf-preprocessing": ("retry_preprocessing", "forged"),
+        }[defect]
+        leaf_image[field] = value
+        third_sidecar.write_text(json.dumps(payload), encoding="utf-8")
+        for history in histories:
+            history[2]["sidecar_sha256"] = _sha256(third_sidecar)
+            history[2]["sidecar_bytes"] = third_sidecar.stat().st_size
 
     pages_path.write_text(json.dumps(pages_payload), encoding="utf-8")
     selected_path.write_text(json.dumps(selected_payload), encoding="utf-8")
@@ -574,10 +601,12 @@ def test_reconcile_rejects_chandra_text_with_surya_zero(tmp_path: Path) -> None:
         ("Cafe\u0301", "CAFÉ"),
     ],
 )
+@pytest.mark.parametrize("retry_leaf_metadata", [False, True])
 def test_reconcile_accepts_third_retry_only_with_normalized_exact_agreement(
     tmp_path: Path,
     surya_text: str,
     chandra_text: str,
+    retry_leaf_metadata: bool,
 ) -> None:
     run_dir, results, result_files = _build_reconciliation_run(
         tmp_path,
@@ -592,6 +621,7 @@ def test_reconcile_accepts_third_retry_only_with_normalized_exact_agreement(
             }
         ],
         chandra_rows=[{"source_page": 1, "text": chandra_text, "ocr_outcome": "text"}],
+        retry_leaf_metadata=retry_leaf_metadata,
     )
 
     adjusted, error = ocr_pipeline._reconcile_mode_both_pages(
@@ -1656,7 +1686,7 @@ def test_strict_app_path_rejects_reconciliation_failure() -> None:
 
 def test_hybrid_cache_identity_includes_retry_and_reconciliation_revision() -> None:
     config = ocr_pipeline._hybrid_runtime_config()
-    assert ocr_pipeline._HYBRID_CHUNK_PIPELINE_REVISION == "chandra-surya-resumable-v6"
+    assert ocr_pipeline._HYBRID_CHUNK_PIPELINE_REVISION == "chandra-surya-resumable-v7"
     assert ocr_pipeline._HYBRID_CHUNK_MANIFEST_SCHEMA == "uniscan.hybrid-chunks.v4"
     assert config["zero_output_retry_policy"] == (
         "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
@@ -1664,6 +1694,32 @@ def test_hybrid_cache_identity_includes_retry_and_reconciliation_revision() -> N
     assert config["page_reconciliation_policy"] == (
         "explicit-chandra-nontext+quiet-surya+scaled-terminal-lineage-v5"
     )
+
+
+def test_hybrid_cache_identity_changes_from_v6(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"sealed source")
+    kwargs = {
+        "input_path": source,
+        "mode": "chandra+surya",
+        "lang": "rus+eng",
+        "strict": True,
+        "delete_original_text_layer": True,
+        "chunk_pages": 10,
+        "page_count": 1,
+    }
+    _, current_key = ocr_pipeline._hybrid_run_identity(**kwargs)
+    monkeypatch.setattr(
+        ocr_pipeline,
+        "_HYBRID_CHUNK_PIPELINE_REVISION",
+        "chandra-surya-resumable-v6",
+    )
+    _, v6_key = ocr_pipeline._hybrid_run_identity(**kwargs)
+
+    assert current_key != v6_key
 
 
 def test_hybrid_cache_identity_changes_from_legacy_v3(

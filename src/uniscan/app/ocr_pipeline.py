@@ -77,7 +77,7 @@ ProgressCallback = Callable[[int, str], None]
 _DEFAULT_HYBRID_CHUNK_PAGES = 10
 _HYBRID_CHUNK_MANIFEST_SCHEMA = "uniscan.hybrid-chunks.v4"
 _OCR_STATUS_RECONCILIATION_PENDING = "reconciliation_pending"
-_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v6"
+_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v7"
 _SURYA_RETRY_PREPROCESSING = "autocontrast-cutoff-1"
 _SURYA_SCALED_RETRY_PREPROCESSING = "rgb-scale-0.5-center-white-lanczos-v1"
 _SURYA_SCALED_RETRY_FACTOR = 0.5
@@ -1117,6 +1117,20 @@ def _strict_third_retry_provenance(
             or attempt_images[0].get("image_name") != image_path.name
         ):
             raise RuntimeError("Surya retry attempt sidecar identity is invalid")
+        attempt_image = attempt_images[0]
+        attempt_count_marker = attempt_image.get("attempt_count")
+        if (
+            ("ocr_outcome" in attempt_image and attempt_image.get("ocr_outcome") != outcome)
+            or (
+                "attempt_count" in attempt_image
+                and (attempt_count_marker != attempt or isinstance(attempt_count_marker, bool))
+            )
+            or (
+                "retry_preprocessing" in attempt_image
+                and attempt_image.get("retry_preprocessing") != preprocessing
+            )
+        ):
+            raise RuntimeError("Surya retry attempt sidecar metadata disagrees with history")
         attempt_pages = attempt_images[0].get("pages")
         if (
             not isinstance(attempt_pages, list)
