@@ -21,7 +21,7 @@ import unicodedata
 from typing import Any, Callable, Mapping, Sequence
 import uuid
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 from uniscan.ocr import (
     ArtifactSearchableResult,
@@ -75,12 +75,15 @@ _ENGINE_SUBPROCESS_ENV_SUFFIXES: tuple[str, ...] = (
 ProgressCallback = Callable[[int, str], None]
 
 _DEFAULT_HYBRID_CHUNK_PAGES = 10
-_HYBRID_CHUNK_MANIFEST_SCHEMA = "uniscan.hybrid-chunks.v3"
+_HYBRID_CHUNK_MANIFEST_SCHEMA = "uniscan.hybrid-chunks.v4"
 _OCR_STATUS_RECONCILIATION_PENDING = "reconciliation_pending"
-_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v3"
+_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v4"
 _SURYA_RETRY_PREPROCESSING = "autocontrast-cutoff-1"
-_SURYA_OTSU_RETRY_PREPROCESSING = "grayscale-autocontrast-otsu-v1"
-_SURYA_RETRY_POLICY = "original+autocontrast-cutoff-1+otsu-max3-v2"
+_SURYA_SCALED_RETRY_PREPROCESSING = "rgb-scale-0.5-center-white-lanczos-v1"
+_SURYA_SCALED_RETRY_FACTOR = 0.5
+_SURYA_SOURCE_COORDINATE_SPACE = "source-image-v1"
+_SURYA_SCALED_GEOMETRY_TRANSFORM = "inverse-actual-content-size-strict-v1"
+_SURYA_RETRY_POLICY = "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
 _RETRY_TEXT_AGREEMENT_ALGORITHM = "nfkc-casefold-unicode-alnum-exact-v1"
 _CHUNK_EVIDENCE_MANIFEST_SCHEMA = "uniscan.chunk-evidence.v1"
 _MAX_CHUNK_MANIFEST_BYTES = 16 * 1024 * 1024
@@ -750,6 +753,40 @@ class _SealedPageGeometry:
     canonical_text: str
 
 
+def _inverse_scaled_retry_geometry(
+    geometry: _SealedPageGeometry,
+    *,
+    source_size: Sequence[int],
+    content_size: Sequence[int],
+    content_offset: Sequence[int],
+) -> _SealedPageGeometry:
+    source_width, source_height = source_size
+    content_width, content_height = content_size
+    offset_x, offset_y = content_offset
+    content_x1 = offset_x + content_width
+    content_y1 = offset_y + content_height
+    lines: list[_SealedTextLine] = []
+    for line in geometry.lines:
+        x0, y0, x1, y1 = line.bbox
+        if x0 < offset_x or y0 < offset_y or x1 > content_x1 or y1 > content_y1:
+            raise RuntimeError("Surya third retry text bbox escapes scaled content")
+        bbox = (
+            (x0 - offset_x) * source_width / content_width,
+            (y0 - offset_y) * source_height / content_height,
+            (x1 - offset_x) * source_width / content_width,
+            (y1 - offset_y) * source_height / content_height,
+        )
+        if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+            raise RuntimeError("Surya inverse-transformed text bbox has no area")
+        lines.append(_SealedTextLine(text=line.text, bbox=bbox))
+    return _SealedPageGeometry(
+        image_name=geometry.image_name,
+        image_bbox=(0.0, 0.0, float(source_width), float(source_height)),
+        lines=tuple(lines),
+        canonical_text=geometry.canonical_text,
+    )
+
+
 def _sealed_page_geometry(
     *,
     image: dict[str, Any],
@@ -921,13 +958,20 @@ def _strict_third_retry_provenance(
         "retry_policy",
         "selected_attempt",
         "attempt_history",
+        "geometry_coordinate_space",
+        "geometry_transform",
     )
     if any(row.get(field) != image.get(field) for field in fields):
         raise RuntimeError("Surya retry provenance disagrees with its durable sidecar")
-    if row.get("retry_preprocessing") != _SURYA_OTSU_RETRY_PREPROCESSING:
+    if row.get("retry_preprocessing") != _SURYA_SCALED_RETRY_PREPROCESSING:
         raise RuntimeError("Surya third retry preprocessing marker is invalid")
     if row.get("retry_policy") != _SURYA_RETRY_POLICY:
         raise RuntimeError("Surya third retry policy marker is invalid")
+    if (
+        row.get("geometry_coordinate_space") != _SURYA_SOURCE_COORDINATE_SPACE
+        or row.get("geometry_transform") != _SURYA_SCALED_GEOMETRY_TRANSFORM
+    ):
+        raise RuntimeError("Surya selected retry coordinate transform is invalid")
     selected_attempt = row.get("selected_attempt")
     if selected_attempt != 3 or isinstance(selected_attempt, bool):
         raise RuntimeError("Surya selected retry attempt is invalid")
@@ -937,10 +981,11 @@ def _strict_third_retry_provenance(
     expected = (
         (1, "original", "zero_output"),
         (2, _SURYA_RETRY_PREPROCESSING, "zero_output"),
-        (3, _SURYA_OTSU_RETRY_PREPROCESSING, "text"),
+        (3, _SURYA_SCALED_RETRY_PREPROCESSING, "text"),
     )
     expected_image_size: list[int] | None = None
     attempt_three_geometry: _SealedPageGeometry | None = None
+    attempt_image_payloads: dict[int, bytes] = {}
     for item, (attempt, preprocessing, outcome) in zip(history, expected, strict=True):
         if not isinstance(item, dict):
             raise RuntimeError("Surya retry attempt history contains a non-object entry")
@@ -1036,8 +1081,9 @@ def _strict_third_retry_provenance(
             raise RuntimeError(f"Surya retry attempt image is unreadable: {exc}") from exc
         if actual_size != image_size:
             raise RuntimeError("Surya retry attempt image size disagrees with its artifact")
-        if actual_mode != ("L" if attempt == 3 else "RGB"):
+        if actual_mode != "RGB":
             raise RuntimeError("Surya retry attempt image mode is invalid")
+        attempt_image_payloads[attempt] = image_payload
         try:
             attempt_payload = json.loads(sidecar_payload.decode("utf-8"))
         except Exception as exc:
@@ -1097,15 +1143,56 @@ def _strict_third_retry_provenance(
                 reading_order=False,
                 require_text=True,
             )
-    threshold = history[2].get("otsu_threshold")
+    scaled_evidence = history[2]
+    content_scale = scaled_evidence.get("content_scale")
     if (
-        not isinstance(threshold, int)
-        or isinstance(threshold, bool)
-        or threshold < 0
-        or threshold > 255
+        not isinstance(content_scale, (int, float))
+        or isinstance(content_scale, bool)
+        or float(content_scale) != _SURYA_SCALED_RETRY_FACTOR
+        or expected_image_size is None
     ):
-        raise RuntimeError("Surya Otsu threshold is invalid")
-    assert expected_image_size is not None
+        raise RuntimeError("Surya scaled retry factor is invalid")
+    expected_content_size = [
+        max(1, round(expected_image_size[0] * _SURYA_SCALED_RETRY_FACTOR)),
+        max(1, round(expected_image_size[1] * _SURYA_SCALED_RETRY_FACTOR)),
+    ]
+    expected_content_offset = [
+        (expected_image_size[0] - expected_content_size[0]) // 2,
+        (expected_image_size[1] - expected_content_size[1]) // 2,
+    ]
+    if (
+        scaled_evidence.get("content_size") != expected_content_size
+        or scaled_evidence.get("content_offset") != expected_content_offset
+        or scaled_evidence.get("resampling") != "lanczos"
+        or scaled_evidence.get("canvas_fill_rgb") != [255, 255, 255]
+    ):
+        raise RuntimeError("Surya scaled retry preprocessing evidence is invalid")
+    try:
+        expected_size_tuple = (expected_image_size[0], expected_image_size[1])
+        expected_content_size_tuple = (expected_content_size[0], expected_content_size[1])
+        expected_content_offset_tuple = (
+            expected_content_offset[0],
+            expected_content_offset[1],
+        )
+        with Image.open(io.BytesIO(attempt_image_payloads[1])) as original_retry_image:
+            original_retry_image.load()
+            expected_content = original_retry_image.resize(
+                expected_content_size_tuple,
+                Image.Resampling.LANCZOS,
+            )
+            expected_scaled = Image.new(
+                "RGB",
+                expected_size_tuple,
+                (255, 255, 255),
+            )
+            expected_scaled.paste(expected_content, expected_content_offset_tuple)
+        with Image.open(io.BytesIO(attempt_image_payloads[3])) as actual_scaled_image:
+            actual_scaled_image.load()
+            actual_scaled = actual_scaled_image.convert("RGB")
+    except Exception as exc:
+        raise RuntimeError(f"Surya scaled retry pixel lineage is unreadable: {exc}") from exc
+    if ImageChops.difference(expected_scaled, actual_scaled).getbbox() is not None:
+        raise RuntimeError("Surya scaled retry pixels disagree with sealed attempt 1")
     pages = image.get("pages")
     if not isinstance(pages, list) or len(pages) != 1 or not isinstance(pages[0], dict):
         raise RuntimeError("Surya selected retry geometry page is invalid")
@@ -1120,9 +1207,17 @@ def _strict_third_retry_provenance(
         float(expected_image_size[1]),
     ):
         raise RuntimeError("Surya selected image bbox disagrees with durable retry image")
-    if attempt_three_geometry is None or selected_geometry != attempt_three_geometry:
-        raise RuntimeError("Surya selected geometry disagrees with third retry sidecar")
-    return attempt_three_geometry
+    if attempt_three_geometry is None:
+        raise RuntimeError("Surya third retry geometry is missing")
+    expected_selected_geometry = _inverse_scaled_retry_geometry(
+        attempt_three_geometry,
+        source_size=expected_image_size,
+        content_size=expected_content_size,
+        content_offset=expected_content_offset,
+    )
+    if selected_geometry != expected_selected_geometry:
+        raise RuntimeError("Surya selected geometry disagrees with inverse retry transform")
+    return selected_geometry
 
 
 def _strict_surya_attempt_metadata(
@@ -1180,8 +1275,8 @@ def _strict_surya_attempt_metadata(
                 raise RuntimeError(f"Surya page {source_page} second attempt provenance is invalid")
     else:
         if (
-            row_marker != _SURYA_OTSU_RETRY_PREPROCESSING
-            or sidecar_marker != _SURYA_OTSU_RETRY_PREPROCESSING
+            row_marker != _SURYA_SCALED_RETRY_PREPROCESSING
+            or sidecar_marker != _SURYA_SCALED_RETRY_PREPROCESSING
         ):
             raise RuntimeError(f"Surya page {source_page} third attempt marker is invalid")
         provenance_fields = ("retry_policy", "selected_attempt", "attempt_history")
@@ -1736,7 +1831,9 @@ def _hybrid_runtime_config() -> dict[str, object]:
         "effective_ocr_render_dpi": _resolve_ocr_render_dpi(),
         "effective_textless_dpi": _resolve_textless_dpi(),
         "zero_output_retry_policy": _SURYA_RETRY_POLICY,
-        "page_reconciliation_policy": "explicit-chandra-nontext+quiet-surya+otsu-text-agreement-v3",
+        "page_reconciliation_policy": (
+            "explicit-chandra-nontext+quiet-surya+scaled-text-agreement-v4"
+        ),
         "environment": {key: os.environ.get(key) for key in _HYBRID_IDENTITY_ENV_KEYS},
     }
 
@@ -2663,7 +2760,7 @@ def _required_chunk_evidence(
                     expected_marker = (
                         _SURYA_RETRY_PREPROCESSING
                         if attempt_count == 2
-                        else _SURYA_OTSU_RETRY_PREPROCESSING
+                        else _SURYA_SCALED_RETRY_PREPROCESSING
                     )
                     if (
                         raw_row.get("selected_attempt") != attempt_count

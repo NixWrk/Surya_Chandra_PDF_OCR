@@ -306,6 +306,7 @@ def _write_surya_retry_sidecar(
     retry_image = image_paths[0]
     with Image.open(retry_image) as image:
         assert image.size == (120, 80)
+    bbox = [35, 25, 55, 35] if "attempt_3_scaled" in retry_image.parts else [1, 2, 50, 20]
     sidecar = work_dir / "surya_page_lines.json"
     sidecar.parent.mkdir(parents=True, exist_ok=True)
     sidecar.write_text(
@@ -318,9 +319,7 @@ def _write_surya_retry_sidecar(
                         "pages": [
                             {
                                 "image_bbox": [0, 0, 120, 80],
-                                "text_lines": (
-                                    [{"text": text, "bbox": [1, 2, 50, 20]}] if text else []
-                                ),
+                                "text_lines": ([{"text": text, "bbox": bbox}] if text else []),
                             }
                         ],
                     }
@@ -433,7 +432,7 @@ def test_surya_zero_output_retry_succeeds_once(tmp_path: Path, monkeypatch) -> N
     assert page_metadata[0]["retry_preprocessing"] == "autocontrast-cutoff-1"
 
 
-def test_surya_third_retry_uses_binary_otsu_and_recovers(
+def test_surya_third_retry_scales_content_and_recovers(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -458,10 +457,9 @@ def test_surya_third_retry_uses_binary_otsu_and_recovers(
 
         with Image.open(image_paths[0]) as image:
             assert image.size == (120, 80)
-            assert image.mode == "L"
-            assert set(image.getdata()) == {0, 255}
-            assert image.getpixel((0, 0)) == 0
-            assert image.getpixel((40, 40)) == 255
+            assert image.mode == "RGB"
+            assert image.getpixel((0, 0)) == (255, 255, 255)
+            assert image.getpixel((60, 40)) == (120, 120, 120)
         _write_surya_retry_sidecar(
             image_paths=image_paths,
             work_dir=work_dir,
@@ -481,13 +479,12 @@ def test_surya_third_retry_uses_binary_otsu_and_recovers(
     assert (page_texts, chars) == (["SOLD OUT"], len("SOLD OUT"))
     assert page_errors == []
     assert page_metadata[0]["attempt_count"] == 3
-    assert page_metadata[0]["retry_preprocessing"] == "grayscale-autocontrast-otsu-v1"
-    assert autocontrast_calls == [
-        ("RGB", (120, 80), 1),
-        ("L", (120, 80), 1),
-    ]
+    assert page_metadata[0]["retry_preprocessing"] == ("rgb-scale-0.5-center-white-lanczos-v1")
+    assert autocontrast_calls == [("RGB", (120, 80), 1)]
     assert page_metadata[0]["selected_attempt"] == 3
-    assert page_metadata[0]["retry_policy"] == ("original+autocontrast-cutoff-1+otsu-max3-v2")
+    assert page_metadata[0]["retry_policy"] == (
+        "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+    )
     attempts = page_metadata[0]["attempt_history"]
     assert [item["attempt"] for item in attempts] == [1, 2, 3]
     assert [item["ocr_outcome"] for item in attempts] == [
@@ -498,10 +495,14 @@ def test_surya_third_retry_uses_binary_otsu_and_recovers(
     assert [item["preprocessing"] for item in attempts] == [
         "original",
         "autocontrast-cutoff-1",
-        "grayscale-autocontrast-otsu-v1",
+        "rgb-scale-0.5-center-white-lanczos-v1",
     ]
     assert attempts[2]["image_size"] == [120, 80]
-    assert attempts[2]["otsu_threshold"] == 0
+    assert attempts[2]["content_scale"] == 0.5
+    assert attempts[2]["content_size"] == [60, 40]
+    assert attempts[2]["content_offset"] == [30, 20]
+    assert attempts[2]["resampling"] == "lanczos"
+    assert attempts[2]["canvas_fill_rgb"] == [255, 255, 255]
     assert len(attempts[2]["image_sha256"]) == 64
     assert all(len(item["sidecar_sha256"]) == 64 for item in attempts)
     durable = json.loads(
@@ -510,6 +511,16 @@ def test_surya_third_retry_uses_binary_otsu_and_recovers(
     assert durable["attempt_history"] == attempts
     assert durable["selected_attempt"] == 3
     assert durable["retry_policy"] == page_metadata[0]["retry_policy"]
+    assert durable["geometry_coordinate_space"] == "source-image-v1"
+    assert durable["geometry_transform"] == "inverse-actual-content-size-strict-v1"
+    assert durable["pages"][0]["text_lines"][0]["bbox"] == [10.0, 10.0, 50.0, 30.0]
+    raw_attempt = json.loads(Path(attempts[2]["sidecar_path"]).read_text(encoding="utf-8"))
+    assert raw_attempt["images"][0]["pages"][0]["text_lines"][0]["bbox"] == [
+        35,
+        25,
+        55,
+        35,
+    ]
 
     output_dir = tmp_path / "output"
     benchmark._write_pagewise_text_artifacts(
@@ -524,6 +535,10 @@ def test_surya_third_retry_uses_binary_otsu_and_recovers(
     )
     pages_payload = json.loads((output_dir / "surya" / "pages.json").read_text(encoding="utf-8"))
     durable_history = pages_payload["pages"][0]["attempt_history"]
+    assert pages_payload["pages"][0]["geometry_coordinate_space"] == "source-image-v1"
+    assert pages_payload["pages"][0]["geometry_transform"] == (
+        "inverse-actual-content-size-strict-v1"
+    )
     assert [item["attempt"] for item in durable_history] == [1, 2, 3]
     for item in durable_history:
         image_path = Path(item["image_path"])
@@ -542,7 +557,72 @@ def test_surya_third_retry_uses_binary_otsu_and_recovers(
     persisted_image = persisted_geometry["images"][0]
     assert persisted_image["attempt_history"] == durable_history
     assert persisted_image["selected_attempt"] == 3
-    assert persisted_image["retry_policy"] == ("original+autocontrast-cutoff-1+otsu-max3-v2")
+    assert persisted_image["retry_policy"] == (
+        "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+    )
+    assert persisted_image["geometry_coordinate_space"] == "source-image-v1"
+    assert persisted_image["geometry_transform"] == "inverse-actual-content-size-strict-v1"
+    assert persisted_image["pages"][0]["text_lines"][0]["bbox"] == [10.0, 10.0, 50.0, 30.0]
+
+
+def test_scaled_retry_uses_exact_odd_content_size_and_asymmetric_borders(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    target = tmp_path / "scaled.png"
+    Image.new("RGB", (1301, 1313), (120, 120, 120)).save(source, format="PNG")
+
+    evidence = benchmark._write_scaled_retry_image(source=source, target=target)
+
+    assert evidence["image_size"] == [1301, 1313]
+    assert evidence["content_size"] == [650, 656]
+    assert evidence["content_offset"] == [325, 328]
+    with Image.open(target) as image:
+        assert image.mode == "RGB"
+        assert image.size == (1301, 1313)
+        assert image.getpixel((324, 500)) == (255, 255, 255)
+        assert image.getpixel((325, 500)) == (120, 120, 120)
+        assert image.getpixel((974, 500)) == (120, 120, 120)
+        assert image.getpixel((975, 500)) == (255, 255, 255)
+        assert image.getpixel((500, 327)) == (255, 255, 255)
+        assert image.getpixel((500, 328)) == (120, 120, 120)
+        assert image.getpixel((500, 983)) == (120, 120, 120)
+        assert image.getpixel((500, 984)) == (255, 255, 255)
+
+
+def test_inverse_scaled_retry_bbox_uses_actual_odd_axis_scales() -> None:
+    kwargs = {
+        "source_size": [1301, 1313],
+        "content_size": [650, 656],
+        "content_offset": [325, 328],
+        "label": "diagnostic bbox",
+    }
+    sold = benchmark._inverse_scaled_retry_bbox([351, 366, 938, 597], **kwargs)
+    out = benchmark._inverse_scaled_retry_bbox([468, 675, 867, 870], **kwargs)
+
+    assert sold == pytest.approx([52.04, 76.0579268292683, 1226.943076923077, 538.4100609756098])
+    assert out == pytest.approx([286.22, 694.5289634146342, 1084.833846153846, 1084.8262195121952])
+    assert benchmark._inverse_scaled_retry_bbox([325, 328, 975, 984], **kwargs) == pytest.approx(
+        [0.0, 0.0, 1301.0, 1313.0]
+    )
+
+
+@pytest.mark.parametrize(
+    "bbox",
+    (
+        [0, 0, 100, 100],
+        [300, 300, 400, 400],
+        [351, 366, 351, 597],
+        [351, 366, float("nan"), 597],
+    ),
+)
+def test_inverse_scaled_retry_bbox_rejects_unusable_geometry(bbox: list[float]) -> None:
+    with pytest.raises(RuntimeError):
+        benchmark._inverse_scaled_retry_bbox(
+            bbox,
+            source_size=[1301, 1313],
+            content_size=[650, 656],
+            content_offset=[325, 328],
+            label="bad bbox",
+        )
 
 
 def test_surya_zero_output_retry_failure_is_durable_for_reconciliation(
@@ -828,7 +908,7 @@ def test_surya_malformed_raw_initial_sidecar_never_starts_retry(
 
 
 @pytest.mark.parametrize("defect", _RAW_SIDECAR_DEFECTS)
-def test_surya_malformed_raw_second_sidecar_never_starts_otsu(
+def test_surya_malformed_raw_second_sidecar_never_starts_scaled_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     defect: str,
@@ -840,7 +920,7 @@ def test_surya_malformed_raw_second_sidecar_never_starts_otsu(
         nonlocal retry_calls
         retry_calls += 1
         if retry_calls > 1:
-            raise AssertionError("malformed raw attempt 2 must not start Otsu")
+            raise AssertionError("malformed raw attempt 2 must not start scaled retry")
         _write_malformed_raw_surya_sidecar(
             image_path=image_paths[0],
             work_dir=work_dir,
@@ -853,7 +933,7 @@ def test_surya_malformed_raw_second_sidecar_never_starts_otsu(
     with pytest.raises(RuntimeError, match="Surya sidecar"):
         _run_surya_pagewise(tmp_path, defer_empty_pages=True)
     assert retry_calls == 1
-    assert not (tmp_path / "work" / "zero_output_retry" / "page_0001" / "attempt_3_otsu").exists()
+    assert not (tmp_path / "work" / "zero_output_retry" / "page_0001" / "attempt_3_scaled").exists()
 
 
 @pytest.mark.parametrize(

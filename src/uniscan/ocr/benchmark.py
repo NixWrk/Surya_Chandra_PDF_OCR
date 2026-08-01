@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -53,8 +54,11 @@ _MAX_OCR_TEXT_ARTIFACT_BYTES = 64 * 1024 * 1024
 _CHANDRA_MODEL_REPO_ID = "datalab-to/chandra-ocr-2"
 _MODEL_CACHE_CHECK_MEMO: dict[str, str] = {}
 _ZERO_OUTPUT_RETRY_PREPROCESSING = "autocontrast-cutoff-1"
-_ZERO_OUTPUT_OTSU_RETRY_PREPROCESSING = "grayscale-autocontrast-otsu-v1"
-_ZERO_OUTPUT_RETRY_POLICY = "original+autocontrast-cutoff-1+otsu-max3-v2"
+_ZERO_OUTPUT_SCALED_RETRY_PREPROCESSING = "rgb-scale-0.5-center-white-lanczos-v1"
+_ZERO_OUTPUT_SCALED_RETRY_FACTOR = 0.5
+_ZERO_OUTPUT_RETRY_POLICY = (
+    "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+)
 _SURYA_DIRECT_EXECUTION_PATHS = ("cli", "module")
 _SURYA_MODULE_EXECUTION_PATHS = ("module",)
 _OCR_OUTCOME_TEXT = "text"
@@ -65,6 +69,27 @@ _PAGE_ERROR_ZERO_OUTPUT = "zero_output"
 _PAGE_ERROR_MISSING_OUTPUT = "missing_output"
 _OCR_STATUS_RECONCILIATION_PENDING = "reconciliation_pending"
 _PAGE_ERROR_UNCLASSIFIED = "unclassified"
+_SURYA_FAILURE_EVIDENCE_SCHEMA = "uniscan.surya-failure-evidence.v1"
+_SURYA_SOURCE_COORDINATE_SPACE = "source-image-v1"
+_SURYA_SCALED_GEOMETRY_TRANSFORM = "inverse-actual-content-size-strict-v1"
+_MAX_SURYA_FAILURE_EVIDENCE_FILES = 512
+_MAX_SURYA_FAILURE_EVIDENCE_ENTRIES = 1024
+_MAX_SURYA_FAILURE_EVIDENCE_RELATIVE_PATH_CHARS = 4096
+_MAX_SURYA_FAILURE_EVIDENCE_BYTES = 1024 * 1024 * 1024
+_STABLE_FILE_STAT_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_size",
+    "st_mtime_ns",
+    "st_nlink",
+) + (() if os.name == "nt" else ("st_ctime_ns",))
+_STABLE_DIRECTORY_STAT_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_mtime_ns",
+) + (() if os.name == "nt" else ("st_ctime_ns",))
 
 
 def _alnum_evidence(lines: Sequence[str]) -> tuple[int, int]:
@@ -94,6 +119,26 @@ def _sha256_path(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _stable_file_fingerprint(path: Path) -> dict[str, object]:
+    before_path = path.stat()
+    if not stat.S_ISREG(before_path.st_mode):
+        raise RuntimeError(f"Cannot seal non-regular file: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        before_descriptor = os.fstat(stream.fileno())
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+        after_descriptor = os.fstat(stream.fileno())
+    after_path = path.stat()
+    if any(
+        getattr(record, field) != getattr(before_descriptor, field)
+        for record in (before_path, after_descriptor, after_path)
+        for field in _STABLE_FILE_STAT_FIELDS
+    ):
+        raise RuntimeError(f"File changed while sealing: {path}")
+    return {"sha256": digest.hexdigest(), "bytes": int(before_descriptor.st_size)}
+
+
 def _image_attempt_evidence(path: Path) -> dict[str, object]:
     with Image.open(path) as image:
         image_size = [int(image.width), int(image.height)]
@@ -118,46 +163,35 @@ def _write_autocontrast_retry_image(*, source: Path, target: Path) -> dict[str, 
     return _image_attempt_evidence(target)
 
 
-def _otsu_threshold(histogram: Sequence[int]) -> int:
-    pixel_count = sum(histogram)
-    if pixel_count <= 0:
-        raise RuntimeError("Cannot compute Otsu threshold for an empty image.")
-    weighted_total = sum(level * count for level, count in enumerate(histogram))
-    background_count = 0
-    background_total = 0
-    best_variance = -1.0
-    best_threshold = 0
-    for level, count in enumerate(histogram):
-        background_count += count
-        background_total += level * count
-        foreground_count = pixel_count - background_count
-        if background_count == 0:
-            continue
-        if foreground_count == 0:
-            break
-        background_mean = background_total / background_count
-        foreground_mean = (weighted_total - background_total) / foreground_count
-        variance = background_count * foreground_count * (background_mean - foreground_mean) ** 2
-        if variance > best_variance:
-            best_variance = variance
-            best_threshold = level
-    return best_threshold
-
-
-def _write_otsu_retry_image(*, source: Path, target: Path) -> dict[str, object]:
+def _write_scaled_retry_image(*, source: Path, target: Path) -> dict[str, object]:
     with Image.open(source) as original:
         original_size = original.size
-        enhanced = ImageOps.autocontrast(original.convert("L"), cutoff=1)
-        threshold = _otsu_threshold(enhanced.histogram())
-        lookup = [0 if value <= threshold else 255 for value in range(256)]
-        binary = enhanced.point(lookup, mode="L")
-        if binary.size != original_size:
+        image = original.convert("RGB")
+        content_size = (
+            max(1, round(image.width * _ZERO_OUTPUT_SCALED_RETRY_FACTOR)),
+            max(1, round(image.height * _ZERO_OUTPUT_SCALED_RETRY_FACTOR)),
+        )
+        resized = image.resize(content_size, Image.Resampling.LANCZOS)
+        content_offset = (
+            (image.width - content_size[0]) // 2,
+            (image.height - content_size[1]) // 2,
+        )
+        canvas = Image.new("RGB", original_size, (255, 255, 255))
+        canvas.paste(resized, content_offset)
+        if canvas.size != original_size:
             raise RuntimeError(
-                f"OCR Otsu retry changed image dimensions from {original_size} to {binary.size}."
+                f"OCR scaled retry changed image dimensions from {original_size} to {canvas.size}."
             )
         target.parent.mkdir(parents=True, exist_ok=True)
-        binary.save(target, format="PNG")
-    return {**_image_attempt_evidence(target), "otsu_threshold": threshold}
+        canvas.save(target, format="PNG")
+    return {
+        **_image_attempt_evidence(target),
+        "content_scale": _ZERO_OUTPUT_SCALED_RETRY_FACTOR,
+        "content_size": list(content_size),
+        "content_offset": list(content_offset),
+        "resampling": "lanczos",
+        "canvas_fill_rgb": [255, 255, 255],
+    }
 
 
 def _strict_numeric_bbox(
@@ -176,6 +210,55 @@ def _strict_numeric_bbox(
     if x0 < 0.0 or y0 < 0.0 or x1 <= x0 or y1 <= y0:
         raise RuntimeError(f"Invalid {label}: bbox must have positive in-bounds area.")
     return x0, y0, x1, y1
+
+
+def _inverse_scaled_retry_bbox(
+    value: object,
+    *,
+    source_size: Sequence[int],
+    content_size: Sequence[int],
+    content_offset: Sequence[int],
+    label: str,
+) -> list[float]:
+    dimensions = (source_size, content_size, content_offset)
+    if any(
+        len(items) != 2
+        or any(not isinstance(item, int) or isinstance(item, bool) for item in items)
+        for items in dimensions
+    ):
+        raise RuntimeError(f"Invalid {label}: scaled retry dimensions are malformed.")
+    source_width, source_height = source_size
+    content_width, content_height = content_size
+    offset_x, offset_y = content_offset
+    if (
+        source_width <= 0
+        or source_height <= 0
+        or content_width <= 0
+        or content_height <= 0
+        or offset_x < 0
+        or offset_y < 0
+        or offset_x + content_width > source_width
+        or offset_y + content_height > source_height
+    ):
+        raise RuntimeError(f"Invalid {label}: scaled retry dimensions are out of bounds.")
+
+    x0, y0, x1, y1 = _strict_numeric_bbox(value, label=label)
+    if x1 > source_width or y1 > source_height:
+        raise RuntimeError(f"Invalid {label}: bbox escapes the retry canvas.")
+    content_x1 = offset_x + content_width
+    content_y1 = offset_y + content_height
+    if x0 < offset_x or y0 < offset_y or x1 > content_x1 or y1 > content_y1:
+        raise RuntimeError(f"Invalid {label}: bbox escapes scaled content.")
+
+    mapped = [
+        (x0 - offset_x) * source_width / content_width,
+        (y0 - offset_y) * source_height / content_height,
+        (x1 - offset_x) * source_width / content_width,
+        (y1 - offset_y) * source_height / content_height,
+    ]
+    if mapped[2] <= mapped[0] or mapped[3] <= mapped[1]:
+        raise RuntimeError(f"Invalid {label}: inverse-transformed bbox has no area.")
+    return mapped
 
 
 def _strict_surya_single_page_geometry(
@@ -242,6 +325,69 @@ def _strict_surya_single_page_geometry(
     return tuple(lines)
 
 
+def _write_source_coordinate_surya_sidecar(
+    *,
+    source: Path,
+    target: Path,
+    source_size: Sequence[int],
+    content_size: Sequence[int],
+    content_offset: Sequence[int],
+) -> Path:
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Cannot transform Surya retry geometry: {exc}") from exc
+    images = payload.get("images") if isinstance(payload, dict) else None
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise RuntimeError("Cannot transform malformed Surya retry image geometry.")
+    image = dict(images[0])
+    pages = image.get("pages")
+    if not isinstance(pages, list) or len(pages) != 1 or not isinstance(pages[0], dict):
+        raise RuntimeError("Cannot transform malformed Surya retry page geometry.")
+    page = dict(pages[0])
+    raw_lines = page.get("text_lines")
+    if not isinstance(raw_lines, list):
+        raise RuntimeError("Cannot transform malformed Surya retry text geometry.")
+    transformed_lines: list[dict[str, Any]] = []
+    for raw_line in raw_lines:
+        if not isinstance(raw_line, dict):
+            raise RuntimeError("Cannot transform non-object Surya retry text geometry.")
+        line = dict(raw_line)
+        line["bbox"] = _inverse_scaled_retry_bbox(
+            line.get("bbox"),
+            source_size=source_size,
+            content_size=content_size,
+            content_offset=content_offset,
+            label="scaled retry text line",
+        )
+        transformed_lines.append(line)
+    page["image_bbox"] = [0.0, 0.0, float(source_size[0]), float(source_size[1])]
+    page["text_lines"] = transformed_lines
+    image["pages"] = [page]
+    image["geometry_coordinate_space"] = _SURYA_SOURCE_COORDINATE_SPACE
+    image["geometry_transform"] = _SURYA_SCALED_GEOMETRY_TRANSFORM
+    transformed_payload = dict(payload)
+    transformed_payload["images"] = [image]
+    _write_json_atomic(target, transformed_payload)
+    return target
+
+
+def _strict_scaled_retry_pair(
+    value: object,
+    *,
+    label: str,
+    allow_zero: bool,
+) -> tuple[int, int]:
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(not isinstance(item, int) or isinstance(item, bool) for item in value)
+        or any(item < (0 if allow_zero else 1) for item in value)
+    ):
+        raise RuntimeError(f"Invalid scaled retry {label} evidence.")
+    return value[0], value[1]
+
+
 def _structured_surya_zero_output(
     *,
     page_errors: Sequence[dict[str, Any]],
@@ -303,6 +449,258 @@ def _copy_retry_evidence(*, source: Path, target: Path) -> Path:
         target.unlink(missing_ok=True)
         raise RuntimeError(f"OCR retry evidence copy failed verification: {target}")
     return target
+
+
+def _is_reparse_point(path: Path) -> bool:
+    return _stat_has_reparse_point(path.lstat())
+
+
+def _stat_has_reparse_point(path_stat: os.stat_result) -> bool:
+    attributes = int(getattr(path_stat, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    return bool(reparse_flag and attributes & reparse_flag)
+
+
+def _strict_snapshot_directory(
+    path: Path,
+    *,
+    label: str,
+    expected: os.stat_result | None = None,
+) -> os.stat_result:
+    try:
+        current = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Surya failure evidence {label} is missing") from exc
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or stat.S_ISLNK(current.st_mode)
+        or _stat_has_reparse_point(current)
+    ):
+        raise RuntimeError(f"Surya failure evidence {label} is unsafe")
+    if expected is not None:
+        if any(
+            getattr(current, field) != getattr(expected, field)
+            for field in _STABLE_DIRECTORY_STAT_FIELDS
+        ):
+            raise RuntimeError(f"Surya failure evidence {label} changed while copying")
+    return current
+
+
+def _copy_bounded_snapshot_file(
+    *,
+    source: Path,
+    source_stat: os.stat_result,
+    destination: Path,
+    max_bytes: int,
+) -> tuple[str, int]:
+    if max_bytes < 0 or source_stat.st_size > max_bytes:
+        raise RuntimeError("Surya failure evidence exceeds the byte limit")
+    digest = hashlib.sha256()
+    copied = 0
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("rb") as source_stream:
+        opened_stat = os.fstat(source_stream.fileno())
+        if any(
+            getattr(opened_stat, field) != getattr(source_stat, field)
+            for field in _STABLE_FILE_STAT_FIELDS
+        ):
+            raise RuntimeError(f"Surya failure evidence changed before copying: {source}")
+        with destination.open("xb") as destination_stream:
+            while True:
+                read_size = min(1024 * 1024, max_bytes - copied + 1)
+                block = source_stream.read(read_size)
+                if not block:
+                    break
+                copied += len(block)
+                if copied > max_bytes:
+                    raise RuntimeError("Surya failure evidence exceeds the byte limit")
+                destination_stream.write(block)
+                digest.update(block)
+        descriptor_after = os.fstat(source_stream.fileno())
+    path_after = source.lstat()
+    if any(
+        getattr(record, field) != getattr(source_stat, field)
+        for record in (descriptor_after, path_after)
+        for field in _STABLE_FILE_STAT_FIELDS
+    ):
+        raise RuntimeError(f"Surya failure evidence changed while copying: {source}")
+    if copied != source_stat.st_size:
+        raise RuntimeError(f"Surya failure evidence file ended before its sealed size: {source}")
+    destination_fingerprint = _stable_file_fingerprint(destination)
+    expected_fingerprint = {"sha256": digest.hexdigest(), "bytes": copied}
+    if destination_fingerprint != expected_fingerprint:
+        raise RuntimeError(f"Surya failure evidence copy is invalid: {source}")
+    return digest.hexdigest(), copied
+
+
+def _snapshot_surya_failure_evidence(
+    *,
+    source_root: Path,
+    trusted_root: Path,
+    output_dir: Path,
+    pdf_path: Path,
+    sample_pages_1based: Sequence[int],
+    dpi: int,
+    lang: str,
+    error: str,
+) -> dict[str, object] | None:
+    lexical_trusted_root = Path(os.path.abspath(trusted_root))
+    lexical_source_root = Path(os.path.abspath(source_root))
+    if lexical_source_root.parent != lexical_trusted_root:
+        raise RuntimeError("Surya failure evidence root is outside its trusted runtime root")
+    trusted_stat = _strict_snapshot_directory(
+        lexical_trusted_root,
+        label="trusted runtime root",
+    )
+    try:
+        lexical_source_root.lstat()
+    except FileNotFoundError:
+        return None
+    source_root_stat = _strict_snapshot_directory(
+        lexical_source_root,
+        label="source root",
+    )
+    source_root = lexical_source_root
+    sealed_pdf_path = pdf_path.resolve(strict=True)
+    source_pdf_fingerprint = _stable_file_fingerprint(sealed_pdf_path)
+    token = uuid.uuid4().hex
+    final_root = output_dir / f"{pdf_path.stem}_surya_failure_evidence_{token}"
+    staging_root = output_dir / f".{final_root.name}.tmp"
+    entries: list[dict[str, object]] = []
+    entry_count = 0
+    total_bytes = 0
+    sealed_directories: list[tuple[Path, os.stat_result]] = []
+    published = False
+    manifest_fingerprint: dict[str, object] | None = None
+    try:
+        staging_root.mkdir(parents=False, exist_ok=False)
+        payload_root = staging_root / "payload"
+        payload_root.mkdir(exist_ok=False)
+        pending = [(source_root, Path(), source_root_stat)]
+        while pending:
+            _strict_snapshot_directory(
+                lexical_trusted_root,
+                label="trusted runtime root",
+                expected=trusted_stat,
+            )
+            source_dir, relative_dir, sealed_directory_stat = pending.pop()
+            directory_stat = _strict_snapshot_directory(
+                source_dir,
+                label=f"directory {relative_dir}",
+                expected=sealed_directory_stat,
+            )
+            sealed_directories.append((source_dir, directory_stat))
+            directory_names: list[str] = []
+            with os.scandir(source_dir) as iterator:
+                for directory_entry in iterator:
+                    entry_count += 1
+                    if entry_count > _MAX_SURYA_FAILURE_EVIDENCE_ENTRIES:
+                        raise RuntimeError("Surya failure evidence exceeds the entry-count limit")
+                    directory_names.append(directory_entry.name)
+            for directory_name in sorted(directory_names):
+                source = source_dir / directory_name
+                relative = relative_dir / directory_name
+                if len(relative.as_posix()) > _MAX_SURYA_FAILURE_EVIDENCE_RELATIVE_PATH_CHARS:
+                    raise RuntimeError(
+                        "Surya failure evidence exceeds the relative-path-length limit"
+                    )
+                source_stat = source.lstat()
+                if stat.S_ISLNK(source_stat.st_mode) or _stat_has_reparse_point(source_stat):
+                    raise RuntimeError(f"Surya failure evidence contains a link: {relative}")
+                if stat.S_ISDIR(source_stat.st_mode):
+                    (payload_root / relative).mkdir(exist_ok=False)
+                    pending.append((source, relative, source_stat))
+                    continue
+                if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_nlink != 1:
+                    raise RuntimeError(
+                        "Surya failure evidence is not an exclusively owned file: "
+                        f"{relative} (nlink={source_stat.st_nlink})"
+                    )
+                if len(entries) >= _MAX_SURYA_FAILURE_EVIDENCE_FILES:
+                    raise RuntimeError("Surya failure evidence exceeds the file-count limit")
+                destination = payload_root / relative
+                source_sha256, source_bytes = _copy_bounded_snapshot_file(
+                    source=source,
+                    source_stat=source_stat,
+                    destination=destination,
+                    max_bytes=_MAX_SURYA_FAILURE_EVIDENCE_BYTES - total_bytes,
+                )
+                entries.append(
+                    {
+                        "path": (Path("payload") / relative).as_posix(),
+                        "sha256": source_sha256,
+                        "bytes": source_bytes,
+                    }
+                )
+                total_bytes += source_bytes
+            _strict_snapshot_directory(
+                source_dir,
+                label=f"directory {relative_dir}",
+                expected=directory_stat,
+            )
+        if not entries:
+            raise RuntimeError("Surya failure evidence tree is empty")
+        entries.sort(key=lambda item: str(item["path"]))
+        for sealed_path, sealed_stat in sealed_directories:
+            _strict_snapshot_directory(
+                sealed_path,
+                label=f"directory {sealed_path}",
+                expected=sealed_stat,
+            )
+        _strict_snapshot_directory(
+            lexical_trusted_root,
+            label="trusted runtime root",
+            expected=trusted_stat,
+        )
+        if _stable_file_fingerprint(sealed_pdf_path) != source_pdf_fingerprint:
+            raise RuntimeError("Surya failure evidence source PDF changed while copying")
+        manifest = {
+            "schema": _SURYA_FAILURE_EVIDENCE_SCHEMA,
+            "status": "sealed",
+            "engine": OCR_ENGINE_SURYA,
+            "source_pdf": {
+                "path": str(sealed_pdf_path),
+                **source_pdf_fingerprint,
+            },
+            "sample_pages": list(sample_pages_1based),
+            "dpi": int(dpi),
+            "lang": lang,
+            "retry_policy": _ZERO_OUTPUT_RETRY_POLICY,
+            "original_error": error,
+            "file_count": len(entries),
+            "total_bytes": total_bytes,
+            "payload_root": "payload",
+            "limits": {
+                "max_files": _MAX_SURYA_FAILURE_EVIDENCE_FILES,
+                "max_entries": _MAX_SURYA_FAILURE_EVIDENCE_ENTRIES,
+                "max_relative_path_chars": _MAX_SURYA_FAILURE_EVIDENCE_RELATIVE_PATH_CHARS,
+                "max_bytes": _MAX_SURYA_FAILURE_EVIDENCE_BYTES,
+            },
+            "files": entries,
+        }
+        _write_json_atomic(staging_root / "manifest.json", manifest)
+        os.replace(staging_root, final_root)
+        published = True
+        manifest_fingerprint = _stable_file_fingerprint(final_root / "manifest.json")
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        if published:
+            shutil.rmtree(final_root, ignore_errors=True)
+        raise
+    assert manifest_fingerprint is not None
+    manifest_path = final_root / "manifest.json"
+    return {
+        "schema": _SURYA_FAILURE_EVIDENCE_SCHEMA,
+        "status": "saved",
+        "engine": OCR_ENGINE_SURYA,
+        "evidence_root": str(final_root.resolve()),
+        "manifest_path": str(manifest_path.resolve()),
+        "manifest_sha256": manifest_fingerprint["sha256"],
+        "manifest_bytes": manifest_fingerprint["bytes"],
+        "file_count": len(entries),
+        "total_bytes": total_bytes,
+        "original_error": error,
+    }
 
 
 def _attempt_history_record(
@@ -1219,6 +1617,8 @@ def _write_pagewise_text_artifacts(
             "selected_attempt",
             "retry_policy",
             "attempt_history",
+            "geometry_coordinate_space",
+            "geometry_transform",
             "alnum_line_count",
             "alnum_chars",
         ):
@@ -1571,6 +1971,10 @@ def _collect_surya_batch_outputs(
             per_page_image_payload["attempt_count"] = attempt_count
             if retry_preprocessing is not None:
                 per_page_image_payload["retry_preprocessing"] = retry_preprocessing
+            for field in ("geometry_coordinate_space", "geometry_transform"):
+                value = image_payload.get(field)
+                if isinstance(value, str) and value:
+                    page_meta[field] = value
             per_page_payload: dict[str, Any] = {"images": [per_page_image_payload]}
             if execution_path:
                 per_page_payload["execution_path"] = execution_path
@@ -1750,75 +2154,117 @@ def _run_extraction_engine_pagewise(
             selected_metadata = retry_metadata
             selected_attempt = 2
             if retry_outcome == _OCR_OUTCOME_ZERO:
-                otsu_root = retry_root / "attempt_3_otsu"
-                otsu_image = otsu_root / "input" / image_path.name
-                otsu_image_evidence = _write_otsu_retry_image(
+                scaled_root = retry_root / "attempt_3_scaled"
+                scaled_image = scaled_root / "input" / image_path.name
+                scaled_image_evidence = _write_scaled_retry_image(
                     source=image_path,
-                    target=otsu_image,
+                    target=scaled_image,
                 )
-                otsu_work_dir = otsu_root / "module"
+                scaled_work_dir = scaled_root / "module"
                 _run_surya_module_cli(
-                    [otsu_image],
+                    [scaled_image],
                     lang=lang,
-                    work_dir=otsu_work_dir,
+                    work_dir=scaled_work_dir,
                     which_fn=which_fn,
                     run_cmd=run_cmd,
                 )
-                otsu_sidecar = otsu_work_dir / "surya_page_lines.json"
-                if not otsu_sidecar.is_file():
+                scaled_sidecar = scaled_work_dir / "surya_page_lines.json"
+                if not scaled_sidecar.is_file():
                     raise RuntimeError(
                         "Surya third zero-output retry did not produce mandatory geometry "
                         f"for source page {source_page}."
                     )
-                otsu_texts, _, otsu_errors, otsu_metadata = _collect_surya_batch_outputs(
-                    sidecar_path=otsu_sidecar,
-                    image_paths=[otsu_image],
-                    source_pages_1based=[source_page],
-                    work_dir=work_dir,
-                    attempt_count=3,
-                    retry_preprocessing=_ZERO_OUTPUT_OTSU_RETRY_PREPROCESSING,
+                raw_scaled_texts, _, raw_scaled_errors, raw_scaled_metadata = (
+                    _collect_surya_batch_outputs(
+                        sidecar_path=scaled_sidecar,
+                        image_paths=[scaled_image],
+                        source_pages_1based=[source_page],
+                        work_dir=scaled_root / "raw_collection",
+                        attempt_count=3,
+                        retry_preprocessing=_ZERO_OUTPUT_SCALED_RETRY_PREPROCESSING,
+                    )
                 )
-                if len(otsu_metadata) != 1:
+                if len(raw_scaled_metadata) != 1:
                     raise RuntimeError(
                         "Invalid third-attempt geometry: exact page metadata is required."
                     )
-                otsu_outcome = otsu_metadata[0].get("ocr_outcome")
-                if otsu_outcome == _OCR_OUTCOME_ZERO:
+                scaled_outcome = raw_scaled_metadata[0].get("ocr_outcome")
+                if scaled_outcome == _OCR_OUTCOME_ZERO:
                     _structured_surya_zero_output(
-                        page_errors=otsu_errors,
-                        page_metadata=otsu_metadata,
+                        page_errors=raw_scaled_errors,
+                        page_metadata=raw_scaled_metadata,
                         source_page=source_page,
-                        image_path=otsu_image,
+                        image_path=scaled_image,
                         expected_attempt=3,
-                        expected_preprocessing=_ZERO_OUTPUT_OTSU_RETRY_PREPROCESSING,
+                        expected_preprocessing=_ZERO_OUTPUT_SCALED_RETRY_PREPROCESSING,
                         permitted_execution_paths=_SURYA_MODULE_EXECUTION_PATHS,
                         label="third-attempt geometry",
                     )
-                elif otsu_outcome in {_OCR_OUTCOME_TEXT, _OCR_OUTCOME_VERIFIED_BLANK}:
+                elif scaled_outcome in {_OCR_OUTCOME_TEXT, _OCR_OUTCOME_VERIFIED_BLANK}:
                     _strict_surya_single_page_geometry(
-                        sidecar_path=otsu_sidecar,
-                        image_path=otsu_image,
-                        require_text=otsu_outcome == _OCR_OUTCOME_TEXT,
+                        sidecar_path=scaled_sidecar,
+                        image_path=scaled_image,
+                        require_text=scaled_outcome == _OCR_OUTCOME_TEXT,
                         permitted_execution_paths=_SURYA_MODULE_EXECUTION_PATHS,
                         label="third-attempt geometry",
                     )
+                    source_coordinate_sidecar = _write_source_coordinate_surya_sidecar(
+                        source=scaled_sidecar,
+                        target=scaled_root / "source_coordinates" / "surya_page_lines.json",
+                        source_size=_strict_scaled_retry_pair(
+                            scaled_image_evidence.get("image_size"),
+                            label="image_size",
+                            allow_zero=False,
+                        ),
+                        content_size=_strict_scaled_retry_pair(
+                            scaled_image_evidence.get("content_size"),
+                            label="content_size",
+                            allow_zero=False,
+                        ),
+                        content_offset=_strict_scaled_retry_pair(
+                            scaled_image_evidence.get("content_offset"),
+                            label="content_offset",
+                            allow_zero=True,
+                        ),
+                    )
+                    scaled_texts, _, scaled_errors, scaled_metadata = _collect_surya_batch_outputs(
+                        sidecar_path=source_coordinate_sidecar,
+                        image_paths=[image_path],
+                        source_pages_1based=[source_page],
+                        work_dir=work_dir,
+                        attempt_count=3,
+                        retry_preprocessing=_ZERO_OUTPUT_SCALED_RETRY_PREPROCESSING,
+                    )
+                    if (
+                        len(scaled_metadata) != 1
+                        or scaled_metadata[0].get("ocr_outcome") != scaled_outcome
+                        or scaled_texts != raw_scaled_texts
+                    ):
+                        raise RuntimeError(
+                            "Invalid third-attempt geometry: source-coordinate transform "
+                            "changed OCR evidence."
+                        )
                 else:
                     raise RuntimeError(
                         "Invalid third-attempt geometry: output is missing or malformed."
                     )
+                if scaled_outcome == _OCR_OUTCOME_ZERO:
+                    scaled_texts = raw_scaled_texts
+                    scaled_errors = raw_scaled_errors
+                    scaled_metadata = raw_scaled_metadata
                 attempt_history.append(
                     _attempt_history_record(
                         attempt=3,
-                        preprocessing=_ZERO_OUTPUT_OTSU_RETRY_PREPROCESSING,
-                        ocr_outcome=str(otsu_outcome),
-                        image_path=otsu_image,
-                        sidecar_path=otsu_sidecar,
-                        image_evidence=otsu_image_evidence,
+                        preprocessing=_ZERO_OUTPUT_SCALED_RETRY_PREPROCESSING,
+                        ocr_outcome=str(scaled_outcome),
+                        image_path=scaled_image,
+                        sidecar_path=scaled_sidecar,
+                        image_evidence=scaled_image_evidence,
                     )
                 )
-                selected_texts = otsu_texts
-                selected_errors = otsu_errors
-                selected_metadata = otsu_metadata
+                selected_texts = scaled_texts
+                selected_errors = scaled_errors
+                selected_metadata = scaled_metadata
                 selected_attempt = 3
 
             _attach_surya_retry_provenance(
@@ -3327,6 +3773,7 @@ def run_ocr_benchmark(
 
     import_probe = import_module or _module_presence_probe
     results: list[OcrBenchmarkResult] = []
+    failure_diagnostics: list[dict[str, object]] = []
     source_pages_1based = [page + 1 for page in sample_pages]
 
     tmp_dir = _create_runtime_work_dir(prefix="uniscan_ocr_benchmark_")
@@ -3510,6 +3957,33 @@ def run_ocr_benchmark(
                 _emit_benchmark_progress(progress, engine_end_percent, f"Done: {engine}")
             except Exception as exc:
                 elapsed = perf_counter() - start
+                if engine == OCR_ENGINE_SURYA:
+                    try:
+                        diagnostic = _snapshot_surya_failure_evidence(
+                            source_root=tmp_dir / f"{engine}_work",
+                            trusted_root=tmp_dir,
+                            output_dir=resolved_output,
+                            pdf_path=resolved_pdf,
+                            sample_pages_1based=source_pages_1based,
+                            dpi=dpi,
+                            lang=lang,
+                            error=str(exc),
+                        )
+                    except Exception as diagnostic_exc:
+                        failure_diagnostics.append(
+                            {
+                                "schema": _SURYA_FAILURE_EVIDENCE_SCHEMA,
+                                "status": "error",
+                                "engine": OCR_ENGINE_SURYA,
+                                "original_error": str(exc),
+                                "snapshot_error": (
+                                    f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                                ),
+                            }
+                        )
+                    else:
+                        if diagnostic is not None:
+                            failure_diagnostics.append(diagnostic)
                 results.append(
                     _make_result(
                         engine=engine,
@@ -3534,6 +4008,7 @@ def run_ocr_benchmark(
                 "page_count": page_count,
                 "sample_pages": [page + 1 for page in sample_pages],
                 "results": [asdict(result) for result in results],
+                "failure_diagnostics": failure_diagnostics,
             },
             indent=2,
             ensure_ascii=False,

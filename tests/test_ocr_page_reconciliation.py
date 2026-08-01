@@ -59,9 +59,25 @@ def _build_reconciliation_run(
                     )
                     attempt_dir.mkdir(parents=True)
                     image_path = attempt_dir / f"page_{source_page:04d}.png"
-                    mode = "L" if attempt == 3 else "RGB"
-                    Image.new(mode, (100, 100), color=255).save(image_path, format="PNG")
+                    if attempt == 3:
+                        attempt_one_path = (
+                            engine_dir
+                            / f"page_{source_page:04d}.retry"
+                            / "attempt_1"
+                            / f"page_{source_page:04d}.png"
+                        )
+                        with Image.open(attempt_one_path) as original:
+                            content = original.resize((50, 50), Image.Resampling.LANCZOS)
+                        candidate = Image.new("RGB", (100, 100), (255, 255, 255))
+                        candidate.paste(content, (25, 25))
+                        candidate.save(image_path, format="PNG")
+                    else:
+                        Image.new("RGB", (100, 100), color=(120, 120, 120)).save(
+                            image_path,
+                            format="PNG",
+                        )
                     attempt_text = text if attempt == 3 else ""
+                    attempt_bbox = [30, 30, 50, 40]
                     sidecar_path = attempt_dir / "surya_page_lines.json"
                     sidecar_path.write_text(
                         json.dumps(
@@ -74,7 +90,7 @@ def _build_reconciliation_run(
                                             {
                                                 "image_bbox": [0, 0, 100, 100],
                                                 "text_lines": (
-                                                    [{"text": attempt_text, "bbox": [0, 0, 50, 10]}]
+                                                    [{"text": attempt_text, "bbox": attempt_bbox}]
                                                     if attempt_text
                                                     else []
                                                 ),
@@ -111,7 +127,11 @@ def _build_reconciliation_run(
                 "pages": [
                     {
                         "image_bbox": [0, 0, 100, 100],
-                        "text_lines": ([{"text": text, "bbox": [0, 0, 50, 10]}] if text else []),
+                        "text_lines": (
+                            [{"text": text, "bbox": [10, 10, 50, 30]}]
+                            if text and isinstance(raw_history, list)
+                            else ([{"text": text, "bbox": [0, 0, 50, 10]}] if text else [])
+                        ),
                     }
                 ],
             }
@@ -126,6 +146,8 @@ def _build_reconciliation_run(
                 "retry_policy",
                 "selected_attempt",
                 "attempt_history",
+                "geometry_coordinate_space",
+                "geometry_transform",
             ):
                 if key in raw_row:
                     image_evidence[key] = raw_row[key]
@@ -152,6 +174,8 @@ def _build_reconciliation_run(
                 "retry_policy",
                 "selected_attempt",
                 "attempt_history",
+                "geometry_coordinate_space",
+                "geometry_transform",
             ):
                 if key in raw_row:
                     row[key] = raw_row[key]
@@ -240,9 +264,13 @@ def _explicit_graphics_page(source_page: int) -> dict[str, Any]:
 def _third_retry_fields() -> dict[str, Any]:
     return {
         "attempt_count": 3,
-        "retry_preprocessing": "grayscale-autocontrast-otsu-v1",
-        "retry_policy": "original+autocontrast-cutoff-1+otsu-max3-v2",
+        "retry_preprocessing": "rgb-scale-0.5-center-white-lanczos-v1",
+        "retry_policy": (
+            "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+        ),
         "selected_attempt": 3,
+        "geometry_coordinate_space": "source-image-v1",
+        "geometry_transform": "inverse-actual-content-size-strict-v1",
         "attempt_history": [
             {
                 "attempt": 1,
@@ -262,15 +290,46 @@ def _third_retry_fields() -> dict[str, Any]:
             },
             {
                 "attempt": 3,
-                "preprocessing": "grayscale-autocontrast-otsu-v1",
+                "preprocessing": "rgb-scale-0.5-center-white-lanczos-v1",
                 "ocr_outcome": "text",
                 "image_size": [120, 80],
                 "image_sha256": "3" * 64,
                 "sidecar_sha256": "c" * 64,
-                "otsu_threshold": 104,
+                "content_scale": 0.5,
+                "content_size": [50, 50],
+                "content_offset": [25, 25],
+                "resampling": "lanczos",
+                "canvas_fill_rgb": [255, 255, 255],
             },
         ],
     }
+
+
+def test_inverse_scaled_retry_geometry_uses_actual_odd_axis_scales() -> None:
+    raw = ocr_pipeline._SealedPageGeometry(
+        image_name="00001.png",
+        image_bbox=(0.0, 0.0, 1301.0, 1313.0),
+        lines=(
+            ocr_pipeline._SealedTextLine("SOLD", (351.0, 366.0, 938.0, 597.0)),
+            ocr_pipeline._SealedTextLine("OUT", (468.0, 675.0, 867.0, 870.0)),
+        ),
+        canonical_text="soldout",
+    )
+
+    mapped = ocr_pipeline._inverse_scaled_retry_geometry(
+        raw,
+        source_size=[1301, 1313],
+        content_size=[650, 656],
+        content_offset=[325, 328],
+    )
+
+    assert mapped.image_bbox == (0.0, 0.0, 1301.0, 1313.0)
+    assert mapped.lines[0].bbox == pytest.approx(
+        (52.04, 76.0579268292683, 1226.943076923077, 538.4100609756098)
+    )
+    assert mapped.lines[1].bbox == pytest.approx(
+        (286.22, 694.5289634146342, 1084.833846153846, 1084.8262195121952)
+    )
 
 
 def test_reconcile_knh_accepts_trivial_surya_without_substituting_its_text(
@@ -537,12 +596,12 @@ def test_reconcile_rejects_compatibility_character_that_is_not_equal_after_nfkc(
 @pytest.mark.parametrize(
     ("surya_text", "attempt_count", "retry_preprocessing", "expected_reason"),
     [
-        ("SOLD NOW", 3, "grayscale-autocontrast-otsu-v1", "retry_text_mismatch"),
-        ("SОLD OUT", 3, "grayscale-autocontrast-otsu-v1", "retry_text_mismatch"),
-        ("OUT SOLD", 3, "grayscale-autocontrast-otsu-v1", "retry_text_mismatch"),
-        ("---", 3, "grayscale-autocontrast-otsu-v1", "invalid_retry_text_evidence"),
+        ("SOLD NOW", 3, "rgb-scale-0.5-center-white-lanczos-v1", "retry_text_mismatch"),
+        ("SОLD OUT", 3, "rgb-scale-0.5-center-white-lanczos-v1", "retry_text_mismatch"),
+        ("OUT SOLD", 3, "rgb-scale-0.5-center-white-lanczos-v1", "retry_text_mismatch"),
+        ("---", 3, "rgb-scale-0.5-center-white-lanczos-v1", "invalid_retry_text_evidence"),
         ("SOLD OUT", 3, None, "invalid_retry_text_evidence"),
-        ("SOLD OUT", 4, "grayscale-autocontrast-otsu-v1", "invalid_retry_text_evidence"),
+        ("SOLD OUT", 4, "rgb-scale-0.5-center-white-lanczos-v1", "invalid_retry_text_evidence"),
         ("SOLD OUT", 0, None, "invalid_retry_text_evidence"),
         ("SOLD OUT", -1, None, "invalid_retry_text_evidence"),
         ("SOLD OUT", False, None, "invalid_retry_text_evidence"),
@@ -569,7 +628,7 @@ def test_reconcile_rejects_unconfirmed_or_invalid_third_retry_text(
     }
     if retry_preprocessing is not None:
         surya_row["retry_preprocessing"] = retry_preprocessing
-    if attempt_count == 3 and retry_preprocessing == "grayscale-autocontrast-otsu-v1":
+    if attempt_count == 3 and retry_preprocessing == "rgb-scale-0.5-center-white-lanczos-v1":
         surya_row.update(_third_retry_fields())
     run_dir, results, result_files = _build_reconciliation_run(
         tmp_path,
@@ -888,7 +947,7 @@ def test_reconcile_retry_sidecar_size_error_fails_closed(
         "selected-image-name",
     ],
 )
-def test_reconcile_third_retry_requires_exact_selected_raw_geometry(
+def test_reconcile_third_retry_requires_deterministic_inverse_geometry(
     tmp_path: Path,
     defect: str,
 ) -> None:
@@ -956,6 +1015,55 @@ def test_reconcile_third_retry_requires_exact_selected_raw_geometry(
     else:
         selected_image["image_name"] = "forged-page.png"
 
+    pages_path.write_text(json.dumps(pages_payload), encoding="utf-8")
+    selected_path.write_text(json.dumps(selected_payload), encoding="utf-8")
+
+    adjusted, error = ocr_pipeline._reconcile_mode_both_pages(
+        run_dir=run_dir,
+        results=results,
+        result_files=result_files,
+    )
+
+    assert adjusted == results
+    assert error == "unresolved pages: [1]"
+    reconciliation = json.loads((run_dir / "page_reconciliation.json").read_text(encoding="utf-8"))
+    assert reconciliation["pages"][0]["reason"] == "invalid_retry_text_evidence"
+
+
+def test_reconcile_rejects_self_sealed_third_retry_pixels_not_derived_from_attempt_one(
+    tmp_path: Path,
+) -> None:
+    run_dir, results, result_files = _build_reconciliation_run(
+        tmp_path,
+        surya_rows=[
+            {
+                "source_page": 1,
+                "text": "SOLD OUT",
+                "ocr_outcome": "text",
+                "alnum_line_count": 1,
+                "alnum_chars": 7,
+                **_third_retry_fields(),
+            }
+        ],
+        chandra_rows=[{"source_page": 1, "text": "SOLD OUT", "ocr_outcome": "text"}],
+    )
+    engine_dir = run_dir / "surya" / "surya"
+    pages_path = engine_dir / "pages.json"
+    selected_path = engine_dir / "page_0001.surya.json"
+    pages_payload = json.loads(pages_path.read_text(encoding="utf-8"))
+    selected_payload = json.loads(selected_path.read_text(encoding="utf-8"))
+    histories = (
+        pages_payload["pages"][0]["attempt_history"],
+        selected_payload["images"][0]["attempt_history"],
+    )
+    candidate_path = Path(histories[0][2]["image_path"])
+    with Image.open(candidate_path) as source:
+        forged = source.copy()
+    forged.putpixel((0, 0), (0, 0, 0))
+    forged.save(candidate_path, format="PNG")
+    for history in histories:
+        history[2]["image_sha256"] = _sha256(candidate_path)
+        history[2]["image_bytes"] = candidate_path.stat().st_size
     pages_path.write_text(json.dumps(pages_payload), encoding="utf-8")
     selected_path.write_text(json.dumps(selected_payload), encoding="utf-8")
 
@@ -1153,8 +1261,10 @@ def test_reconcile_rejects_invalid_chandra_identity_or_geometry(
                 "text": "",
                 "ocr_outcome": "zero_output",
                 "attempt_count": 3,
-                "retry_preprocessing": "grayscale-autocontrast-otsu-v1",
-                "retry_policy": "original+autocontrast-cutoff-1+otsu-max3-v2",
+                "retry_preprocessing": "rgb-scale-0.5-center-white-lanczos-v1",
+                "retry_policy": (
+                    "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+                ),
                 "selected_attempt": 3,
                 "page_errors": ["zero"],
             },
@@ -1167,8 +1277,10 @@ def test_reconcile_rejects_invalid_chandra_identity_or_geometry(
                 "text": "",
                 "ocr_outcome": "zero_output",
                 "attempt_count": 3,
-                "retry_preprocessing": "grayscale-autocontrast-otsu-v1",
-                "retry_policy": "original+autocontrast-cutoff-1+otsu-max3-v2",
+                "retry_preprocessing": "rgb-scale-0.5-center-white-lanczos-v1",
+                "retry_policy": (
+                    "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+                ),
                 "selected_attempt": 3,
                 "attempt_history": [],
                 "page_errors": ["zero"],
@@ -1451,15 +1563,17 @@ def test_strict_app_path_rejects_reconciliation_failure() -> None:
 
 def test_hybrid_cache_identity_includes_retry_and_reconciliation_revision() -> None:
     config = ocr_pipeline._hybrid_runtime_config()
-    assert ocr_pipeline._HYBRID_CHUNK_PIPELINE_REVISION == "chandra-surya-resumable-v3"
-    assert ocr_pipeline._HYBRID_CHUNK_MANIFEST_SCHEMA == "uniscan.hybrid-chunks.v3"
-    assert config["zero_output_retry_policy"] == ("original+autocontrast-cutoff-1+otsu-max3-v2")
+    assert ocr_pipeline._HYBRID_CHUNK_PIPELINE_REVISION == "chandra-surya-resumable-v4"
+    assert ocr_pipeline._HYBRID_CHUNK_MANIFEST_SCHEMA == "uniscan.hybrid-chunks.v4"
+    assert config["zero_output_retry_policy"] == (
+        "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+    )
     assert config["page_reconciliation_policy"] == (
-        "explicit-chandra-nontext+quiet-surya+otsu-text-agreement-v3"
+        "explicit-chandra-nontext+quiet-surya+scaled-text-agreement-v4"
     )
 
 
-def test_hybrid_cache_identity_changes_from_legacy_v2(
+def test_hybrid_cache_identity_changes_from_legacy_v3(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1480,7 +1594,7 @@ def test_hybrid_cache_identity_changes_from_legacy_v2(
     monkeypatch.setattr(
         ocr_pipeline,
         "_HYBRID_CHUNK_PIPELINE_REVISION",
-        "chandra-surya-resumable-v2",
+        "chandra-surya-resumable-v3",
     )
     monkeypatch.setattr(
         ocr_pipeline,

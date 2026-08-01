@@ -160,7 +160,7 @@ def _write_complete_hybrid_summary(
                 preprocessings = (
                     "original",
                     "autocontrast-cutoff-1",
-                    "grayscale-autocontrast-otsu-v1",
+                    "rgb-scale-0.5-center-white-lanczos-v1",
                 )
                 for attempt, preprocessing in enumerate(preprocessings, start=1):
                     retry_dir = engine_dir / "page_0001.retry" / f"attempt_{attempt}"
@@ -183,8 +183,10 @@ def _write_complete_hybrid_summary(
                 row.update(
                     {
                         "attempt_count": 3,
-                        "retry_preprocessing": "grayscale-autocontrast-otsu-v1",
-                        "retry_policy": "original+autocontrast-cutoff-1+otsu-max3-v2",
+                        "retry_preprocessing": "rgb-scale-0.5-center-white-lanczos-v1",
+                        "retry_policy": (
+                            "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+                        ),
                         "selected_attempt": 3,
                         "attempt_history": retry_history,
                     }
@@ -417,7 +419,7 @@ def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
     manifest = json.loads(summary.chunk_manifest_path.read_text(encoding="utf-8"))
     assert manifest["status"] == "done"
     assert [item["status"] for item in manifest["chunks"]] == ["done", "done", "done"]
-    assert manifest["schema"] == "uniscan.hybrid-chunks.v3"
+    assert manifest["schema"] == "uniscan.hybrid-chunks.v4"
     assert all(item["output_sha256"] for item in manifest["chunks"])
 
     calls_before_resume = len(calls)
@@ -513,19 +515,19 @@ def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
     assert changed_summary.run_dir != recovered.run_dir
 
 
-def test_chunk_manifest_v3_rejects_stale_v2_record() -> None:
+def test_chunk_manifest_v4_rejects_stale_v3_record() -> None:
     tmp_path = _new_test_dir()
     source_pdf = tmp_path / "source.pdf"
     chunk_pdf = tmp_path / "chunk.pdf"
     source_pdf.write_bytes(b"source")
     chunk_pdf.write_bytes(b"chunk")
     manifest_path = tmp_path / "chunk_manifest.json"
-    identity = {"pipeline_revision": "chandra-surya-resumable-v3"}
+    identity = {"pipeline_revision": "chandra-surya-resumable-v4"}
     run_key = "f" * 64
     manifest_path.write_text(
         json.dumps(
             {
-                "schema": "uniscan.hybrid-chunks.v2",
+                "schema": "uniscan.hybrid-chunks.v3",
                 "status": "done",
                 "run_key": run_key,
                 "identity": identity,
@@ -554,7 +556,7 @@ def test_chunk_manifest_v3_rejects_stale_v2_record() -> None:
         chunk_pages=10,
     )
 
-    assert manifest["schema"] == "uniscan.hybrid-chunks.v3"
+    assert manifest["schema"] == "uniscan.hybrid-chunks.v4"
     assert manifest["recovery_reason"] == "ignored incompatible manifest identity"
     assert records[0]["status"] == "pending"
     assert "output_pdf" not in records[0]
@@ -1041,7 +1043,7 @@ def test_chunk_manifest_reader_rejects_linked_file(
     link_kind: str,
 ) -> None:
     target = tmp_path / "manifest-target.json"
-    target.write_text('{"schema":"uniscan.hybrid-chunks.v3"}', encoding="utf-8")
+    target.write_text('{"schema":"uniscan.hybrid-chunks.v4"}', encoding="utf-8")
     manifest = tmp_path / "chunk_manifest.json"
     try:
         if link_kind == "hardlink":

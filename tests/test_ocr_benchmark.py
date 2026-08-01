@@ -315,6 +315,482 @@ def test_run_ocr_benchmark_unready_engine_is_error(tmp_path, monkeypatch) -> Non
     assert results[0].artifact_path is not None
 
 
+def test_run_ocr_benchmark_seals_surya_retry_failure_before_runtime_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = _build_sample_pdf(tmp_path, [90])
+    output_dir = tmp_path / "out"
+    runtime_dir = tmp_path / "runtime"
+    expected_error = "Invalid third-attempt geometry: line text has no alphanumeric evidence."
+
+    def allocate_runtime(*, prefix: str) -> Path:
+        assert prefix == "uniscan_ocr_benchmark_"
+        runtime_dir.mkdir()
+        return runtime_dir
+
+    def fail_pagewise(*_args, work_dir: Path, **_kwargs):
+        attempt_root = work_dir / "zero_output_retry" / "page_0001" / "attempt_3_scaled"
+        input_path = attempt_root / "input" / "00001.png"
+        raw_path = attempt_root / "module" / "surya_out" / "surya_input" / "results.json"
+        sidecar_path = attempt_root / "module" / "surya_page_lines.json"
+        input_path.parent.mkdir(parents=True)
+        raw_path.parent.mkdir(parents=True)
+        input_path.write_bytes(b"sealed retry image")
+        raw_path.write_text('{"00001":[{"text_lines":[{"text":"---"}]}]}', encoding="utf-8")
+        sidecar_path.write_text(
+            '{"execution_path":"module","images":[{"image_name":"00001.png"}]}',
+            encoding="utf-8",
+        )
+        raise RuntimeError(expected_error)
+
+    monkeypatch.setattr(ocr_benchmark_mod, "_create_runtime_work_dir", allocate_runtime)
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "detect_ocr_engine_status",
+        lambda engine_name, **_kwargs: _ready_status(engine_name, searchable_pdf=False),
+    )
+    monkeypatch.setattr(ocr_benchmark_mod, "_run_extraction_engine_pagewise", fail_pagewise)
+
+    results = run_ocr_benchmark(
+        pdf_path=pdf_path,
+        output_dir=output_dir,
+        engines=(OCR_ENGINE_SURYA,),
+        sample_size=1,
+        dpi=100,
+    )
+
+    assert results[0].status == "error"
+    assert results[0].error == expected_error
+    assert not runtime_dir.exists()
+    report = json.loads((output_dir / "fixture_ocr_benchmark.json").read_text(encoding="utf-8"))
+    diagnostics = report["failure_diagnostics"]
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic["status"] == "saved"
+    assert diagnostic["original_error"] == expected_error
+    evidence_root = Path(diagnostic["evidence_root"])
+    manifest_path = Path(diagnostic["manifest_path"])
+    assert manifest_path == evidence_root / "manifest.json"
+    assert ocr_benchmark_mod._sha256_path(manifest_path) == diagnostic["manifest_sha256"]
+    assert manifest_path.stat().st_size == diagnostic["manifest_bytes"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema"] == "uniscan.surya-failure-evidence.v1"
+    assert manifest["status"] == "sealed"
+    assert manifest["original_error"] == expected_error
+    expected_paths = {
+        "payload/zero_output_retry/page_0001/attempt_3_scaled/input/00001.png",
+        "payload/zero_output_retry/page_0001/attempt_3_scaled/module/surya_out/surya_input/results.json",
+        "payload/zero_output_retry/page_0001/attempt_3_scaled/module/surya_page_lines.json",
+    }
+    assert {item["path"] for item in manifest["files"]} == expected_paths
+    assert diagnostic["file_count"] == len(expected_paths)
+    assert diagnostic["total_bytes"] == manifest["total_bytes"]
+    assert manifest["file_count"] == len(expected_paths)
+    assert manifest["limits"] == {
+        "max_files": ocr_benchmark_mod._MAX_SURYA_FAILURE_EVIDENCE_FILES,
+        "max_entries": ocr_benchmark_mod._MAX_SURYA_FAILURE_EVIDENCE_ENTRIES,
+        "max_relative_path_chars": (
+            ocr_benchmark_mod._MAX_SURYA_FAILURE_EVIDENCE_RELATIVE_PATH_CHARS
+        ),
+        "max_bytes": ocr_benchmark_mod._MAX_SURYA_FAILURE_EVIDENCE_BYTES,
+    }
+    assert manifest["payload_root"] == "payload"
+    for item in manifest["files"]:
+        evidence_path = evidence_root / item["path"]
+        assert evidence_path.stat().st_size == item["bytes"]
+        assert ocr_benchmark_mod._sha256_path(evidence_path) == item["sha256"]
+
+
+def _failure_snapshot_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    trusted_root = tmp_path / "runtime"
+    source_root = trusted_root / "surya_work"
+    output_dir = tmp_path / "out"
+    trusted_root.mkdir()
+    output_dir.mkdir()
+    pdf_path = tmp_path / "fixture.pdf"
+    pdf_path.write_bytes(b"sealed pdf")
+    return trusted_root, source_root, output_dir, pdf_path
+
+
+def test_surya_failure_snapshot_missing_source_returns_none(tmp_path: Path) -> None:
+    trusted_root, source_root, output_dir, pdf_path = _failure_snapshot_fixture(tmp_path)
+
+    diagnostic = ocr_benchmark_mod._snapshot_surya_failure_evidence(
+        source_root=source_root,
+        trusted_root=trusted_root,
+        output_dir=output_dir,
+        pdf_path=pdf_path,
+        sample_pages_1based=[1],
+        dpi=300,
+        lang="eng",
+        error="failure before Surya work materialized",
+    )
+
+    assert diagnostic is None
+    assert list(output_dir.iterdir()) == []
+
+
+def test_surya_failure_snapshot_seals_pdf_symlink_target_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root, source_root, output_dir, _pdf_path = _failure_snapshot_fixture(tmp_path)
+    source_root.mkdir()
+    (source_root / "raw.json").write_text("{}", encoding="utf-8")
+    first_target = tmp_path / "first.pdf"
+    second_target = tmp_path / "second.pdf"
+    first_target.write_bytes(b"first sealed PDF")
+    second_target.write_bytes(b"second PDF")
+    linked_pdf = tmp_path / "linked.pdf"
+    try:
+        linked_pdf.symlink_to(first_target)
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this host")
+    real_fingerprint = ocr_benchmark_mod._stable_file_fingerprint
+    retargeted = False
+
+    def retarget_after_first_pdf_seal(path: Path) -> dict[str, object]:
+        nonlocal retargeted
+        fingerprint = real_fingerprint(path)
+        if Path(path) == first_target and not retargeted:
+            linked_pdf.unlink()
+            linked_pdf.symlink_to(second_target)
+            retargeted = True
+        return fingerprint
+
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_stable_file_fingerprint",
+        retarget_after_first_pdf_seal,
+    )
+    diagnostic = ocr_benchmark_mod._snapshot_surya_failure_evidence(
+        source_root=source_root,
+        trusted_root=trusted_root,
+        output_dir=output_dir,
+        pdf_path=linked_pdf,
+        sample_pages_1based=[1],
+        dpi=300,
+        lang="eng",
+        error="boom",
+    )
+
+    assert retargeted is True
+    assert diagnostic is not None
+    manifest = json.loads(Path(diagnostic["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["source_pdf"] == {
+        "path": str(first_target.resolve()),
+        "sha256": ocr_benchmark_mod._sha256_path(first_target),
+        "bytes": first_target.stat().st_size,
+    }
+
+
+def test_surya_failure_snapshot_rejects_linked_source_root(tmp_path: Path) -> None:
+    trusted_root, source_root, output_dir, pdf_path = _failure_snapshot_fixture(tmp_path)
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "secret.txt").write_text("outside", encoding="utf-8")
+    try:
+        source_root.symlink_to(external, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this host")
+    with pytest.raises(RuntimeError, match="source root is unsafe"):
+        ocr_benchmark_mod._snapshot_surya_failure_evidence(
+            source_root=source_root,
+            trusted_root=trusted_root,
+            output_dir=output_dir,
+            pdf_path=pdf_path,
+            sample_pages_1based=[1],
+            dpi=300,
+            lang="eng",
+            error="boom",
+        )
+    source_root.unlink()
+    assert list(output_dir.iterdir()) == []
+
+
+def test_surya_failure_snapshot_rejects_reparse_source_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root, source_root, output_dir, pdf_path = _failure_snapshot_fixture(tmp_path)
+    source_root.mkdir()
+    source_stat = source_root.lstat()
+    source_identity = (source_stat.st_dev, source_stat.st_ino)
+    real_is_reparse = ocr_benchmark_mod._stat_has_reparse_point
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_stat_has_reparse_point",
+        lambda path_stat: (
+            (path_stat.st_dev, path_stat.st_ino) == source_identity or real_is_reparse(path_stat)
+        ),
+    )
+    with pytest.raises(RuntimeError, match="source root is unsafe"):
+        ocr_benchmark_mod._snapshot_surya_failure_evidence(
+            source_root=source_root,
+            trusted_root=trusted_root,
+            output_dir=output_dir,
+            pdf_path=pdf_path,
+            sample_pages_1based=[1],
+            dpi=300,
+            lang="eng",
+            error="boom",
+        )
+    assert list(output_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value", "files", "message"),
+    [
+        ("_MAX_SURYA_FAILURE_EVIDENCE_FILES", 1, (b"a", b"b"), "file-count limit"),
+        ("_MAX_SURYA_FAILURE_EVIDENCE_ENTRIES", 1, (b"a", b"b"), "entry-count limit"),
+        (
+            "_MAX_SURYA_FAILURE_EVIDENCE_RELATIVE_PATH_CHARS",
+            3,
+            (b"a",),
+            "relative-path-length limit",
+        ),
+        ("_MAX_SURYA_FAILURE_EVIDENCE_BYTES", 3, (b"four",), "byte limit"),
+    ],
+)
+def test_surya_failure_snapshot_is_bounded_and_cleans_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit_value: int,
+    files: tuple[bytes, ...],
+    message: str,
+) -> None:
+    trusted_root, source_root, output_dir, pdf_path = _failure_snapshot_fixture(tmp_path)
+    source_root.mkdir()
+    for index, payload in enumerate(files):
+        (source_root / f"{index}.bin").write_bytes(payload)
+    monkeypatch.setattr(ocr_benchmark_mod, limit_name, limit_value)
+
+    with pytest.raises(RuntimeError, match=message):
+        ocr_benchmark_mod._snapshot_surya_failure_evidence(
+            source_root=source_root,
+            trusted_root=trusted_root,
+            output_dir=output_dir,
+            pdf_path=pdf_path,
+            sample_pages_1based=[1],
+            dpi=300,
+            lang="eng",
+            error="boom",
+        )
+
+    assert list(output_dir.iterdir()) == []
+
+
+def test_surya_failure_snapshot_isolates_source_manifest_namespace(tmp_path: Path) -> None:
+    trusted_root, source_root, output_dir, pdf_path = _failure_snapshot_fixture(tmp_path)
+    source_root.mkdir()
+    source_manifest = source_root / "manifest.json"
+    source_manifest.write_text("source-owned manifest", encoding="utf-8")
+
+    diagnostic = ocr_benchmark_mod._snapshot_surya_failure_evidence(
+        source_root=source_root,
+        trusted_root=trusted_root,
+        output_dir=output_dir,
+        pdf_path=pdf_path,
+        sample_pages_1based=[1],
+        dpi=300,
+        lang="eng",
+        error="boom",
+    )
+
+    assert diagnostic is not None
+    evidence_root = Path(diagnostic["evidence_root"])
+    assert (evidence_root / "manifest.json").is_file()
+    assert (evidence_root / "payload" / "manifest.json").read_text(encoding="utf-8") == (
+        "source-owned manifest"
+    )
+    manifest = json.loads((evidence_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["files"] == [
+        {
+            "path": "payload/manifest.json",
+            "sha256": ocr_benchmark_mod._sha256_path(evidence_root / "payload" / "manifest.json"),
+            "bytes": len("source-owned manifest"),
+        }
+    ]
+
+
+def test_surya_failure_snapshot_rechecks_trusted_root_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root, source_root, output_dir, pdf_path = _failure_snapshot_fixture(tmp_path)
+    source_root.mkdir()
+    (source_root / "raw.json").write_text("{}", encoding="utf-8")
+    real_check = ocr_benchmark_mod._strict_snapshot_directory
+    rechecks = 0
+
+    def inject_identity_change(
+        path: Path,
+        *,
+        label: str,
+        expected: os.stat_result | None = None,
+    ) -> os.stat_result:
+        nonlocal rechecks
+        if Path(path) == trusted_root and expected is not None:
+            rechecks += 1
+            raise RuntimeError("Surya failure evidence trusted runtime root changed while copying")
+        return real_check(path, label=label, expected=expected)
+
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_strict_snapshot_directory",
+        inject_identity_change,
+    )
+    with pytest.raises(RuntimeError, match="trusted runtime root changed"):
+        ocr_benchmark_mod._snapshot_surya_failure_evidence(
+            source_root=source_root,
+            trusted_root=trusted_root,
+            output_dir=output_dir,
+            pdf_path=pdf_path,
+            sample_pages_1based=[1],
+            dpi=300,
+            lang="eng",
+            error="boom",
+        )
+    assert rechecks == 1
+    assert list(output_dir.iterdir()) == []
+
+
+def test_surya_failure_snapshot_removes_published_orphan_on_descriptor_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root, source_root, output_dir, pdf_path = _failure_snapshot_fixture(tmp_path)
+    source_root.mkdir()
+    (source_root / "raw.json").write_text("{}", encoding="utf-8")
+    real_fingerprint = ocr_benchmark_mod._stable_file_fingerprint
+
+    def fail_manifest_descriptor(path: Path) -> dict[str, object]:
+        if path.name == "manifest.json":
+            raise OSError("injected descriptor failure")
+        return real_fingerprint(path)
+
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_stable_file_fingerprint",
+        fail_manifest_descriptor,
+    )
+    with pytest.raises(OSError, match="injected descriptor failure"):
+        ocr_benchmark_mod._snapshot_surya_failure_evidence(
+            source_root=source_root,
+            trusted_root=trusted_root,
+            output_dir=output_dir,
+            pdf_path=pdf_path,
+            sample_pages_1based=[1],
+            dpi=300,
+            lang="eng",
+            error="boom",
+        )
+    assert list(output_dir.iterdir()) == []
+
+
+def test_bounded_snapshot_copy_rejects_short_eof_without_stat_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    destination = tmp_path / "destination.bin"
+    source.write_bytes(b"sealed bytes")
+    source_stat = source.lstat()
+    real_path_open = Path.open
+
+    class ShortReadStream:
+        def __init__(self, stream) -> None:
+            self._stream = stream
+            self._read_once = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            self._stream.close()
+
+        def fileno(self) -> int:
+            return self._stream.fileno()
+
+        def read(self, _size: int = -1) -> bytes:
+            if self._read_once:
+                return b""
+            self._read_once = True
+            return self._stream.read(1)
+
+    def short_source_open(path: Path, *args, **kwargs):
+        stream = real_path_open(path, *args, **kwargs)
+        if path == source and args and args[0] == "rb":
+            return ShortReadStream(stream)
+        return stream
+
+    monkeypatch.setattr(Path, "open", short_source_open)
+    with pytest.raises(RuntimeError, match="ended before its sealed size"):
+        ocr_benchmark_mod._copy_bounded_snapshot_file(
+            source=source,
+            source_stat=source_stat,
+            destination=destination,
+            max_bytes=source_stat.st_size,
+        )
+
+
+def test_surya_failure_snapshot_error_never_masks_original_ocr_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = _build_sample_pdf(tmp_path, [90])
+    output_dir = tmp_path / "out"
+    runtime_dir = tmp_path / "runtime"
+    expected_error = "original OCR failure"
+
+    def allocate_runtime(*, prefix: str) -> Path:
+        assert prefix == "uniscan_ocr_benchmark_"
+        runtime_dir.mkdir()
+        return runtime_dir
+
+    def fail_with_hardlink(*_args, work_dir: Path, **_kwargs):
+        retry_root = work_dir / "zero_output_retry" / "page_0001"
+        retry_root.mkdir(parents=True)
+        original = retry_root / "original.json"
+        alias = retry_root / "alias.json"
+        original.write_text("{}", encoding="utf-8")
+        os.link(original, alias)
+        raise RuntimeError(expected_error)
+
+    monkeypatch.setattr(ocr_benchmark_mod, "_create_runtime_work_dir", allocate_runtime)
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "detect_ocr_engine_status",
+        lambda engine_name, **_kwargs: _ready_status(engine_name, searchable_pdf=False),
+    )
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_run_extraction_engine_pagewise",
+        fail_with_hardlink,
+    )
+
+    results = run_ocr_benchmark(
+        pdf_path=pdf_path,
+        output_dir=output_dir,
+        engines=(OCR_ENGINE_SURYA,),
+        sample_size=1,
+        dpi=100,
+    )
+
+    assert results[0].status == "error"
+    assert results[0].error == expected_error
+    assert not runtime_dir.exists()
+    report = json.loads((output_dir / "fixture_ocr_benchmark.json").read_text(encoding="utf-8"))
+    diagnostics = report["failure_diagnostics"]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["status"] == "error"
+    assert diagnostics[0]["original_error"] == expected_error
+    assert "exclusively owned file" in diagnostics[0]["snapshot_error"]
+    assert list(output_dir.glob("fixture_surya_failure_evidence_*")) == []
+
+
 def test_run_ocr_benchmark_rejects_unsafe_engine_before_touching_output(tmp_path) -> None:
     output_dir = tmp_path / "out"
 
