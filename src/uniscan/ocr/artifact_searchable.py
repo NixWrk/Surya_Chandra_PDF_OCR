@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -450,12 +451,15 @@ def _estimate_page_split_weights(
     return [min(value, high_clip) if value > 0 else 0.1 for value in counts]
 
 
-def _extract_pdf_text(pdf_path: Path) -> str:
+def _extract_pdf_page_texts(pdf_path: Path) -> list[str]:
     from pypdf import PdfReader
 
     reader = PdfReader(str(pdf_path))
-    parts = [(page.extract_text() or "") for page in reader.pages]
-    return "\n".join(part for part in parts if part.strip())
+    return [(page.extract_text() or "") for page in reader.pages]
+
+
+def _extract_pdf_text(pdf_path: Path) -> str:
+    return "\n".join(part for part in _extract_pdf_page_texts(pdf_path) if part.strip())
 
 
 def _resolve_text_layer_font_path() -> Path:
@@ -2434,6 +2438,7 @@ def _build_overlay_page(
     page_height: float,
     placements: Sequence[tuple[tuple[float, float, float, float], str]],
     font_name: str,
+    drawn_text_out: list[str] | None = None,
 ) -> Any:
     from pypdf import PdfReader
     from reportlab.pdfgen import canvas
@@ -2473,6 +2478,8 @@ def _build_overlay_page(
         if abs(horiz_scale - 100.0) > 0.5:
             text_obj.setHorizScale(horiz_scale)
         text_obj.textLine(line)
+        if drawn_text_out is not None:
+            drawn_text_out.append(line)
         pdf_canvas.drawText(text_obj)
 
     order, split_positions = _bbox_reading_order_details(
@@ -2517,6 +2524,7 @@ def _build_searchable_pdf_from_text(
     blend_primary_y_weight: float | None = None,
     geometry_debug_rows: list[dict[str, object]] | None = None,
     warnings: list[str] | None = None,
+    source_page_texts_out: list[str] | None = None,
 ) -> tuple[int, int]:
     from pypdf import PdfReader, PdfWriter
     import fitz
@@ -2571,6 +2579,9 @@ def _build_searchable_pdf_from_text(
                 page_weights=page_weights,
             )
 
+    if source_page_texts_out is not None:
+        source_page_texts_out.clear()
+
     effective_policy = _normalize_hybrid_policy(hybrid_policy)
     default_blend_weight = (
         _HYBRID_SOFT_BLEND_PRIMARY_Y_WEIGHT
@@ -2586,6 +2597,7 @@ def _build_searchable_pdf_from_text(
 
     try:
         for page_idx, source_page in enumerate(reader.pages):
+            drawn_page_lines: list[str] = []
             # Important: first clone page into writer, then mutate the clone.
             # Mutating reader page objects in-place can leak resource changes
             # into sibling pages that share inherited resource dictionaries.
@@ -2775,11 +2787,14 @@ def _build_searchable_pdf_from_text(
                     page_height=page_height,
                     placements=placements,
                     font_name=font_name,
+                    drawn_text_out=drawn_page_lines,
                 )
                 if abs(crop_x0) > 1e-6 or abs(crop_y0) > 1e-6:
                     target_page.merge_translated_page(overlay_page, crop_x0, crop_y0)
                 else:
                     target_page.merge_page(overlay_page)
+            if source_page_texts_out is not None:
+                source_page_texts_out.append("\n".join(drawn_page_lines))
     finally:
         layout_doc.close()
 
@@ -2793,31 +2808,70 @@ def _build_searchable_pdf_from_text(
     return page_count, len(text)
 
 
+def _canonical_exact_page_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 def _validate_searchable_text_retention(
     *,
-    source_text: str,
-    extracted_text: str,
+    source_text: str | None = None,
+    extracted_text: str | None = None,
+    source_page_texts: Sequence[str] | None = None,
+    extracted_page_texts: Sequence[str] | None = None,
+    expected_textless_pages: frozenset[int] = frozenset(),
     expect_empty_text_layer: bool = False,
 ) -> None:
-    source_clean = "\n".join(_split_page_text_lines(source_text))
-    source_chars = len(re.sub(r"\s+", "", source_clean))
-    extracted_chars = len(re.sub(r"\s+", "", extracted_text))
-    if source_chars == 0:
-        if expect_empty_text_layer:
-            if extracted_chars != 0:
-                raise RuntimeError(
-                    "Verified textless-graphics output gained an unexpected text layer."
-                )
-            return
-        if extracted_chars == 0:
-            raise RuntimeError("Output PDF has empty extracted text layer.")
-        return
-    retention = extracted_chars / source_chars
-    if retention < 0.50:
+    if source_page_texts is None:
+        if source_text is None:
+            raise TypeError("source text evidence is required")
+        source_page_texts = ("\n".join(_split_page_text_lines(source_text)),)
+    elif source_text is not None:
+        raise TypeError("provide source_text or source_page_texts, not both")
+    if extracted_page_texts is None:
+        if extracted_text is None:
+            raise TypeError("extracted text evidence is required")
+        extracted_page_texts = (extracted_text,)
+    elif extracted_text is not None:
+        raise TypeError("provide extracted_text or extracted_page_texts, not both")
+
+    source_pages = tuple(str(value) for value in source_page_texts)
+    extracted_pages = tuple(str(value) for value in extracted_page_texts)
+    if len(source_pages) != len(extracted_pages):
         raise RuntimeError(
-            "Output PDF retained too little searchable text: "
-            f"{extracted_chars}/{source_chars} non-whitespace characters ({retention:.1%})."
+            "Output PDF searchable text page cardinality changed: "
+            f"expected {len(source_pages)}, got {len(extracted_pages)}."
         )
+    all_pages = frozenset(range(1, len(source_pages) + 1))
+    if not expected_textless_pages <= all_pages:
+        raise RuntimeError("Verified textless-graphics page set is out of range.")
+    if expect_empty_text_layer:
+        expected_textless_pages = all_pages
+
+    canonical_source = tuple(_canonical_exact_page_text(text) for text in source_pages)
+    canonical_extracted = tuple(_canonical_exact_page_text(text) for text in extracted_pages)
+    if not any(canonical_source) and expected_textless_pages != all_pages:
+        raise RuntimeError("Output PDF has empty extracted text layer.")
+
+    for page_number, (expected, observed) in enumerate(
+        zip(canonical_source, canonical_extracted, strict=True),
+        start=1,
+    ):
+        if page_number in expected_textless_pages:
+            if expected:
+                raise RuntimeError(
+                    f"Verified textless-graphics page {page_number} has nonempty source text."
+                )
+            if observed:
+                raise RuntimeError(
+                    "Verified textless-graphics output gained an unexpected text layer "
+                    f"on page {page_number}."
+                )
+            continue
+        if observed != expected:
+            raise RuntimeError(
+                f"Output PDF page {page_number} failed exact searchable text retention."
+            )
 
 
 def _json_object_or_none(path: Path) -> dict[str, object] | None:
@@ -2880,7 +2934,7 @@ def _textless_geometry_is_valid(path: Path, *, engine: str) -> bool:
     )
 
 
-def _validated_all_textless_graphics_pages(
+def _validated_textless_graphics_pages(
     *,
     reconciliation_root: Path | None,
     compare_dir: Path,
@@ -2930,11 +2984,11 @@ def _validated_all_textless_graphics_pages(
             return frozenset()
         rows[source_page] = raw_row
     expected_pages = frozenset(range(1, len(rows) + 1))
-    if accepted != expected_pages or frozenset(rows) != expected_pages:
+    if not accepted <= expected_pages or frozenset(rows) != expected_pages:
         return frozenset()
 
     def reject_claim(reason: str) -> NoReturn:
-        raise ValueError(f"Verified all-textless graphics evidence is invalid: {reason}")
+        raise ValueError(f"Verified textless-graphics evidence is invalid: {reason}")
 
     identity_payloads: dict[str, dict[str, object]] = {}
     identity_stems: set[str] = set()
@@ -2972,10 +3026,10 @@ def _validated_all_textless_graphics_pages(
     if any(
         not isinstance(result_chars.get(engine), int)
         or isinstance(result_chars.get(engine), bool)
-        or result_chars.get(engine) != 0
+        or int(result_chars[engine]) < 0
         for engine in ("surya", "chandra")
     ):
-        reject_claim("result text counters are nonzero")
+        reject_claim("result text counters are invalid")
     if not isinstance(error_totals, dict) or set(error_totals) != {"surya", "chandra"}:
         reject_claim("reconciled error counters are incomplete")
 
@@ -2987,6 +3041,19 @@ def _validated_all_textless_graphics_pages(
         surya_lines = raw_row.get("surya_alnum_line_count")
         surya_chars = raw_row.get("surya_alnum_chars")
         if (
+            not isinstance(surya_errors, int)
+            or isinstance(surya_errors, bool)
+            or surya_errors < 0
+            or not isinstance(chandra_errors, int)
+            or isinstance(chandra_errors, bool)
+            or chandra_errors < 0
+        ):
+            reject_claim(f"page {source_page} error counters are invalid")
+        computed_errors["surya"] += surya_errors
+        computed_errors["chandra"] += chandra_errors
+        if source_page not in accepted:
+            continue
+        if (
             raw_row.get("accepted") is not True
             or raw_row.get("reason") != "explicit_chandra_nontext_with_quiet_surya"
             or raw_row.get("chandra_outcome") != "explicit_nontext"
@@ -2997,16 +3064,8 @@ def _validated_all_textless_graphics_pages(
             or not isinstance(surya_chars, int)
             or isinstance(surya_chars, bool)
             or not 0 <= surya_chars <= 8
-            or not isinstance(surya_errors, int)
-            or isinstance(surya_errors, bool)
-            or surya_errors < 0
-            or not isinstance(chandra_errors, int)
-            or isinstance(chandra_errors, bool)
-            or chandra_errors < 0
         ):
             reject_claim(f"page {source_page} reconciliation row is inconsistent")
-        computed_errors["surya"] += surya_errors
-        computed_errors["chandra"] += chandra_errors
     if any(
         not isinstance(error_totals.get(engine), int)
         or isinstance(error_totals.get(engine), bool)
@@ -3016,12 +3075,14 @@ def _validated_all_textless_graphics_pages(
         reject_claim("reconciled error counters disagree with page rows")
 
     marker_pages = tuple(int(match.group(1)) for match in _PAGE_MARKER_RE.finditer(artifact_text))
-    if (
-        len(marker_pages) != len(set(marker_pages))
-        or frozenset(marker_pages) != expected_pages
-        or _split_page_text_lines(artifact_text)
+    if len(marker_pages) != len(set(marker_pages)) or frozenset(marker_pages) != expected_pages:
+        reject_claim("the selected artifact marker map is not exact")
+    artifact_page_texts = _split_text_to_pages(artifact_text, len(expected_pages))
+    if any(
+        _canonical_exact_page_text(artifact_page_texts[page_number - 1])
+        for page_number in accepted
     ):
-        reject_claim("the selected artifact is not exact marker-only text")
+        reject_claim("an accepted textless-graphics page has selected artifact text")
     try:
         artifact_bytes = artifact_path.read_bytes()
     except OSError:
@@ -3050,8 +3111,11 @@ def _validated_all_textless_graphics_pages(
             engine_pdf_path = str(resolved_evidence_pdf)
         elif engine_pdf_path != str(resolved_evidence_pdf):
             reject_claim("engine source PDF identities disagree")
+        declared_total_chars = pages_payload.get("total_text_chars")
         if (
-            not _is_exact_zero(pages_payload.get("total_text_chars"))
+            not isinstance(declared_total_chars, int)
+            or isinstance(declared_total_chars, bool)
+            or declared_total_chars < 0
             or pages_payload.get("aggregate_has_page_markers") is not True
         ):
             reject_claim(f"{engine} text counters or aggregate marker seal are invalid")
@@ -3071,6 +3135,7 @@ def _validated_all_textless_graphics_pages(
         if not isinstance(engine_rows_raw, list) or len(engine_rows_raw) != len(expected_pages):
             reject_claim(f"{engine} pages index is not complete")
         engine_pages: set[int] = set()
+        computed_text_chars = 0
         for raw_row in engine_rows_raw:
             if not isinstance(raw_row, dict):
                 reject_claim(f"{engine} pages index contains a non-object row")
@@ -3079,12 +3144,33 @@ def _validated_all_textless_graphics_pages(
                 not isinstance(source_page, int)
                 or isinstance(source_page, bool)
                 or source_page in engine_pages
+                or source_page not in expected_pages
             ):
                 reject_claim(f"{engine} pages index contains an invalid page identity")
             engine_pages.add(source_page)
+            page_text = _owned_exact_evidence_file(
+                engine_dir,
+                raw_row.get("file"),
+                f"page_{source_page:04d}.txt",
+            )
+            if page_text is None:
+                reject_claim(f"{engine} page {source_page} text evidence is incomplete")
+            try:
+                page_text_value = page_text.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                reject_claim(f"{engine} page {source_page} text artifact is unreadable")
+            row_text_chars = raw_row.get("text_chars")
             if (
-                not _is_exact_zero(raw_row.get("text_chars"))
-                or raw_row.get("ocr_outcome") != "textless_graphics"
+                not isinstance(row_text_chars, int)
+                or isinstance(row_text_chars, bool)
+                or row_text_chars != len(page_text_value)
+            ):
+                reject_claim(f"{engine} page {source_page} text counter changed")
+            computed_text_chars += row_text_chars
+            if source_page not in accepted:
+                continue
+            if (
+                raw_row.get("ocr_outcome") != "textless_graphics"
                 or raw_row.get("page_errors") != []
                 or raw_row.get("textless_graphics") is not True
                 or raw_row.get("accepted_by") != "mode_both_page_reconciliation"
@@ -3093,27 +3179,23 @@ def _validated_all_textless_graphics_pages(
                 or (engine == "chandra" and raw_row.get("explicit_nontext") is not True)
             ):
                 reject_claim(f"{engine} page {source_page} published evidence is inconsistent")
-            page_text = _owned_exact_evidence_file(
-                engine_dir,
-                raw_row.get("file"),
-                f"page_{source_page:04d}.txt",
-            )
             geometry = _owned_exact_evidence_file(
                 engine_dir,
                 raw_row.get("geometry_file"),
                 f"page_{source_page:04d}.{engine}.json",
             )
-            if page_text is None or geometry is None:
+            if geometry is None:
                 reject_claim(f"{engine} page {source_page} owned evidence is incomplete")
-            try:
-                if page_text.read_bytes() != b"":
-                    reject_claim(f"{engine} page {source_page} text artifact is not empty")
-            except OSError:
-                reject_claim(f"{engine} page {source_page} text artifact is unreadable")
+            if page_text_value != "":
+                reject_claim(f"{engine} page {source_page} text artifact is not empty")
             if not _textless_geometry_is_valid(geometry, engine=engine):
                 reject_claim(f"{engine} page {source_page} geometry evidence is invalid")
         if frozenset(engine_pages) != expected_pages:
             reject_claim(f"{engine} pages index is not contiguous")
+        if declared_total_chars != computed_text_chars:
+            reject_claim(f"{engine} total text counter disagrees with page artifacts")
+        if result_chars[engine] != computed_text_chars:
+            reject_claim(f"{engine} reconciliation text counter disagrees with page artifacts")
 
     try:
         import fitz
@@ -3125,7 +3207,10 @@ def _validated_all_textless_graphics_pages(
         raise
     except Exception as exc:
         reject_claim(f"the source PDF is unreadable: {exc}")
-    return expected_pages
+    return accepted
+
+
+_validated_all_textless_graphics_pages = _validated_textless_graphics_pages
 
 
 def _validate_textless_visual_retention(
@@ -3140,8 +3225,12 @@ def _validate_textless_visual_retention(
         with fitz.open(str(source_pdf)) as source_document, fitz.open(
             str(candidate_pdf)
         ) as candidate_document:
-            expected = frozenset(range(1, source_document.page_count + 1))
-            if expected_pages != expected or candidate_document.page_count != source_document.page_count:
+            all_pages = frozenset(range(1, source_document.page_count + 1))
+            if (
+                not expected_pages
+                or not expected_pages <= all_pages
+                or candidate_document.page_count != source_document.page_count
+            ):
                 raise RuntimeError("Textless-graphics output page count changed.")
             matrix = fitz.Matrix(1.0, 1.0)
             for page_number in sorted(expected_pages):
@@ -3354,7 +3443,7 @@ def run_artifact_searchable_package(
                     "TXT artifact has no explicit page markers. "
                     "Expected '[SOURCE PAGE N]' blocks or form-feed separators."
                 )
-            expected_textless_pages = _validated_all_textless_graphics_pages(
+            expected_textless_pages = _validated_textless_graphics_pages(
                 reconciliation_root=reconciliation_root,
                 compare_dir=resolved_compare,
                 artifact_path=artifact_path,
@@ -3395,16 +3484,26 @@ def run_artifact_searchable_package(
                         warnings=result_warnings,
                     )
             if expected_textless_pages:
-                # Marker-only verified graphics need no overlay. Keeping geometry
-                # disabled makes the builder clone each source page byte-structure
-                # without normalizing /Rotate or merging an empty content stream.
-                surya_geometry_by_page = None
-                fallback_geometry_by_page = None
+                # Accepted graphics pages must be cloned untouched, while mixed
+                # documents retain geometry on their ordinary text pages.
+                if surya_geometry_by_page:
+                    surya_geometry_by_page = {
+                        page: value
+                        for page, value in surya_geometry_by_page.items()
+                        if page not in expected_textless_pages
+                    }
+                if fallback_geometry_by_page:
+                    fallback_geometry_by_page = {
+                        page: value
+                        for page, value in fallback_geometry_by_page.items()
+                        if page not in expected_textless_pages
+                    }
             geometry_debug_rows: list[dict[str, object]] | None = [] if (debug_enabled and engine == "chandra") else None
             out_pdf = resolved_output / document / f"{document}__{engine}_searchable.pdf"
             candidate_pdf = out_pdf.with_name(
                 f".{out_pdf.name}.{uuid.uuid4().hex}.candidate"
             )
+            overlay_page_texts: list[str] = []
             page_count, text_chars = _build_searchable_pdf_from_text(
                 source_pdf=source_pdf_for_build,
                 text=text,
@@ -3416,8 +3515,20 @@ def run_artifact_searchable_package(
                 blend_primary_y_weight=blend_weight,
                 geometry_debug_rows=geometry_debug_rows,
                 warnings=result_warnings,
+                source_page_texts_out=overlay_page_texts,
             )
-            extracted = _extract_pdf_text(candidate_pdf)
+            if len(overlay_page_texts) != page_count:
+                overlay_page_texts = _split_text_to_pages(text, page_count)
+            native_page_texts = _extract_pdf_page_texts(source_pdf_for_build)
+            extracted_page_texts = _extract_pdf_page_texts(candidate_pdf)
+            if len(native_page_texts) != page_count:
+                raise RuntimeError("Source PDF text page cardinality changed during build.")
+            expected_output_page_texts = [
+                native_text + overlay_text
+                for native_text, overlay_text in zip(
+                    native_page_texts, overlay_page_texts, strict=True
+                )
+            ]
             if expected_textless_pages:
                 _validate_textless_visual_retention(
                     source_pdf=source_pdf_for_build,
@@ -3425,13 +3536,13 @@ def run_artifact_searchable_package(
                     expected_pages=expected_textless_pages,
                 )
             _validate_searchable_text_retention(
-                source_text=text,
-                extracted_text=extracted,
-                expect_empty_text_layer=bool(expected_textless_pages),
+                source_page_texts=expected_output_page_texts,
+                extracted_page_texts=extracted_page_texts,
+                expected_textless_pages=expected_textless_pages,
             )
             if expected_textless_pages:
                 result_warnings.append(
-                    "empty text layer accepted from verified all-textless graphics evidence"
+                    "empty text layer accepted on verified textless-graphics page(s)"
                 )
 
             geometry_log_path: Path | None = None

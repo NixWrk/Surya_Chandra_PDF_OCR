@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 import uuid
 
 import pytest
+from PIL import Image, ImageOps
 
 from uniscan.app import ocr_pipeline
 from uniscan.app.ocr_pipeline import (
@@ -19,6 +21,7 @@ from uniscan.app.ocr_pipeline import (
     run_basic_ocr_benchmark,
 )
 from uniscan.ocr import ArtifactSearchableResult, CompareTxtBuildResult, OcrBenchmarkResult
+import uniscan.ocr.benchmark as ocr_benchmark
 
 
 def _ok_compare_result(engine: str, compare_path: Path) -> CompareTxtBuildResult:
@@ -55,6 +58,204 @@ def _ok_benchmark_result(engine: str) -> OcrBenchmarkResult:
     )
 
 
+def _fixture_source_raster_identity(
+    source_page: int,
+    source_image: Image.Image,
+) -> dict[str, object]:
+    image = source_image.convert("RGB")
+    return {
+        "pixel_sha256": ocr_benchmark._canonical_rgb_pixel_sha256(image),
+        "width": image.width,
+        "height": image.height,
+        "name": f"{source_page:05d}.png",
+        "source_page": source_page,
+        "verified_blank": ocr_benchmark._is_effectively_blank_rgb_image(image),
+    }
+
+
+def _write_fixture_source_raster_artifact(
+    *,
+    engine_dir: Path,
+    source_page: int,
+    engine: str,
+    source_image: Image.Image,
+) -> dict[str, object]:
+    source_path = engine_dir / f"page_{source_page:04d}.{engine}-source" / "source.png"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_image.convert("RGB").save(source_path, format="PNG")
+    return {
+        "path": str(source_path.resolve()),
+        "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "bytes": source_path.stat().st_size,
+    }
+
+
+def _chandra_attempt_one(
+    text: str,
+    *,
+    source_raster_identity: dict[str, object],
+) -> dict[str, object]:
+    canonical = "".join(char for char in text.casefold() if char.isalnum())
+    return {
+        "explicit_nontext": False,
+        "chandra_non_text_labels": [],
+        "attempt_count": 1,
+        "terminal_attempt": 1,
+        "selected_attempt": 1,
+        "chandra_retry_policy": (
+            "ocr-layout-original+ocr-layout-autocontrast-cutoff-1+ocr-original-max3-v1"
+        ),
+        "attempts": [
+            {
+                "attempt": 1,
+                "source_raster_identity": dict(source_raster_identity),
+                "prompt_type": "ocr_layout",
+                "prompt_sha256": (
+                    "025935f3e1de1acdfadd4c7d581ab17eb82e8caaffef7b64962621c80b7ca9a8"
+                ),
+                "preprocessing": "original",
+                "content_filter_policy": "skip-graphic-labels-v1",
+                "alternative_text_evidence": ocr_benchmark._chandra_alternative_text_evidence(
+                    raw_result={"html": "", "markdown": ""},
+                    texts=[],
+                    ignored_graphic_lines=[],
+                ),
+                "labels": ["text"],
+                "text_chars": len(text),
+                "canonical_alnum_chars": len(canonical),
+                "canonical_alnum_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                "geometry_lines": 1,
+                "explicit_nontext": False,
+                "ocr_outcome": "text",
+            }
+        ],
+    }
+
+
+def _write_chandra_attempt_one_artifact(
+    *,
+    engine_dir: Path,
+    source_page: int,
+    text: str,
+    evidence: dict[str, object],
+    source_raster_identity: dict[str, object],
+    source_image: Image.Image,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    attempt_dir = engine_dir / f"page_{source_page:04d}.chandra-attempts" / "attempt_1"
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    image_path = attempt_dir / "input.png"
+    source_image = source_image.convert("RGB")
+    source_width, source_height = source_image.size
+    if min(source_width, source_height) < ocr_benchmark._CHANDRA_MIN_IMAGE_DIM:
+        scale = ocr_benchmark._CHANDRA_MIN_IMAGE_DIM / float(min(source_width, source_height))
+        model_size = (int(source_width * scale), int(source_height * scale))
+    else:
+        model_size = source_image.size
+    attempt_image = (
+        source_image.copy()
+        if model_size == source_image.size
+        else source_image.resize(model_size, Image.Resampling.LANCZOS)
+    )
+    attempt_image.save(image_path, format="PNG")
+    source_path = engine_dir / f"page_{source_page:04d}.chandra-source" / "source.png"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_image.save(source_path, format="PNG")
+    source_artifact = {
+        "path": str(source_path.resolve()),
+        "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "bytes": source_path.stat().st_size,
+    }
+    line = {"text": text, "bbox": [0.0, 0.0, 80.0, 10.0]}
+    sidecar_path = attempt_dir / "chandra_attempt.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "schema": "uniscan.chandra-attempt.v2",
+                "source_raster_identity": dict(source_raster_identity),
+                "image_name": "input.png",
+                "image_bbox": [0.0, 0.0, float(model_size[0]), float(model_size[1])],
+                "raw_result": {
+                    "error": False,
+                    "chunks": [
+                        {
+                            "label": "Text",
+                            "content": text,
+                            "bbox": [0.0, 0.0, 80.0, 10.0],
+                        }
+                    ],
+                    "html": "",
+                    "markdown": "",
+                },
+                "parsed": {"texts": [text], "text_lines": [line], "labels": ["text"]},
+                "evidence": evidence,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return [
+        {
+            "attempt": 1,
+            "image_size": [model_size[0], model_size[1]],
+            "image_path": str(image_path.resolve()),
+            "image_sha256": hashlib.sha256(image_path.read_bytes()).hexdigest(),
+            "image_bytes": image_path.stat().st_size,
+            "sidecar_path": str(sidecar_path.resolve()),
+            "sidecar_sha256": hashlib.sha256(sidecar_path.read_bytes()).hexdigest(),
+            "sidecar_bytes": sidecar_path.stat().st_size,
+        }
+    ], source_artifact
+
+
+def _write_surya_attempt_one_artifact(
+    *,
+    engine_dir: Path,
+    source_page: int,
+    text: str,
+    source_raster_identity: dict[str, object],
+    source_image: Image.Image,
+) -> list[dict[str, object]]:
+    attempt_dir = engine_dir / f"page_{source_page:04d}.retry" / "attempt_1"
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    image_path = attempt_dir / str(source_raster_identity["name"])
+    source_image.convert("RGB").save(image_path, format="PNG")
+    sidecar_path = attempt_dir / "surya_page_lines.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "execution_path": "module",
+                "images": [
+                    {
+                        "image_name": image_path.name,
+                        "ocr_outcome": "text",
+                        "attempt_count": 1,
+                        "pages": [
+                            {
+                                "image_bbox": [0, 0, source_image.width, source_image.height],
+                                "text_lines": [{"text": text, "bbox": [0, 0, 80, 10]}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return [
+        {
+            "attempt": 1,
+            "preprocessing": "original",
+            "ocr_outcome": "text",
+            "image_size": [source_image.width, source_image.height],
+            "image_path": str(image_path.resolve()),
+            "image_sha256": hashlib.sha256(image_path.read_bytes()).hexdigest(),
+            "image_bytes": image_path.stat().st_size,
+            "sidecar_path": str(sidecar_path.resolve()),
+            "sidecar_sha256": hashlib.sha256(sidecar_path.read_bytes()).hexdigest(),
+            "sidecar_bytes": sidecar_path.stat().st_size,
+        }
+    ]
+
+
 def _new_test_dir() -> Path:
     root = Path.cwd() / "outputs" / "_pytest_tmp"
     root.mkdir(parents=True, exist_ok=True)
@@ -85,38 +286,53 @@ def _write_complete_hybrid_summary(
     run_dir: Path,
     output_pdf: Path | None = None,
     include_retry: bool = False,
+    delete_original_text_layer: bool = False,
 ) -> SearchablePdfSummary:
     import fitz
 
     chunk_pdf = chunk_pdf.resolve()
     run_dir = run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    artifact_source = run_dir.parent / "_source_pdf_without_text_fixture" / chunk_pdf.name
-    artifact_source.parent.mkdir(parents=True, exist_ok=True)
-    if not artifact_source.exists():
-        shutil.copy2(chunk_pdf, artifact_source)
-    artifact_source = artifact_source.resolve()
+    artifact_source = chunk_pdf
+    if delete_original_text_layer:
+        artifact_source = (
+            run_dir.parent / "_source_pdf_without_text_fixture" / chunk_pdf.name
+        ).resolve()
+        ocr_pipeline._build_textless_source_pdf(
+            source_pdf=chunk_pdf,
+            out_pdf=artifact_source,
+            dpi=ocr_pipeline._resolve_textless_dpi(),
+        )
     compare_dir = run_dir / "_compare_txt"
     compare_dir.mkdir(parents=True, exist_ok=True)
     if output_pdf is None:
         output_pdf = run_dir / "result.pdf"
     output_pdf = output_pdf.resolve()
-    shutil.copy2(chunk_pdf, output_pdf)
     document = fitz.open(str(chunk_pdf))
     try:
         page_count = int(document.page_count)
     finally:
         document.close()
     local_pages = list(range(1, page_count + 1))
-    reconciliation = run_dir / "page_reconciliation.json"
-    reconciliation.write_text(
-        json.dumps({"schema": "uniscan.page-reconciliation.v1", "status": "ok"}),
-        encoding="utf-8",
+    rendered_dir = run_dir / "_fixture_source_renders"
+    rendered_dir.mkdir(parents=True, exist_ok=True)
+    rendered_paths = ocr_benchmark._render_sample_paths(
+        artifact_source,
+        list(range(page_count)),
+        dpi=ocr_pipeline._resolve_ocr_render_dpi(),
+        tmp_dir=rendered_dir,
     )
+    source_images: list[Image.Image] = []
+    for rendered_path in rendered_paths:
+        with Image.open(rendered_path) as rendered:
+            rendered.load()
+            source_images.append(rendered.convert("RGB").copy())
+    reconciliation = run_dir / "page_reconciliation.json"
 
     benchmark_results: list[OcrBenchmarkResult] = []
     result_files: list[Path] = []
     benchmark_artifacts: dict[str, Path] = {}
+    engine_text_chars: dict[str, int] = {}
     for engine in ("chandra", "surya"):
         output_dir = run_dir / engine
         engine_dir = output_dir / engine
@@ -125,36 +341,96 @@ def _write_complete_hybrid_summary(
         aggregate_blocks: list[str] = []
         for source_page in local_pages:
             text = f"{engine.upper()} PAGE {source_page}"
-            text_path = engine_dir / f"page_{source_page:04d}.txt"
-            text_path.write_text(text, encoding="utf-8")
-            geometry_path = engine_dir / f"page_{source_page:04d}.{engine}.json"
-            geometry_path.write_text(
-                json.dumps(
-                    {
-                        "images": [
-                            {
-                                "image_name": f"page_{source_page:04d}.png",
-                                "ocr_outcome": "text",
-                                "pages": [
-                                    {
-                                        "image_bbox": [0, 0, 100, 100],
-                                        "text_lines": [{"text": text, "bbox": [0, 0, 80, 10]}],
-                                    }
-                                ],
-                            }
-                        ]
-                    }
-                ),
-                encoding="utf-8",
+            if include_retry and engine == "surya" and source_page == 1:
+                text = f"CHANDRA PAGE {source_page}"
+            source_image = source_images[source_page - 1]
+            source_raster_identity = _fixture_source_raster_identity(
+                source_page,
+                source_image,
             )
+            source_raster_artifact = _write_fixture_source_raster_artifact(
+                engine_dir=engine_dir,
+                source_page=source_page,
+                engine=engine,
+                source_image=source_image,
+            )
+            text_path = engine_dir / f"page_{source_page:04d}.txt"
+            text_path.write_bytes(text.encode("utf-8"))
+            geometry_path = engine_dir / f"page_{source_page:04d}.{engine}.json"
+            image_evidence: dict[str, object] = {
+                "image_name": str(source_raster_identity["name"]),
+                "source_raster_identity": source_raster_identity,
+                "source_raster_artifact": source_raster_artifact,
+                "ocr_outcome": "text",
+                "pages": [
+                    {
+                        "image_bbox": [0, 0, source_image.width, source_image.height],
+                        "ocr_outcome": "text",
+                        "text_lines": [{"text": text, "bbox": [0, 0, 80, 10]}],
+                    }
+                ],
+            }
+            if engine == "chandra":
+                chandra_fields = _chandra_attempt_one(
+                    text,
+                    source_raster_identity=source_raster_identity,
+                )
+                attempt_history, source_raster_artifact = _write_chandra_attempt_one_artifact(
+                    engine_dir=engine_dir,
+                    source_page=source_page,
+                    text=text,
+                    evidence=chandra_fields["attempts"][0],
+                    source_raster_identity=source_raster_identity,
+                    source_image=source_image,
+                )
+                chandra_fields["attempt_history"] = attempt_history
+                chandra_fields["source_raster_artifact"] = source_raster_artifact
+                image_evidence.update(chandra_fields)
+                image_evidence["pages"][0]["image_bbox"] = [
+                    0,
+                    0,
+                    *attempt_history[-1]["image_size"],
+                ]
+            else:
+                chandra_fields = None
             row: dict[str, object] = {
                 "source_page": source_page,
+                "source_raster_identity": source_raster_identity,
+                "source_raster_artifact": source_raster_artifact,
                 "file": text_path.name,
                 "geometry_file": geometry_path.name,
                 "ocr_outcome": "text",
+                "text_chars": len(text),
             }
             if engine == "surya":
                 row["attempt_count"] = 1
+                image_evidence["attempt_count"] = 1
+                if not (include_retry and source_page == 1):
+                    attempt_history = _write_surya_attempt_one_artifact(
+                        engine_dir=engine_dir,
+                        source_page=source_page,
+                        text=text,
+                        source_raster_identity=source_raster_identity,
+                        source_image=source_image,
+                    )
+                    attempt_fields: dict[str, object] = {
+                        "retry_policy": (
+                            "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+                        ),
+                        "selected_attempt": 1,
+                        "attempt_history": attempt_history,
+                    }
+                    row.update(attempt_fields)
+                    image_evidence.update(attempt_fields)
+            else:
+                assert chandra_fields is not None
+                row.update(
+                    {
+                        key: value
+                        for key, value in chandra_fields.items()
+                        if key not in {"attempts", "chandra_non_text_labels"}
+                    }
+                )
             if include_retry and engine == "surya" and source_page == 1:
                 retry_history: list[dict[str, object]] = []
                 preprocessings = (
@@ -162,61 +438,155 @@ def _write_complete_hybrid_summary(
                     "autocontrast-cutoff-1",
                     "rgb-scale-0.5-center-white-lanczos-v1",
                 )
-                for attempt, preprocessing in enumerate(preprocessings, start=1):
+                source_image = source_images[0].copy()
+                autocontrast_image = ImageOps.autocontrast(source_image, cutoff=1)
+                content_size = (
+                    max(1, round(source_image.width * 0.5)),
+                    max(1, round(source_image.height * 0.5)),
+                )
+                content_offset = (
+                    (source_image.width - content_size[0]) // 2,
+                    (source_image.height - content_size[1]) // 2,
+                )
+                scaled_content = source_image.resize(content_size, Image.Resampling.LANCZOS)
+                scaled_image = Image.new("RGB", source_image.size, color=(255, 255, 255))
+                scaled_image.paste(scaled_content, content_offset)
+                scaled_line_bbox = [
+                    float(content_offset[0]),
+                    float(content_offset[1]),
+                    float(content_offset[0])
+                    + (80.0 * float(content_size[0]) / float(source_image.width)),
+                    float(content_offset[1])
+                    + (10.0 * float(content_size[1]) / float(source_image.height)),
+                ]
+                image_evidence["pages"][0]["text_lines"][0]["bbox"] = [
+                    0.0,
+                    0.0,
+                    (scaled_line_bbox[2] - float(content_offset[0]))
+                    * float(source_image.width)
+                    / float(content_size[0]),
+                    (scaled_line_bbox[3] - float(content_offset[1]))
+                    * float(source_image.height)
+                    / float(content_size[1]),
+                ]
+                retry_images = (source_image, autocontrast_image, scaled_image)
+                for attempt, (preprocessing, retry_payload) in enumerate(
+                    zip(preprocessings, retry_images, strict=True),
+                    start=1,
+                ):
                     retry_dir = engine_dir / "page_0001.retry" / f"attempt_{attempt}"
                     retry_dir.mkdir(parents=True)
-                    retry_image = retry_dir / "page_0001.png"
-                    retry_image.write_bytes(f"durable retry png evidence {attempt}".encode())
+                    retry_image = retry_dir / "00001.png"
+                    retry_payload.save(retry_image, format="PNG")
                     retry_sidecar = retry_dir / "surya_page_lines.json"
+                    attempt_outcome = "text" if attempt == 3 else "zero_output"
                     retry_sidecar.write_text(
-                        json.dumps({"images": [{"image_name": retry_image.name}]}),
+                        json.dumps(
+                            {
+                                "execution_path": "module",
+                                "images": [
+                                    {
+                                        "image_name": retry_image.name,
+                                        "ocr_outcome": attempt_outcome,
+                                        "attempt_count": attempt,
+                                        "pages": [
+                                            {
+                                                "image_bbox": [0, 0, *source_image.size],
+                                                "text_lines": (
+                                                    [
+                                                        {
+                                                            "text": text,
+                                                            "bbox": scaled_line_bbox,
+                                                        }
+                                                    ]
+                                                    if attempt == 3
+                                                    else []
+                                                ),
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ),
                         encoding="utf-8",
                     )
-                    retry_history.append(
-                        {
-                            "attempt": attempt,
-                            "preprocessing": preprocessing,
-                            "image_path": str(retry_image.resolve()),
-                            "sidecar_path": str(retry_sidecar.resolve()),
-                        }
-                    )
-                row.update(
-                    {
-                        "attempt_count": 3,
-                        "retry_preprocessing": "rgb-scale-0.5-center-white-lanczos-v1",
-                        "retry_policy": (
-                            "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
-                        ),
-                        "selected_attempt": 3,
-                        "attempt_history": retry_history,
+                    if attempt > 1:
+                        retry_payload_json = json.loads(retry_sidecar.read_text(encoding="utf-8"))
+                        retry_payload_json["images"][0]["retry_preprocessing"] = preprocessing
+                        retry_sidecar.write_text(
+                            json.dumps(retry_payload_json),
+                            encoding="utf-8",
+                        )
+                    history_item: dict[str, object] = {
+                        "attempt": attempt,
+                        "preprocessing": preprocessing,
+                        "ocr_outcome": attempt_outcome,
+                        "image_size": list(source_image.size),
+                        "image_path": str(retry_image.resolve()),
+                        "image_sha256": hashlib.sha256(retry_image.read_bytes()).hexdigest(),
+                        "image_bytes": retry_image.stat().st_size,
+                        "sidecar_path": str(retry_sidecar.resolve()),
+                        "sidecar_sha256": hashlib.sha256(retry_sidecar.read_bytes()).hexdigest(),
+                        "sidecar_bytes": retry_sidecar.stat().st_size,
                     }
-                )
+                    if attempt == 3:
+                        history_item.update(
+                            {
+                                "content_scale": 0.5,
+                                "content_size": list(content_size),
+                                "content_offset": list(content_offset),
+                                "resampling": "lanczos",
+                                "canvas_fill_rgb": [255, 255, 255],
+                            }
+                        )
+                    retry_history.append(history_item)
+                retry_fields: dict[str, object] = {
+                    "attempt_count": 3,
+                    "retry_preprocessing": "rgb-scale-0.5-center-white-lanczos-v1",
+                    "retry_policy": (
+                        "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+                    ),
+                    "selected_attempt": 3,
+                    "attempt_history": retry_history,
+                    "geometry_coordinate_space": "source-image-v1",
+                    "geometry_transform": "inverse-actual-content-size-strict-v1",
+                }
+                row.update(retry_fields)
+                image_evidence.update(retry_fields)
+            geometry_path.write_text(
+                json.dumps({"images": [image_evidence]}),
+                encoding="utf-8",
+            )
             page_rows.append(row)
             aggregate_blocks.extend([f"[SOURCE PAGE {source_page:04d}]", text, ""])
         aggregate_path = engine_dir / "all_pages.txt"
         aggregate_text = "\n".join(aggregate_blocks).strip() + "\n"
-        aggregate_path.write_text(aggregate_text, encoding="utf-8")
+        aggregate_path.write_bytes(aggregate_text.encode("utf-8"))
         pages_path = engine_dir / "pages.json"
         pages_path.write_text(
             json.dumps(
                 {
+                    "pdf_path": str(artifact_source),
                     "engine": engine,
                     "pages": page_rows,
+                    "total_text_chars": sum(int(row["text_chars"]) for row in page_rows),
                     "aggregate_file": aggregate_path.name,
+                    "aggregate_has_page_markers": True,
                 }
             ),
             encoding="utf-8",
         )
         artifact_path = output_dir / f"document_{engine}.txt"
-        artifact_path.write_text(aggregate_text, encoding="utf-8")
+        artifact_path.write_bytes(aggregate_text.encode("utf-8"))
         benchmark_artifacts[engine] = artifact_path
+        engine_text_chars[engine] = sum(int(row["text_chars"]) for row in page_rows)
         result = OcrBenchmarkResult(
             engine=engine,
             status="ok",
             sample_pages=list(local_pages),
             elapsed_seconds=0.1,
             artifact_path=str(artifact_path),
-            text_chars=len(aggregate_text),
+            text_chars=engine_text_chars[engine],
         )
         benchmark_results.append(result)
         report_path = output_dir / "document_ocr_benchmark.json"
@@ -225,12 +595,55 @@ def _write_complete_hybrid_summary(
             encoding="utf-8",
         )
         result_files.append(report_path)
-    result_files.append(reconciliation)
+    reconciliation_pages: list[dict[str, object]] = []
+    for source_page in local_pages:
+        row: dict[str, object] = {
+            "source_page": source_page,
+            "surya_outcome": "text",
+            "chandra_outcome": "text",
+            "surya_alnum_line_count": None,
+            "surya_alnum_chars": None,
+            "surya_page_error_count": 0,
+            "chandra_page_error_count": 0,
+            "accepted": True,
+            "reason": "both_text",
+        }
+        if include_retry and source_page == 1:
+            canonical = ocr_pipeline._canonical_retry_agreement_text(f"CHANDRA PAGE {source_page}")
+            canonical_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            row.update(
+                {
+                    "reason": "both_text_retry_geometry_agreement",
+                    "retry_text_agreement": {
+                        "algorithm": "nfkc-layout-whitespace-exact-v1",
+                        "matched": True,
+                        "surya_sha256": canonical_sha256,
+                        "chandra_sha256": canonical_sha256,
+                    },
+                }
+            )
+        reconciliation_pages.append(row)
+    reconciliation.write_text(
+        json.dumps(
+            {
+                "schema": "uniscan.page-reconciliation.v1",
+                "status": "ok",
+                "exact_page_bijection": True,
+                "accepted_textless_graphics_pages": [],
+                "unresolved_pages": [],
+                "pages": reconciliation_pages,
+                "reconciled_page_error_counts": {"surya": 0, "chandra": 0},
+                "result_text_chars": dict(engine_text_chars),
+                "reconciliation_original_evidence": {},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     compare_results: list[CompareTxtBuildResult] = []
     for engine in ("chandra", "surya"):
-        compare_path = compare_dir / f"chunk__{engine}.txt"
-        compare_path.write_text(f"{engine} compare", encoding="utf-8")
+        compare_path = compare_dir / f"{chunk_pdf.stem}__{engine}.txt"
+        compare_path.write_bytes(benchmark_artifacts[engine].read_bytes())
         compare_results.append(
             CompareTxtBuildResult(
                 engine=engine,
@@ -239,6 +652,20 @@ def _write_complete_hybrid_summary(
                 compare_txt_path=str(compare_path),
             )
         )
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+    searchable = fitz.open(str(artifact_source))
+    try:
+        for source_page in local_pages:
+            page = searchable[source_page - 1]
+            page.insert_text(
+                (36, 36),
+                f"CHANDRA PAGE {source_page}",
+                fontsize=6,
+                render_mode=3,
+            )
+        searchable.save(str(output_pdf), garbage=4, deflate=True)
+    finally:
+        searchable.close()
     geometry_log = run_dir / "searchable_pdf_final" / "geometry.json"
     geometry_log.parent.mkdir(parents=True, exist_ok=True)
     geometry_log.write_text("{}", encoding="utf-8")
@@ -250,7 +677,7 @@ def _write_complete_hybrid_summary(
         text_artifact_path=str(compare_results[0].compare_txt_path),
         searchable_pdf_path=str(output_pdf),
         page_count=page_count,
-        text_chars=page_count,
+        text_chars=engine_text_chars["chandra"],
         elapsed_seconds=0.01,
         geometry_log_path=str(geometry_log),
     )
@@ -313,6 +740,15 @@ def test_split_and_merge_pdf_chunks_preserves_page_order_and_sizes() -> None:
     )
 
     assert [(chunk.start_page, chunk.end_page) for chunk in chunks] == [(1, 10), (11, 20), (21, 23)]
+    first_fingerprints = [ocr_pipeline._stable_file_fingerprint(chunk.path) for chunk in chunks]
+    repeated_chunks = ocr_pipeline._split_pdf_chunks(
+        source_pdf=source_pdf,
+        output_root=tmp_path / "chunks",
+        pages_per_chunk=10,
+    )
+    assert [
+        ocr_pipeline._stable_file_fingerprint(chunk.path) for chunk in repeated_chunks
+    ] == first_fingerprints
 
     merged_pdf = ocr_pipeline._merge_pdf_chunks(
         source_pdf=source_pdf,
@@ -365,6 +801,7 @@ def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
         return _write_complete_hybrid_summary(
             chunk_pdf=chunk_pdf,
             run_dir=run_dir,
+            delete_original_text_layer=bool(kwargs["delete_original_text_layer"]),
         )
 
     monkeypatch.setattr(ocr_pipeline, "build_searchable_pdf", fake_build_searchable_pdf)
@@ -657,6 +1094,8 @@ def test_reusable_chunk_rejects_tampered_critical_evidence(defect: str) -> None:
         "missing-reconciliation",
         "missing-retry-history",
         "empty-retry-history",
+        "chandra-prompt-tamper",
+        "aggregate-canonical-tamper",
     ],
 )
 def test_complete_chunk_refuses_incomplete_or_out_of_tree_claims(defect: str) -> None:
@@ -687,6 +1126,14 @@ def test_complete_chunk_refuses_incomplete_or_out_of_tree_claims(defect: str) ->
         (summary.run_dir / "chandra" / "chandra" / "page_0001.chandra.json").unlink()
     elif defect == "missing-reconciliation":
         (summary.run_dir / "page_reconciliation.json").unlink()
+    elif defect == "chandra-prompt-tamper":
+        geometry_path = summary.run_dir / "chandra" / "chandra" / "page_0001.chandra.json"
+        geometry_payload = json.loads(geometry_path.read_text(encoding="utf-8"))
+        geometry_payload["images"][0]["attempts"][0]["prompt_sha256"] = "0" * 64
+        geometry_path.write_text(json.dumps(geometry_payload), encoding="utf-8")
+    elif defect == "aggregate-canonical-tamper":
+        aggregate_path = summary.run_dir / "chandra" / "chandra" / "all_pages.txt"
+        aggregate_path.write_bytes(b"[SOURCE PAGE 0001]\nCHANDRA PAGE 1!\n")
     else:
         pages_path = summary.run_dir / "surya" / "surya" / "pages.json"
         pages_payload = json.loads(pages_path.read_text(encoding="utf-8"))
@@ -1077,6 +1524,7 @@ def test_chunked_hybrid_pipeline_records_failed_page_range(
         return _write_complete_hybrid_summary(
             chunk_pdf=chunk_pdf,
             run_dir=Path(str(kwargs["work_root"])) / "run",
+            delete_original_text_layer=bool(kwargs["delete_original_text_layer"]),
         )
 
     monkeypatch.setattr(ocr_pipeline, "build_searchable_pdf", fail_second_chunk)
@@ -1628,3 +2076,481 @@ def test_engine_subprocess_env_maps_surya_gpu_runtime(monkeypatch, tmp_path: Pat
 
     assert env["TORCH_DEVICE"] == "cuda:0"
     assert env["UNISCAN_SURYA_REQUIRE_GPU"] == "1"
+
+
+def test_merge_candidate_validator_runs_before_publish() -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    chunks = ocr_pipeline._split_pdf_chunks(
+        source_pdf=source_pdf,
+        output_root=tmp_path / "chunks",
+        pages_per_chunk=10,
+    )
+    output_pdf = tmp_path / "merged.pdf"
+    validated: list[Path] = []
+
+    def _reject_candidate(candidate: Path) -> None:
+        validated.append(candidate)
+        assert candidate.is_file()
+        assert not output_pdf.exists()
+        raise RuntimeError("candidate mutation rejected")
+
+    with pytest.raises(RuntimeError, match="candidate mutation rejected"):
+        ocr_pipeline._merge_pdf_chunks(
+            source_pdf=source_pdf,
+            chunks=[(chunk, chunk.path) for chunk in chunks],
+            output_pdf=output_pdf,
+            validate_candidate=_reject_candidate,
+        )
+
+    assert len(validated) == 1
+    assert not output_pdf.exists()
+
+
+def test_private_chunk_snapshot_rejects_record_fingerprint_mismatch() -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    target = tmp_path / "snapshots" / "chunk.snapshot.pdf"
+
+    with pytest.raises(RuntimeError, match="fingerprint changed before merge"):
+        ocr_pipeline._stable_snapshot_chunk_output(
+            source=source_pdf,
+            target=target,
+            expected_sha256="0" * 64,
+            expected_size=source_pdf.stat().st_size,
+        )
+
+    assert not target.exists()
+
+
+def test_merge_rejects_source_mutation_after_candidate_validation() -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    chunks = ocr_pipeline._split_pdf_chunks(
+        source_pdf=source_pdf,
+        output_root=tmp_path / "chunks",
+        pages_per_chunk=10,
+    )
+    expected_source = ocr_pipeline._stable_file_fingerprint(source_pdf)
+    output_pdf = tmp_path / "merged.pdf"
+
+    def _mutate_source(_candidate: Path) -> None:
+        source_pdf.write_bytes(b"changed during merge validation")
+
+    with pytest.raises(RuntimeError, match="Source PDF changed during chunk merge"):
+        ocr_pipeline._merge_pdf_chunks(
+            source_pdf=source_pdf,
+            chunks=[(chunk, chunk.path) for chunk in chunks],
+            output_pdf=output_pdf,
+            validate_candidate=_mutate_source,
+            expected_source_fingerprint=expected_source,
+        )
+
+    assert not output_pdf.exists()
+
+
+def test_premerge_rejects_processing_source_changed_after_outer_validation() -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+        delete_original_text_layer=False,
+    )
+    chunk = ocr_pipeline._PdfChunk(1, 1, 1, source_pdf)
+    source_sizes = ocr_pipeline._source_page_sizes(source_pdf)
+    record: dict[str, object] = {}
+    ocr_pipeline._complete_chunk_record(
+        record=record,
+        chunk=chunk,
+        summary=summary,
+        run_dir=tmp_path,
+        source_sizes=source_sizes,
+        delete_original_text_layer=False,
+    )
+    required = ocr_pipeline._required_chunk_evidence(
+        summary=summary,
+        chunk=chunk,
+        run_dir=tmp_path,
+        delete_original_text_layer=False,
+    )
+    source_pdf.write_bytes(source_pdf.read_bytes() + b"\n% mutation after validation\n")
+
+    with pytest.raises(
+        RuntimeError,
+        match="Validated outer semantic evidence changed before merge",
+    ):
+        ocr_pipeline._premerge_chunk_state(
+            chunk=chunk,
+            record=record,
+            summary=summary,
+            required=required,
+            snapshot_root=tmp_path / "snapshots",
+        )
+
+
+def test_chunked_false_mode_preserves_native_and_overlay_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=2)
+
+    def fake_build_searchable_pdf(**kwargs: object) -> SearchablePdfSummary:
+        chunk_pdf = Path(str(kwargs["pdf_path"]))
+        return _write_complete_hybrid_summary(
+            chunk_pdf=chunk_pdf,
+            run_dir=Path(str(kwargs["work_root"])) / "run",
+            delete_original_text_layer=False,
+        )
+
+    monkeypatch.setattr(ocr_pipeline, "build_searchable_pdf", fake_build_searchable_pdf)
+    summary = ocr_pipeline._build_searchable_pdf_chunked(
+        input_path=source_pdf,
+        mode="chandra+surya",
+        lang="rus+eng",
+        work_root=tmp_path / "work",
+        overwrite_target=None,
+        return_bytes=False,
+        strict=True,
+        progress=None,
+        delete_original_text_layer=False,
+        chunk_pages=1,
+        page_count=2,
+    )
+
+    merged_texts = ocr_pipeline._extract_pdf_page_texts(summary.output_pdf_path)
+    assert len(merged_texts) == 2
+    assert "PAGE 1" in merged_texts[0]
+    assert "PAGE 2" in merged_texts[1]
+    assert all("CHANDRA PAGE 1" in text for text in merged_texts)
+
+
+def test_global_graphics_cap_spans_non_ten_page_chunk_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=7)
+
+    def fake_build_searchable_pdf(**kwargs: object) -> SearchablePdfSummary:
+        chunk_pdf = Path(str(kwargs["pdf_path"]))
+        return _write_complete_hybrid_summary(
+            chunk_pdf=chunk_pdf,
+            run_dir=Path(str(kwargs["work_root"])) / "run",
+            delete_original_text_layer=False,
+        )
+
+    def fake_premerge_chunk_state(
+        *,
+        chunk: ocr_pipeline._PdfChunk,
+        record: dict[str, object],
+        summary: SearchablePdfSummary,
+        required: ocr_pipeline._RequiredChunkEvidence,
+        snapshot_root: Path,
+    ) -> tuple[Path, tuple[str, ...], dict[int, dict[str, object]]]:
+        del record, required, snapshot_root
+        local_page_count = chunk.end_page - chunk.start_page + 1
+        global_page = 6 if chunk.index == 1 else 7
+        return (
+            summary.output_pdf_path,
+            tuple("" for _ in range(local_page_count)),
+            {global_page: {"sealed": True}},
+        )
+
+    monkeypatch.setattr(ocr_pipeline, "build_searchable_pdf", fake_build_searchable_pdf)
+    monkeypatch.setattr(ocr_pipeline, "_premerge_chunk_state", fake_premerge_chunk_state)
+
+    with pytest.raises(RuntimeError, match="Global textless-graphics recovery cap exceeded"):
+        ocr_pipeline._build_searchable_pdf_chunked(
+            input_path=source_pdf,
+            mode="chandra+surya",
+            lang="rus+eng",
+            work_root=tmp_path / "work",
+            overwrite_target=None,
+            return_bytes=False,
+            strict=True,
+            progress=None,
+            delete_original_text_layer=False,
+            chunk_pages=6,
+            page_count=7,
+        )
+
+
+def _complete_c2_fixture(
+    source_pdf: Path,
+    summary: SearchablePdfSummary,
+    run_dir: Path,
+    *,
+    delete_original_text_layer: bool = False,
+) -> dict[str, object]:
+    record: dict[str, object] = {}
+    ocr_pipeline._complete_chunk_record(
+        record=record,
+        chunk=ocr_pipeline._PdfChunk(1, 1, 1, source_pdf),
+        summary=summary,
+        run_dir=run_dir,
+        source_sizes=ocr_pipeline._source_page_sizes(source_pdf),
+        delete_original_text_layer=delete_original_text_layer,
+    )
+    return record
+
+
+@pytest.mark.parametrize("delete_original_text_layer", [False, True])
+def test_c2_complete_chunk_accepts_exact_processing_source_derivation(
+    delete_original_text_layer: bool,
+) -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+        delete_original_text_layer=delete_original_text_layer,
+    )
+    record = _complete_c2_fixture(
+        source_pdf,
+        summary,
+        tmp_path,
+        delete_original_text_layer=delete_original_text_layer,
+    )
+    assert record["status"] == "done"
+
+
+@pytest.mark.parametrize(
+    ("fixture_delete", "validation_delete", "message"),
+    [
+        (False, True, "must be textless"),
+        (True, False, "must exactly equal the fresh chunk"),
+    ],
+)
+def test_c2_complete_chunk_rejects_wrong_processing_source_mode(
+    fixture_delete: bool,
+    validation_delete: bool,
+    message: str,
+) -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+        delete_original_text_layer=fixture_delete,
+    )
+    with pytest.raises(RuntimeError, match=message):
+        _complete_c2_fixture(
+            source_pdf,
+            summary,
+            tmp_path,
+            delete_original_text_layer=validation_delete,
+        )
+
+
+@pytest.mark.parametrize("defect", ["pages-source", "render-name"])
+def test_c2_complete_chunk_rejects_unbound_pages_source_evidence(defect: str) -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(chunk_pdf=source_pdf, run_dir=tmp_path / "run")
+    pages_path = summary.run_dir / "surya" / "surya" / "pages.json"
+    pages = json.loads(pages_path.read_text(encoding="utf-8"))
+    assert pages["pages"][0]["source_raster_identity"]["name"] == "00001.png"
+    if defect == "pages-source":
+        alien = tmp_path / "alien.pdf"
+        shutil.copy2(source_pdf, alien)
+        pages["pdf_path"] = str(alien.resolve())
+        message = "pages source PDF disagrees"
+    else:
+        pages["pages"][0]["source_raster_identity"]["name"] = "alien.png"
+        message = "source raster identity is invalid"
+    pages_path.write_text(json.dumps(pages), encoding="utf-8")
+    with pytest.raises(RuntimeError, match=message):
+        _complete_c2_fixture(source_pdf, summary, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("defect", "message"),
+    [
+        ("compare-source", "does not exactly equal its benchmark artifact"),
+        ("artifact-text", "is not the Chandra compare text"),
+        ("compare-bytes", "compare text differs from its benchmark aggregate"),
+    ],
+)
+def test_c2_complete_chunk_rejects_cross_stage_text_binding(
+    defect: str,
+    message: str,
+) -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(chunk_pdf=source_pdf, run_dir=tmp_path / "run")
+    chandra = next(item for item in summary.compare_results if item.engine == "chandra")
+    surya = next(item for item in summary.compare_results if item.engine == "surya")
+    if defect == "compare-source":
+        alien = summary.run_dir / "alien-benchmark.txt"
+        shutil.copy2(Path(str(chandra.source_artifact_path)), alien)
+        summary = replace(
+            summary,
+            compare_results=tuple(
+                replace(item, source_artifact_path=str(alien)) if item.engine == "chandra" else item
+                for item in summary.compare_results
+            ),
+        )
+    elif defect == "artifact-text":
+        summary = replace(
+            summary,
+            artifact_results=(
+                replace(
+                    summary.artifact_results[0],
+                    text_artifact_path=str(surya.compare_txt_path),
+                ),
+            ),
+        )
+    else:
+        compare_path = Path(str(chandra.compare_txt_path))
+        payload = compare_path.read_bytes()
+        compare_path.write_bytes(b"X" + payload[1:])
+    with pytest.raises(RuntimeError, match=message):
+        _complete_c2_fixture(source_pdf, summary, tmp_path)
+
+
+def test_c2_complete_chunk_rejects_same_length_wrong_hidden_text() -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(chunk_pdf=source_pdf, run_dir=tmp_path / "run")
+    wrong_output = summary.run_dir / "wrong-hidden-text.pdf"
+    document = fitz.open(str(source_pdf))
+    try:
+        document[0].insert_text((36, 36), "CHANDRA PAGE X", fontsize=6, render_mode=3)
+        document.save(str(wrong_output), garbage=4, deflate=True)
+    finally:
+        document.close()
+    assert len(ocr_pipeline._extract_pdf_page_texts(wrong_output)[0]) == len(
+        ocr_pipeline._extract_pdf_page_texts(summary.output_pdf_path)[0]
+    )
+    summary = replace(
+        summary,
+        output_pdf_path=wrong_output,
+        artifact_results=(
+            replace(summary.artifact_results[0], searchable_pdf_path=str(wrong_output)),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="failed exact searchable text retention"):
+        _complete_c2_fixture(source_pdf, summary, tmp_path)
+
+
+def test_c2_complete_chunk_rejects_unaccounted_chandra_alternative_text() -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(chunk_pdf=source_pdf, run_dir=tmp_path / "run")
+    engine_dir = summary.run_dir / "chandra" / "chandra"
+    pages_path = engine_dir / "pages.json"
+    pages = json.loads(pages_path.read_text(encoding="utf-8"))
+    row = pages["pages"][0]
+    geometry_path = engine_dir / str(row["geometry_file"])
+    geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+    image = geometry["images"][0]
+    sidecar_path = Path(str(row["attempt_history"][0]["sidecar_path"]))
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["raw_result"]["html"] = "ALIEN ALTERNATIVE TEXT"
+    alternative = ocr_benchmark._chandra_alternative_text_evidence(
+        raw_result=sidecar["raw_result"],
+        texts=["CHANDRA PAGE 1"],
+        ignored_graphic_lines=[],
+    )
+    assert alternative["accounting"] == "unaccounted"
+    sidecar["evidence"]["alternative_text_evidence"] = alternative
+    image["attempts"][0]["alternative_text_evidence"] = alternative
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    fingerprint = ocr_pipeline._stable_file_fingerprint(sidecar_path)
+    for history in (row["attempt_history"], image["attempt_history"]):
+        history[0]["sidecar_sha256"] = fingerprint["sha256"]
+        history[0]["sidecar_bytes"] = fingerprint["size"]
+    geometry_path.write_text(json.dumps(geometry), encoding="utf-8")
+    pages_path.write_text(json.dumps(pages), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="unaccounted alternative text"):
+        _complete_c2_fixture(source_pdf, summary, tmp_path)
+
+
+def test_c2_complete_chunk_rejects_bool_retry_history_size() -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(
+        chunk_pdf=source_pdf,
+        run_dir=tmp_path / "run",
+        include_retry=True,
+    )
+    engine_dir = summary.run_dir / "surya" / "surya"
+    pages_path = engine_dir / "pages.json"
+    pages = json.loads(pages_path.read_text(encoding="utf-8"))
+    geometry_path = engine_dir / str(pages["pages"][0]["geometry_file"])
+    geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+    pages["pages"][0]["attempt_history"][0]["image_bytes"] = True
+    geometry["images"][0]["attempt_history"][0]["image_bytes"] = True
+    pages_path.write_text(json.dumps(pages), encoding="utf-8")
+    geometry_path.write_text(json.dumps(geometry), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="byte counts|history seal"):
+        _complete_c2_fixture(source_pdf, summary, tmp_path)
+
+
+@pytest.mark.parametrize("semantic_file", ["main-geometry", "attempt-sidecar"])
+def test_c2_complete_chunk_rejects_semantic_mutation_before_seal(
+    monkeypatch: pytest.MonkeyPatch,
+    semantic_file: str,
+) -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=1)
+    summary = _write_complete_hybrid_summary(chunk_pdf=source_pdf, run_dir=tmp_path / "run")
+    engine_dir = summary.run_dir / "chandra" / "chandra"
+    pages = json.loads((engine_dir / "pages.json").read_text(encoding="utf-8"))
+    row = pages["pages"][0]
+    target = (
+        engine_dir / str(row["geometry_file"])
+        if semantic_file == "main-geometry"
+        else Path(str(row["attempt_history"][0]["sidecar_path"]))
+    )
+    original = ocr_pipeline._complete_chunk_evidence_entries
+    mutated = False
+
+    def mutate_then_enumerate(**kwargs: object) -> list[dict[str, object]]:
+        nonlocal mutated
+        if not mutated:
+            target.write_text(target.read_text(encoding="utf-8") + " ", encoding="utf-8")
+            mutated = True
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        ocr_pipeline,
+        "_complete_chunk_evidence_entries",
+        mutate_then_enumerate,
+    )
+    with pytest.raises(RuntimeError, match="changed before it could be sealed"):
+        _complete_c2_fixture(source_pdf, summary, tmp_path)
+    assert mutated is True
+
+
+def test_c2_accepted_textless_graphics_pages_are_an_exact_subset() -> None:
+    assert ocr_pipeline._accepted_textless_graphics_pages(
+        {"accepted_textless_graphics_pages": [3, 1]},
+        expected_pages=3,
+    ) == frozenset({1, 3})
+    with pytest.raises(RuntimeError, match="duplicates"):
+        ocr_pipeline._accepted_textless_graphics_pages(
+            {"accepted_textless_graphics_pages": [1, 1]},
+            expected_pages=3,
+        )
+    with pytest.raises(RuntimeError, match="invalid"):
+        ocr_pipeline._accepted_textless_graphics_pages(
+            {"accepted_textless_graphics_pages": [True]},
+            expected_pages=3,
+        )

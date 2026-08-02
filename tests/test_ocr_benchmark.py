@@ -53,6 +53,21 @@ EXTRACTION_ENGINES = (
 )
 
 
+def _write_fixture_png(path: Path) -> None:
+    Image.new("RGB", (120, 80), color=(96, 96, 96)).save(path, format="PNG")
+
+
+def _load_fixture_chandra_image(path: str, min_image_dim: int = 1536) -> Image.Image:
+    image = Image.open(path).convert("RGB")
+    if image.width < min_image_dim or image.height < min_image_dim:
+        scale = min_image_dim / float(min(image.width, image.height))
+        image = image.resize(
+            (int(image.width * scale), int(image.height * scale)),
+            Image.Resampling.LANCZOS,
+        )
+    return image
+
+
 def test_collect_text_strings_rejects_invalid_utf8_bytes() -> None:
     assert ocr_benchmark_mod._collect_text_strings(b"valid") == ["valid"]
     assert ocr_benchmark_mod._collect_text_strings(b"invalid:\xff") == []
@@ -173,7 +188,18 @@ def test_run_ocr_benchmark_writes_report_and_artifacts(tmp_path, monkeypatch) ->
         assert len(image_paths) == 1
         return f"mineru:{lang}:{len(image_paths)}", 14
 
-    def fake_chandra(image_paths, *, lang, work_dir, which_fn, run_cmd, page_progress_cb=None):
+    def fake_chandra(
+        image_paths,
+        *,
+        lang,
+        work_dir,
+        which_fn,
+        run_cmd,
+        page_progress_cb=None,
+        source_raster_identities=None,
+    ):
+        assert source_raster_identities is not None
+        assert len(source_raster_identities) == len(image_paths)
         assert "chandra_work" in str(work_dir)
         assert len(image_paths) == 2
         if page_progress_cb is not None:
@@ -734,6 +760,7 @@ def test_bounded_snapshot_copy_rejects_short_eof_without_stat_change(
             destination=destination,
             max_bytes=source_stat.st_size,
         )
+    assert not destination.exists()
 
 
 def test_surya_failure_snapshot_error_never_masks_original_ocr_error(
@@ -965,7 +992,7 @@ def test_olmocr_docker_respects_error_rate_overrides(tmp_path, monkeypatch) -> N
 def test_run_extraction_engine_pagewise_keeps_partial_results(tmp_path, monkeypatch) -> None:
     image_paths = [tmp_path / "p1.png", tmp_path / "p2.png"]
     for image_path in image_paths:
-        image_path.write_bytes(b"img")
+        _write_fixture_png(image_path)
 
     def fake_extract(engine, image_paths, *, lang, work_dir, which_fn, run_cmd):
         assert engine == OCR_ENGINE_OLMOCR
@@ -998,7 +1025,7 @@ def test_run_extraction_engine_pagewise_keeps_partial_results(tmp_path, monkeypa
 def test_run_extraction_engine_pagewise_raises_when_all_pages_fail(tmp_path, monkeypatch) -> None:
     image_paths = [tmp_path / "p1.png", tmp_path / "p2.png"]
     for image_path in image_paths:
-        image_path.write_bytes(b"img")
+        _write_fixture_png(image_path)
 
     def fake_extract(_engine, _image_paths, *, lang, work_dir, which_fn, run_cmd):
         raise RuntimeError("all failed")
@@ -1019,14 +1046,30 @@ def test_run_extraction_engine_pagewise_raises_when_all_pages_fail(tmp_path, mon
 
 def test_run_extraction_engine_pagewise_collects_surya_sidecar(tmp_path, monkeypatch) -> None:
     image_paths = [tmp_path / f"p{idx}.png" for idx in range(1, 4)]
+    source_pages = [2, 4, 6]
     for image_path in image_paths:
-        image_path.write_bytes(b"img")
+        _write_fixture_png(image_path)
     call_count = {"value": 0}
     progress_steps: list[tuple[int, int, int]] = []
 
     def fake_surya_direct(_image_paths, *, lang, work_dir, which_fn, run_cmd):
         call_count["value"] += 1
-        assert list(_image_paths) == image_paths
+        staged_paths = list(_image_paths)
+        assert [path.name for path in staged_paths] == [path.name for path in image_paths]
+        assert all(path.parent == tmp_path / "work" / "source_evidence" for path in staged_paths)
+        for staged_path, original_path, source_page in zip(
+            staged_paths,
+            image_paths,
+            source_pages,
+            strict=True,
+        ):
+            assert ocr_benchmark_mod._source_raster_identity(
+                staged_path,
+                source_page=source_page,
+            ) == ocr_benchmark_mod._source_raster_identity(
+                original_path,
+                source_page=source_page,
+            )
         sidecar = work_dir / "surya_page_lines.json"
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_text(
@@ -1062,7 +1105,7 @@ def test_run_extraction_engine_pagewise_collects_surya_sidecar(tmp_path, monkeyp
         ocr_benchmark_mod._run_extraction_engine_pagewise(
             OCR_ENGINE_SURYA,
             image_paths,
-            source_pages_1based=[2, 4, 6],
+            source_pages_1based=source_pages,
             lang="rus",
             work_dir=tmp_path / "work",
             which_fn=lambda _name: None,
@@ -1092,7 +1135,7 @@ def test_run_extraction_engine_pagewise_collects_surya_sidecar(tmp_path, monkeyp
         output_dir=tmp_path / "out",
         engine=OCR_ENGINE_SURYA,
         pdf_path=pdf_path,
-        source_pages_1based=[2, 4, 6],
+        source_pages_1based=source_pages,
         page_texts=page_texts,
         aggregate_path=tmp_path / "out" / "fixture_surya.txt",
         page_metadata=page_metadata,
@@ -1100,13 +1143,29 @@ def test_run_extraction_engine_pagewise_collects_surya_sidecar(tmp_path, monkeyp
     pages_payload = json.loads(pages_json_path.read_text(encoding="utf-8"))
     assert [item["source_page"] for item in pages_payload["pages"]] == [2, 4, 6]
     assert all(item["geometry_type"] == "surya_text_lines" for item in pages_payload["pages"])
+    for row, source_page in zip(pages_payload["pages"], source_pages, strict=True):
+        artifact = row["source_raster_artifact"]
+        expected_path = (
+            tmp_path
+            / "out"
+            / "surya"
+            / f"page_{source_page:04d}.surya-source"
+            / "source.png"
+        ).resolve()
+        assert artifact["path"] == str(expected_path)
+        assert artifact["sha256"] == ocr_benchmark_mod._sha256_path(expected_path)
+        assert artifact["bytes"] == expected_path.stat().st_size
+        geometry = json.loads(
+            (tmp_path / "out" / "surya" / row["geometry_file"]).read_text(encoding="utf-8")
+        )
+        assert geometry["images"][0]["source_raster_artifact"] == artifact
 
 
 def test_run_extraction_engine_pagewise_requires_surya_sidecar_by_default(
     tmp_path, monkeypatch
 ) -> None:
     image_paths = [tmp_path / "p1.png"]
-    image_paths[0].write_bytes(b"img")
+    _write_fixture_png(image_paths[0])
 
     def fake_surya_direct(_image_paths, *, lang, work_dir, which_fn, run_cmd):
         return "ok-surya", 8
@@ -1313,7 +1372,7 @@ def test_run_extraction_engine_pagewise_reports_missing_surya_page_geometry(
 def test_run_extraction_engine_pagewise_collects_chandra_sidecar(tmp_path, monkeypatch) -> None:
     image_paths = [tmp_path / "p1.png", tmp_path / "p2.png"]
     for image_path in image_paths:
-        image_path.write_bytes(b"img")
+        _write_fixture_png(image_path)
     call_count = {"count": 0}
 
     progress_steps: list[tuple[int, int, int]] = []
@@ -1326,7 +1385,10 @@ def test_run_extraction_engine_pagewise_collects_chandra_sidecar(tmp_path, monke
         which_fn,
         run_cmd,
         page_progress_cb=None,
+        source_raster_identities=None,
     ):
+        assert source_raster_identities is not None
+        assert len(source_raster_identities) == len(_image_paths)
         call_count["count"] += 1
         assert len(_image_paths) == 2
         if page_progress_cb is not None:
@@ -1384,7 +1446,7 @@ def test_run_extraction_engine_pagewise_reports_partial_chandra_sidecar(
 ) -> None:
     image_paths = [tmp_path / "p1.png", tmp_path / "p2.png"]
     for image_path in image_paths:
-        image_path.write_bytes(b"img")
+        _write_fixture_png(image_path)
 
     def fake_chandra_direct(_image_paths, *, work_dir, **_kwargs):
         sidecar = work_dir / "chandra_page_lines.json"
@@ -1433,7 +1495,7 @@ def test_run_extraction_engine_pagewise_rejects_partial_chandra_sidecar_by_defau
 ) -> None:
     image_paths = [tmp_path / "p1.png", tmp_path / "p2.png"]
     for image_path in image_paths:
-        image_path.write_bytes(b"img")
+        _write_fixture_png(image_path)
 
     def fake_chandra_direct(_image_paths, *, work_dir, **_kwargs):
         sidecar = work_dir / "chandra_page_lines.json"
@@ -1458,7 +1520,7 @@ def test_run_extraction_engine_pagewise_rejects_partial_chandra_sidecar_by_defau
     monkeypatch.setattr(ocr_benchmark_mod, "_run_chandra_direct", fake_chandra_direct)
     monkeypatch.delenv("UNISCAN_CHANDRA_REQUIRE_SIDECAR", raising=False)
 
-    with pytest.raises(RuntimeError, match="required for each page"):
+    with pytest.raises(RuntimeError, match="cardinality|required for each page"):
         ocr_benchmark_mod._run_extraction_engine_pagewise(
             OCR_ENGINE_CHANDRA,
             image_paths,
@@ -1476,7 +1538,7 @@ def test_run_extraction_engine_pagewise_warns_when_chandra_sidecar_is_missing(
 ) -> None:
     image_paths = [tmp_path / "p1.png", tmp_path / "p2.png"]
     for image_path in image_paths:
-        image_path.write_bytes(b"img")
+        _write_fixture_png(image_path)
 
     def fake_chandra_direct(*_args, **_kwargs):
         return "aggregate chandra text", 22
@@ -1632,7 +1694,7 @@ def test_run_extraction_engine_pagewise_requires_chandra_sidecar_by_default(
     monkeypatch,
 ) -> None:
     image_path = tmp_path / "p1.png"
-    image_path.write_bytes(b"img")
+    _write_fixture_png(image_path)
 
     monkeypatch.setattr(
         ocr_benchmark_mod,
@@ -1655,7 +1717,7 @@ def test_run_extraction_engine_pagewise_requires_chandra_sidecar_by_default(
 
 def test_run_extraction_engine_pagewise_orders_chandra_columns(tmp_path, monkeypatch) -> None:
     image_path = tmp_path / "p1.png"
-    image_path.write_bytes(b"img")
+    _write_fixture_png(image_path)
 
     def fake_chandra_direct(
         _image_paths,
@@ -1665,7 +1727,10 @@ def test_run_extraction_engine_pagewise_orders_chandra_columns(tmp_path, monkeyp
         which_fn,
         run_cmd,
         page_progress_cb=None,
+        source_raster_identities=None,
     ):
+        assert source_raster_identities is not None
+        assert len(source_raster_identities) == len(_image_paths)
         sidecar = work_dir / "chandra_page_lines.json"
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_text(
@@ -1826,6 +1891,32 @@ def test_chandra_chunk_lines_preserves_explicit_breaks() -> None:
     assert ocr_benchmark_mod._chandra_chunk_lines(0) == ["0"]
 
 
+def test_chandra_graphic_chunk_lines_keeps_only_visible_text_tags() -> None:
+    raw = (
+        '<img alt="invented alt text"/>'
+        "<div>Detailed visual description</div>"
+        "<div><p>Nested invented description</p></div>"
+        "<p>VISIBLE<br/>TRANSCRIPT</p>"
+        "<svg><text>diagram description</text></svg>"
+    )
+
+    assert ocr_benchmark_mod._chandra_graphic_chunk_lines(raw) == [
+        "VISIBLE",
+        "TRANSCRIPT",
+    ]
+    assert (
+        ocr_benchmark_mod._chandra_graphic_chunk_lines(
+            '<img alt="invented"/><div>description only</div>'
+        )
+        == []
+    )
+    assert ocr_benchmark_mod._chandra_graphic_chunk_ignored_lines(raw) == [
+        "Detailed visual description",
+        "Nested invented description",
+        "diagram description",
+    ]
+
+
 def test_chandra_expand_chunk_to_line_boxes_splits_rows() -> None:
     lines = [
         "ONE VERY LONG LINE THAT SHOULD BE WRAPPED INTO MULTIPLE SEGMENTS "
@@ -1877,14 +1968,20 @@ def test_run_chandra_module_accepts_verified_blank_page(
     model_module.InferenceManager = FakeInferenceManager
     schema_module = ModuleType("chandra.model.schema")
     schema_module.BatchInputItem = lambda **kwargs: kwargs
+    prompts_module = ModuleType("chandra.prompts")
+    prompts_module.PROMPT_MAPPING = {
+        "ocr_layout": "fake layout prompt",
+        "ocr": "fake plain prompt",
+    }
     input_module = ModuleType("chandra.input")
-    input_module.load_image = lambda _path: Image.new("RGB", (200, 300), "white")
+    input_module.load_image = _load_fixture_chandra_image
     chandra_module = ModuleType("chandra")
     chandra_module.model = model_module
 
     monkeypatch.setitem(sys.modules, "chandra", chandra_module)
     monkeypatch.setitem(sys.modules, "chandra.model", model_module)
     monkeypatch.setitem(sys.modules, "chandra.model.schema", schema_module)
+    monkeypatch.setitem(sys.modules, "chandra.prompts", prompts_module)
     monkeypatch.setitem(sys.modules, "chandra.input", input_module)
     monkeypatch.setattr(ocr_benchmark_mod, "_ensure_chandra_cache_ready", lambda: None)
     monkeypatch.setattr(
@@ -1912,7 +2009,7 @@ def test_run_chandra_module_accepts_verified_blank_page(
 
 def test_run_chandra_direct_disables_cli_fallback_by_default(monkeypatch, tmp_path: Path) -> None:
     image_path = tmp_path / "p1.png"
-    image_path.write_bytes(b"img")
+    _write_fixture_png(image_path)
 
     def fail_module(*_args, **_kwargs):
         raise RuntimeError("module failed")
@@ -1936,7 +2033,7 @@ def test_run_chandra_direct_disables_cli_fallback_by_default(monkeypatch, tmp_pa
 
 def test_run_chandra_direct_allows_cli_fallback_when_enabled(monkeypatch, tmp_path: Path) -> None:
     image_path = tmp_path / "p1.png"
-    image_path.write_bytes(b"img")
+    _write_fixture_png(image_path)
 
     def fail_module(*_args, **_kwargs):
         raise RuntimeError("module failed")
@@ -1962,7 +2059,7 @@ def test_run_chandra_direct_allows_cli_fallback_when_enabled(monkeypatch, tmp_pa
 
 def test_run_surya_direct_disables_text_fallback_by_default(monkeypatch, tmp_path: Path) -> None:
     image_path = tmp_path / "p1.png"
-    image_path.write_bytes(b"img")
+    _write_fixture_png(image_path)
 
     def fail_module(*_args, **_kwargs):
         raise RuntimeError("module failed")
@@ -1988,7 +2085,7 @@ def test_run_surya_direct_disables_text_fallback_by_default(monkeypatch, tmp_pat
 
 def test_run_surya_direct_allows_text_fallback_when_enabled(monkeypatch, tmp_path: Path) -> None:
     image_path = tmp_path / "p1.png"
-    image_path.write_bytes(b"img")
+    _write_fixture_png(image_path)
 
     def fail_module(*_args, **_kwargs):
         raise RuntimeError("module failed")
@@ -2016,7 +2113,7 @@ def test_run_surya_direct_allows_text_fallback_when_enabled(monkeypatch, tmp_pat
 
 def test_surya_module_cli_uses_only_staged_inputs(tmp_path, monkeypatch) -> None:
     image_path = tmp_path / "page_0001.png"
-    image_path.write_bytes(b"img")
+    _write_fixture_png(image_path)
     work_dir = tmp_path / "work"
     stale_input_dir = work_dir / "surya_input"
     stale_input_dir.mkdir(parents=True)
@@ -2064,7 +2161,7 @@ def test_surya_module_cli_uses_only_staged_inputs(tmp_path, monkeypatch) -> None
 
 def test_surya_cli_fallback_cannot_reuse_partial_module_output(tmp_path, monkeypatch) -> None:
     image_path = tmp_path / "page.png"
-    image_path.write_bytes(b"img")
+    _write_fixture_png(image_path)
     work_dir = tmp_path / "work"
 
     surya_module = ModuleType("surya")

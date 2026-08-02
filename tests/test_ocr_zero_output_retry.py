@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -10,6 +11,7 @@ from typing import Any, Callable
 import pytest
 from PIL import Image
 
+from uniscan.app import ocr_pipeline
 import uniscan.ocr.benchmark as benchmark
 from uniscan.ocr import OCR_ENGINE_SURYA
 
@@ -22,10 +24,98 @@ def _nonblank_image(path: Path) -> None:
     image.save(path)
 
 
+def test_copy_retry_evidence_is_bounded_and_exclusive(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"seal")
+    target = tmp_path / "owned" / "copy.bin"
+
+    assert (
+        benchmark._copy_retry_evidence(
+            source=source,
+            target=target,
+            max_bytes=4,
+        ).read_bytes()
+        == b"seal"
+    )
+    with pytest.raises(RuntimeError, match="already exists"):
+        benchmark._copy_retry_evidence(source=source, target=target, max_bytes=4)
+
+    oversized = tmp_path / "oversized.bin"
+    oversized.write_bytes(b"12345")
+    with pytest.raises(RuntimeError, match="exceeds byte limit"):
+        benchmark._copy_retry_evidence(
+            source=oversized,
+            target=tmp_path / "oversized-copy.bin",
+            max_bytes=4,
+        )
+
+
+def test_copy_retry_evidence_removes_invalid_final_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    target = tmp_path / "owned" / "copy.bin"
+    source.write_bytes(b"seal")
+    real_fingerprint = benchmark._stable_file_fingerprint
+    target_reads = 0
+
+    def mismatched_final_fingerprint(path: Path) -> dict[str, object]:
+        nonlocal target_reads
+        fingerprint = real_fingerprint(path)
+        if path == target:
+            target_reads += 1
+            if target_reads == 2:
+                return {"sha256": "0" * 64, "bytes": fingerprint["bytes"]}
+        return fingerprint
+
+    monkeypatch.setattr(benchmark, "_stable_file_fingerprint", mismatched_final_fingerprint)
+    with pytest.raises(RuntimeError, match="target seal is invalid"):
+        benchmark._copy_retry_evidence(source=source, target=target, max_bytes=4)
+    assert target_reads == 2
+    assert not target.exists()
+
+
+def test_copy_retry_evidence_rejects_linked_source(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    linked = tmp_path / "linked.bin"
+    source.write_bytes(b"seal")
+    os.link(source, linked)
+
+    with pytest.raises(RuntimeError, match="not singly owned"):
+        benchmark._copy_retry_evidence(
+            source=linked,
+            target=tmp_path / "copy.bin",
+            max_bytes=4,
+        )
+
+
+def test_copy_retry_evidence_rejects_linked_target_parent(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"seal")
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    try:
+        os.symlink(real_parent, linked_parent, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink creation is unavailable: {exc}")
+
+    with pytest.raises(RuntimeError, match="target parent is unsafe"):
+        benchmark._copy_retry_evidence(
+            source=source,
+            target=linked_parent / "nested" / "copy.bin",
+            max_bytes=4,
+        )
+    assert not (real_parent / "nested").exists()
+    assert not (real_parent / "nested" / "copy.bin").exists()
+
+
 def _install_fake_chandra(
     monkeypatch: pytest.MonkeyPatch,
     *,
     generate: Callable[..., list[Any]],
+    load_image: Callable[..., Image.Image] | None = None,
 ) -> None:
     class FakeInferenceManager:
         def __init__(self, *, method: str) -> None:
@@ -40,13 +130,30 @@ def _install_fake_chandra(
     model_module.InferenceManager = FakeInferenceManager
     schema_module = ModuleType("chandra.model.schema")
     schema_module.BatchInputItem = lambda **kwargs: kwargs
+    prompts_module = ModuleType("chandra.prompts")
+    prompts_module.PROMPT_MAPPING = {
+        "ocr_layout": "fake layout prompt",
+        "ocr": "fake plain prompt",
+    }
     input_module = ModuleType("chandra.input")
-    input_module.load_image = lambda path: Image.open(path).convert("RGB")
+
+    def fake_load_image(path: str, min_image_dim: int = 1536) -> Image.Image:
+        image = Image.open(path).convert("RGB")
+        if image.width < min_image_dim or image.height < min_image_dim:
+            scale = min_image_dim / float(min(image.width, image.height))
+            image = image.resize(
+                (int(image.width * scale), int(image.height * scale)),
+                Image.Resampling.LANCZOS,
+            )
+        return image
+
+    input_module.load_image = load_image or fake_load_image
     chandra_module = ModuleType("chandra")
     chandra_module.model = model_module
     monkeypatch.setitem(sys.modules, "chandra", chandra_module)
     monkeypatch.setitem(sys.modules, "chandra.model", model_module)
     monkeypatch.setitem(sys.modules, "chandra.model.schema", schema_module)
+    monkeypatch.setitem(sys.modules, "chandra.prompts", prompts_module)
     monkeypatch.setitem(sys.modules, "chandra.input", input_module)
     monkeypatch.setattr(benchmark, "_ensure_chandra_cache_ready", lambda: None)
     monkeypatch.setattr(benchmark, "_configure_chandra_runtime_device", lambda: "cuda:0")
@@ -60,6 +167,7 @@ def test_chandra_zero_output_retries_once_with_same_size_and_recovers_text(
     image_path = tmp_path / "page.png"
     _nonblank_image(image_path)
     generated_sizes: list[tuple[int, int]] = []
+    generated_prompts: list[str] = []
     autocontrast_calls: list[tuple[tuple[int, int], int]] = []
     real_autocontrast = benchmark.ImageOps.autocontrast
 
@@ -69,6 +177,7 @@ def test_chandra_zero_output_retries_once_with_same_size_and_recovers_text(
 
     def generate(batch):
         generated_sizes.append(batch[0]["image"].size)
+        generated_prompts.append(batch[0]["prompt_type"])
         if len(generated_sizes) == 1:
             return [SimpleNamespace(chunks=[], markdown="")]
         return [
@@ -78,6 +187,7 @@ def test_chandra_zero_output_retries_once_with_same_size_and_recovers_text(
             )
         ]
 
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 123_456)
     _install_fake_chandra(monkeypatch, generate=generate)
     monkeypatch.setattr(benchmark.ImageOps, "autocontrast", spy_autocontrast)
 
@@ -89,18 +199,35 @@ def test_chandra_zero_output_retries_once_with_same_size_and_recovers_text(
 
     assert text == "RECOVERED"
     assert chars == len("RECOVERED")
-    assert generated_sizes == [(120, 80), (120, 80)]
-    assert autocontrast_calls == [((120, 80), 1)]
+    assert generated_sizes == [(2304, 1536), (2304, 1536)]
+    assert generated_prompts == ["ocr_layout", "ocr_layout"]
+    assert autocontrast_calls == [((2304, 1536), 1)]
     sidecar = json.loads(
         (tmp_path / "work" / "chandra_page_lines.json").read_text(encoding="utf-8")
     )
     image_evidence = sidecar["images"][0]
+    source_identity = image_evidence["source_raster_identity"]
+    assert source_identity == image_evidence["attempts"][0]["source_raster_identity"]
+    assert source_identity["name"] == image_path.name
+    assert source_identity["source_page"] == 1
+    assert source_identity["verified_blank"] is False
+    assert len(source_identity["pixel_sha256"]) == 64
     assert image_evidence["ocr_outcome"] == "text"
     assert image_evidence["attempt_count"] == 2
+    assert image_evidence["selected_attempt"] == 2
+    assert image_evidence["terminal_attempt"] == 2
+    assert image_evidence["chandra_retry_policy"] == (
+        "ocr-layout-original+ocr-layout-autocontrast-cutoff-1+ocr-original-max3-v1"
+    )
     assert image_evidence["retry_preprocessing"] == "autocontrast-cutoff-1"
+    assert [item["prompt_type"] for item in image_evidence["attempts"]] == [
+        "ocr_layout",
+        "ocr_layout",
+    ]
+    assert Image.MAX_IMAGE_PIXELS == 123_456
 
 
-def test_chandra_retry_records_explicit_graphics_after_two_zero_text_attempts(
+def test_chandra_retry_records_explicit_graphics_after_three_zero_text_attempts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -127,17 +254,25 @@ def test_chandra_retry_records_explicit_graphics_after_two_zero_text_attempts(
     )
 
     assert (text, chars) == ("", 0)
-    assert calls == 2
+    assert calls == 3
     evidence = json.loads(
         (tmp_path / "work" / "chandra_page_lines.json").read_text(encoding="utf-8")
     )["images"][0]
     assert evidence["ocr_outcome"] == "explicit_nontext"
     assert evidence["explicit_nontext"] is True
     assert evidence["chandra_non_text_labels"] == ["figure"]
+    assert evidence["attempt_count"] == 3
+    assert evidence["terminal_attempt"] == 3
+    assert evidence["retry_preprocessing"] == "plain-ocr-original-v1"
+    assert [item["prompt_type"] for item in evidence["attempts"]] == [
+        "ocr_layout",
+        "ocr_layout",
+        "ocr",
+    ]
     assert evidence["pages"][0]["text_lines"] == []
 
 
-def test_chandra_preserves_original_explicit_label_when_retry_has_no_labels(
+def test_chandra_preserves_original_label_but_stays_zero_without_layout_consensus(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -166,12 +301,376 @@ def test_chandra_preserves_original_explicit_label_when_retry_has_no_labels(
     )
 
     assert (text, chars) == ("", 0)
-    assert calls == 2
+    assert calls == 3
+    evidence = json.loads(
+        (tmp_path / "work" / "chandra_page_lines.json").read_text(encoding="utf-8")
+    )["images"][0]
+    assert evidence["ocr_outcome"] == "zero_output"
+    assert evidence["explicit_nontext"] is False
+    assert evidence["chandra_non_text_labels"] == ["figure"]
+
+
+def test_chandra_requires_explicit_graphic_evidence_from_all_three_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+    calls = 0
+
+    def generate(_batch):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return [
+                SimpleNamespace(
+                    chunks=[{"label": "Figure", "content": "", "bbox": [0, 0, 120, 80]}],
+                    markdown="",
+                )
+            ]
+        return [SimpleNamespace(chunks=[], markdown="")]
+
+    _install_fake_chandra(monkeypatch, generate=generate)
+
+    text, chars = benchmark._run_chandra_module(
+        [image_path],
+        lang="eng",
+        work_dir=tmp_path / "work",
+    )
+
+    assert (text, chars) == ("", 0)
+    evidence = json.loads(
+        (tmp_path / "work" / "chandra_page_lines.json").read_text(encoding="utf-8")
+    )["images"][0]
+    assert evidence["ocr_outcome"] == "zero_output"
+    assert evidence["explicit_nontext"] is False
+    assert [attempt["explicit_nontext"] for attempt in evidence["attempts"]] == [
+        True,
+        True,
+        False,
+    ]
+
+
+def test_chandra_plain_third_attempt_recovers_text_inside_image_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+    prompts: list[str] = []
+
+    def generate(batch):
+        prompt_type = batch[0]["prompt_type"]
+        prompts.append(prompt_type)
+        if prompt_type == "ocr_layout":
+            return [
+                SimpleNamespace(
+                    chunks=[{"label": "Image", "content": "", "bbox": [0, 0, 120, 80]}],
+                    markdown="",
+                )
+            ]
+        return [
+            SimpleNamespace(
+                chunks=[
+                    {
+                        "label": "Image",
+                        "content": (
+                            '<img alt="English description must be ignored"/>'
+                            "<div>Detailed visual description must be ignored</div>"
+                            "<p>НАД ЧЕМ<br/>РАБОТАЕШЬ?</p>"
+                        ),
+                        "bbox": [10, 12, 110, 68],
+                    }
+                ],
+                markdown="",
+            )
+        ]
+
+    _install_fake_chandra(monkeypatch, generate=generate)
+
+    text, chars = benchmark._run_chandra_module(
+        [image_path],
+        lang="rus+eng",
+        work_dir=tmp_path / "work",
+    )
+
+    assert text == "НАД ЧЕМ\nРАБОТАЕШЬ?"
+    assert chars == len(text)
+    assert prompts == ["ocr_layout", "ocr_layout", "ocr"]
+    evidence = json.loads(
+        (tmp_path / "work" / "chandra_page_lines.json").read_text(encoding="utf-8")
+    )["images"][0]
+    assert evidence["ocr_outcome"] == "text"
+    assert evidence["selected_attempt"] == 3
+    assert evidence["attempt_count"] == 3
+    assert evidence["attempts"][2]["ocr_outcome"] == "text"
+    assert evidence["attempts"][2]["geometry_lines"] == 2
+    assert [line["text"] for line in evidence["pages"][0]["text_lines"]] == [
+        "НАД ЧЕМ",
+        "РАБОТАЕШЬ?",
+    ]
+
+
+def test_chandra_plain_third_attempt_rejects_text_without_geometry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+    calls = 0
+
+    def generate(_batch):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return [SimpleNamespace(chunks=[], markdown="")]
+        return [
+            SimpleNamespace(
+                chunks=[{"label": "Image", "content": "<p>UNSEALED</p>"}],
+                markdown="",
+            )
+        ]
+
+    _install_fake_chandra(monkeypatch, generate=generate)
+
+    with pytest.raises(RuntimeError, match="OCR recovered text without complete geometry"):
+        benchmark._run_chandra_module(
+            [image_path],
+            lang="eng",
+            work_dir=tmp_path / "work",
+        )
+    assert calls == 3
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        SimpleNamespace(chunks=[], markdown="UNSEALED"),
+        SimpleNamespace(
+            chunks=[
+                {"label": "Text", "content": "SEALED", "bbox": [1, 2, 50, 20]},
+                {"label": "Text", "content": "UNSEALED"},
+            ],
+            markdown="",
+        ),
+    ],
+)
+def test_chandra_layout_rejects_text_without_complete_geometry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    result: SimpleNamespace,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+
+    _install_fake_chandra(monkeypatch, generate=lambda _batch: [result])
+
+    with pytest.raises(RuntimeError, match="OCR recovered text without complete geometry"):
+        benchmark._run_chandra_module(
+            [image_path],
+            lang="eng",
+            work_dir=tmp_path / "work",
+        )
+
+
+def test_chandra_plain_description_only_is_not_accepted_as_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+    calls = 0
+
+    def generate(_batch):
+        nonlocal calls
+        calls += 1
+        return [
+            SimpleNamespace(
+                chunks=[
+                    {
+                        "label": "Image",
+                        "content": (
+                            '<img alt="invented alt text"/>'
+                            "<div>Detailed visual description only</div>"
+                        ),
+                        "bbox": [0, 0, 120, 80],
+                    }
+                ],
+                markdown="Detailed visual description only",
+            )
+        ]
+
+    _install_fake_chandra(monkeypatch, generate=generate)
+
+    text, chars = benchmark._run_chandra_module(
+        [image_path],
+        lang="eng",
+        work_dir=tmp_path / "work",
+    )
+
+    assert (text, chars) == ("", 0)
+    assert calls == 3
     evidence = json.loads(
         (tmp_path / "work" / "chandra_page_lines.json").read_text(encoding="utf-8")
     )["images"][0]
     assert evidence["ocr_outcome"] == "explicit_nontext"
-    assert evidence["chandra_non_text_labels"] == ["figure"]
+    assert all(attempt["text_chars"] == 0 for attempt in evidence["attempts"])
+    assert all(
+        attempt["alternative_text_evidence"]["accounting"] == "ignored_graphic_description"
+        for attempt in evidence["attempts"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("alternative_field", "alternative_value"),
+    [
+        ("html", "<p>VISIBLE DIALOGUE</p>"),
+        ("markdown", "VISIBLE DIALOGUE"),
+    ],
+)
+def test_chandra_unaccounted_alternative_text_cannot_be_explicit_nontext(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alternative_field: str,
+    alternative_value: str,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+    calls = 0
+
+    def generate(_batch):
+        nonlocal calls
+        calls += 1
+        payload = {
+            "chunks": [
+                {
+                    "label": "Image",
+                    "content": "<div>Detailed visual description only</div>",
+                    "bbox": [0, 0, 120, 80],
+                }
+            ],
+            "html": "",
+            "markdown": "",
+        }
+        payload[alternative_field] = alternative_value
+        return [SimpleNamespace(**payload)]
+
+    _install_fake_chandra(monkeypatch, generate=generate)
+
+    text, chars = benchmark._run_chandra_module(
+        [image_path],
+        lang="eng",
+        work_dir=tmp_path / "work",
+    )
+
+    assert (text, chars) == ("", 0)
+    assert calls == 3
+    evidence = json.loads(
+        (tmp_path / "work" / "chandra_page_lines.json").read_text(encoding="utf-8")
+    )["images"][0]
+    assert evidence["ocr_outcome"] == "zero_output"
+    assert evidence["explicit_nontext"] is False
+    assert all(attempt["explicit_nontext"] is False for attempt in evidence["attempts"])
+    assert all(
+        attempt["alternative_text_evidence"]["accounting"] == "unaccounted"
+        for attempt in evidence["attempts"]
+    )
+
+
+@pytest.mark.parametrize("prompt_mode", ["layout", "plain"])
+@pytest.mark.parametrize(
+    ("alternative_field", "alternative_value"),
+    [
+        ("html", "<p>CONFLICTING ALTERNATIVE</p>"),
+        ("markdown", "CONFLICTING ALTERNATIVE"),
+    ],
+)
+def test_chandra_text_attempt_rejects_unaccounted_alternative_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_mode: str,
+    alternative_field: str,
+    alternative_value: str,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+    calls = 0
+
+    def generate(_batch):
+        nonlocal calls
+        calls += 1
+        if prompt_mode == "plain" and calls < 3:
+            return [SimpleNamespace(chunks=[], html="", markdown="")]
+        content = "VISIBLE TEXT" if prompt_mode == "layout" else "<p>VISIBLE TEXT</p>"
+        payload = {
+            "chunks": [
+                {
+                    "label": "Text" if prompt_mode == "layout" else "Image",
+                    "content": content,
+                    "bbox": [0, 0, 120, 80],
+                }
+            ],
+            "html": "",
+            "markdown": "",
+        }
+        payload[alternative_field] = alternative_value
+        return [SimpleNamespace(**payload)]
+
+    _install_fake_chandra(monkeypatch, generate=generate)
+
+    with pytest.raises(RuntimeError, match="unaccounted alternative text"):
+        benchmark._run_chandra_module(
+            [image_path],
+            lang="eng",
+            work_dir=tmp_path / "work",
+        )
+    assert calls == (1 if prompt_mode == "layout" else 3)
+
+
+@pytest.mark.parametrize("defect", ["empty", "extra", "error"])
+def test_chandra_attempt_rejects_invalid_batch_cardinality_or_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    defect: str,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+
+    def generate(_batch):
+        result = SimpleNamespace(chunks=[], markdown="", error=defect == "error")
+        if defect == "empty":
+            return []
+        if defect == "extra":
+            return [result, result]
+        return [result]
+
+    _install_fake_chandra(monkeypatch, generate=generate)
+
+    with pytest.raises(RuntimeError, match="returned|marked"):
+        benchmark._run_chandra_module(
+            [image_path],
+            lang="eng",
+            work_dir=tmp_path / "work",
+        )
+
+
+def test_chandra_attempt_rejects_error_from_mapping_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+    _install_fake_chandra(
+        monkeypatch,
+        generate=lambda _batch: [{"chunks": [], "html": "", "markdown": "", "error": True}],
+    )
+
+    with pytest.raises(RuntimeError, match="marked"):
+        benchmark._run_chandra_module(
+            [image_path],
+            lang="eng",
+            work_dir=tmp_path / "work",
+        )
 
 
 def test_chandra_exception_does_not_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -184,6 +683,7 @@ def test_chandra_exception_does_not_retry(tmp_path: Path, monkeypatch: pytest.Mo
         calls += 1
         raise MemoryError("oom")
 
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 123_456)
     _install_fake_chandra(monkeypatch, generate=generate)
 
     with pytest.raises(MemoryError, match="oom"):
@@ -193,6 +693,52 @@ def test_chandra_exception_does_not_retry(tmp_path: Path, monkeypatch: pytest.Mo
             work_dir=tmp_path / "work",
         )
     assert calls == 1
+    assert Image.MAX_IMAGE_PIXELS == 123_456
+
+
+def test_chandra_rejects_extreme_aspect_before_model_image_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "extreme.png"
+    Image.new("RGB", (1, 32_768), "white").save(image_path)
+    load_calls: list[str] = []
+
+    def forbidden_load(path: str, *, min_image_dim: int) -> Image.Image:
+        load_calls.append(path)
+        raise AssertionError(f"load_image must not be called (min_image_dim={min_image_dim})")
+
+    _install_fake_chandra(
+        monkeypatch,
+        generate=lambda _batch: (_ for _ in ()).throw(
+            AssertionError("model.generate must not be called")
+        ),
+        load_image=forbidden_load,
+    )
+
+    with pytest.raises(RuntimeError, match="model input would exceed"):
+        benchmark._run_chandra_module(
+            [image_path],
+            lang="eng",
+            work_dir=tmp_path / "work",
+        )
+    assert load_calls == []
+
+
+def test_chandra_rejects_unexpected_loader_dimensions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+    _install_fake_chandra(
+        monkeypatch,
+        generate=lambda _batch: [],
+        load_image=lambda *_args, **_kwargs: Image.new("RGB", (1536, 1536), "white"),
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected model input dimensions"):
+        benchmark._run_chandra_module([image_path], lang="eng", work_dir=tmp_path / "work")
 
 
 def test_chandra_zero_result_never_invokes_cli_fallback(
@@ -226,7 +772,17 @@ def test_chandra_standalone_explicit_graphics_stays_fail_closed(
     image_path = tmp_path / "page.png"
     _nonblank_image(image_path)
 
-    def fake_direct(image_paths, *, lang, work_dir, which_fn, run_cmd, page_progress_cb):
+    def fake_direct(
+        image_paths,
+        *,
+        lang,
+        work_dir,
+        which_fn,
+        run_cmd,
+        page_progress_cb,
+        source_raster_identities,
+    ):
+        assert len(source_raster_identities) == len(image_paths)
         sidecar = work_dir / "chandra_page_lines.json"
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_text(
@@ -403,6 +959,36 @@ def _run_surya_pagewise(tmp_path: Path, *, defer_empty_pages: bool):
     )
 
 
+def _persist_and_validate_surya_page(
+    tmp_path: Path,
+    *,
+    page_texts: list[str],
+    page_errors: list[dict[str, Any]],
+    page_metadata: list[dict[str, Any]],
+) -> dict[str, Any]:
+    output_dir = tmp_path / "validated-output"
+    benchmark._write_pagewise_text_artifacts(
+        output_dir=output_dir,
+        engine=OCR_ENGINE_SURYA,
+        pdf_path=tmp_path / "document.pdf",
+        source_pages_1based=[1],
+        page_texts=page_texts,
+        aggregate_path=output_dir / "document_surya.txt",
+        page_metadata=page_metadata,
+        page_errors=page_errors,
+    )
+    engine_dir = output_dir / OCR_ENGINE_SURYA
+    pages_payload = json.loads((engine_dir / "pages.json").read_text(encoding="utf-8"))
+    row = pages_payload["pages"][0]
+    attempt, _source_identity = ocr_pipeline._strict_surya_attempt_metadata(
+        row=row,
+        engine_dir=engine_dir,
+        source_page=1,
+    )
+    assert attempt == row["attempt_count"]
+    return row
+
+
 def test_surya_zero_output_retry_succeeds_once(tmp_path: Path, monkeypatch) -> None:
     _install_initial_surya_zero(monkeypatch)
     retry_calls = 0
@@ -447,6 +1033,13 @@ def test_surya_zero_output_retry_succeeds_once(tmp_path: Path, monkeypatch) -> N
     assert "ocr_outcome" not in raw_initial
     assert "attempt_count" not in raw_initial
     assert "retry_preprocessing" not in raw_initial
+    validated = _persist_and_validate_surya_page(
+        tmp_path,
+        page_texts=page_texts,
+        page_errors=page_errors,
+        page_metadata=page_metadata,
+    )
+    assert validated["attempt_count"] == 2
 
 
 def test_surya_third_retry_scales_content_and_recovers(
@@ -590,6 +1183,12 @@ def test_surya_third_retry_scales_content_and_recovers(
     assert persisted_image["geometry_coordinate_space"] == "source-image-v1"
     assert persisted_image["geometry_transform"] == "inverse-actual-content-size-strict-v1"
     assert persisted_image["pages"][0]["text_lines"][0]["bbox"] == [10.0, 10.0, 50.0, 30.0]
+    attempt, _source_identity = ocr_pipeline._strict_surya_attempt_metadata(
+        row=pages_payload["pages"][0],
+        engine_dir=output_dir / OCR_ENGINE_SURYA,
+        source_page=1,
+    )
+    assert attempt == 3
 
 
 def test_scaled_retry_uses_exact_odd_content_size_and_asymmetric_borders(tmp_path: Path) -> None:
@@ -693,6 +1292,14 @@ def test_surya_zero_output_retry_failure_is_durable_for_reconciliation(
         assert image["attempt_count"] == expected_count
         assert image["retry_preprocessing"] == expected_preprocessing
         assert hashlib.sha256(sidecar_path.read_bytes()).hexdigest() == (attempt["sidecar_sha256"])
+    validated = _persist_and_validate_surya_page(
+        tmp_path,
+        page_texts=page_texts,
+        page_errors=page_errors,
+        page_metadata=page_metadata,
+    )
+    assert validated["attempt_count"] == 3
+    assert validated["ocr_outcome"] == "zero_output"
 
 
 def test_surya_retry_exception_propagates_without_another_attempt(
@@ -1165,6 +1772,15 @@ def test_surya_verified_blank_never_starts_zero_output_retry(
     assert page_errors == []
     assert page_metadata[0]["ocr_outcome"] == "verified_blank"
     assert page_metadata[0]["attempt_count"] == 1
+    assert page_metadata[0]["selected_attempt"] == 1
+    assert page_metadata[0]["retry_policy"] == (
+        "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+    )
+    assert len(page_metadata[0]["attempt_history"]) == 1
+    validated = _persist_and_validate_surya_page(
+        tmp_path, page_texts=page_texts, page_errors=page_errors, page_metadata=page_metadata
+    )
+    assert validated["selected_attempt"] == 1
 
 
 def test_surya_third_retry_is_scoped_to_initial_zero_output_page(

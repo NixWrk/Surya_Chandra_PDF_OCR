@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+from html.parser import HTMLParser
 import importlib
 import importlib.util
+import io
 import json
 import math
 import os
@@ -13,11 +15,12 @@ import shutil
 import stat
 import subprocess
 import sys
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, cast
 
 from PIL import Image, ImageOps
 
@@ -59,6 +62,20 @@ _ZERO_OUTPUT_SCALED_RETRY_FACTOR = 0.5
 _ZERO_OUTPUT_RETRY_POLICY = (
     "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
 )
+_CHANDRA_LAYOUT_PROMPT_TYPE = "ocr_layout"
+_CHANDRA_PLAIN_PROMPT_TYPE = "ocr"
+_CHANDRA_PLAIN_RETRY_PREPROCESSING = "plain-ocr-original-v1"
+_CHANDRA_ZERO_OUTPUT_RETRY_POLICY = (
+    "ocr-layout-original+ocr-layout-autocontrast-cutoff-1+ocr-original-max3-v1"
+)
+_CHANDRA_LAYOUT_CONTENT_FILTER = "skip-graphic-labels-v1"
+_CHANDRA_PLAIN_CONTENT_FILTER = "visible-text-tags-exclude-media-description-v1"
+_CHANDRA_ALTERNATIVE_TEXT_POLICY = "account-visible-html-markdown-v1"
+_CHANDRA_ATTEMPT_EVIDENCE_SCHEMA = "uniscan.chandra-attempt.v2"
+_CHANDRA_MIN_IMAGE_DIM = 1536
+_MAX_CHANDRA_ATTEMPT_IMAGE_BYTES = 128 * 1024 * 1024
+_MAX_CHANDRA_ATTEMPT_IMAGE_PIXELS = 50_000_000
+_MAX_CHANDRA_ATTEMPT_IMAGE_DIMENSION = 32_768
 _SURYA_DIRECT_EXECUTION_PATHS = ("cli", "module")
 _SURYA_MODULE_EXECUTION_PATHS = ("module",)
 _OCR_OUTCOME_TEXT = "text"
@@ -92,6 +109,34 @@ _STABLE_DIRECTORY_STAT_FIELDS = (
 ) + (() if os.name == "nt" else ("st_ctime_ns",))
 
 
+def _bounded_chandra_model_input_size(width: int, height: int) -> tuple[int, int]:
+    """Return Chandra's expected resize without decoding an unbounded result."""
+    if (
+        not isinstance(width, int)
+        or isinstance(width, bool)
+        or not isinstance(height, int)
+        or isinstance(height, bool)
+        or width <= 0
+        or height <= 0
+    ):
+        raise RuntimeError("Chandra source raster dimensions are invalid.")
+    if min(width, height) < _CHANDRA_MIN_IMAGE_DIM:
+        scale = _CHANDRA_MIN_IMAGE_DIM / float(min(width, height))
+        expected = (int(width * scale), int(height * scale))
+    else:
+        expected = (width, height)
+    if (
+        expected[0] > _MAX_CHANDRA_ATTEMPT_IMAGE_DIMENSION
+        or expected[1] > _MAX_CHANDRA_ATTEMPT_IMAGE_DIMENSION
+        or expected[0] * expected[1] > _MAX_CHANDRA_ATTEMPT_IMAGE_PIXELS
+    ):
+        raise RuntimeError(
+            "Chandra model input would exceed the bounded dimension/pixel policy: "
+            f"{expected[0]}x{expected[1]}."
+        )
+    return expected
+
+
 def _alnum_evidence(lines: Sequence[str]) -> tuple[int, int]:
     alnum_line_count = sum(1 for line in lines if any(char.isalnum() for char in line))
     alnum_chars = sum(1 for line in lines for char in line if char.isalnum())
@@ -117,6 +162,161 @@ def _sha256_path(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _canonical_rgb_pixel_sha256(image: Image.Image) -> str:
+    rgb = image if image.mode == "RGB" else image.convert("RGB")
+    return hashlib.sha256(rgb.tobytes()).hexdigest()
+
+
+def _is_effectively_blank_rgb_image(image: Image.Image) -> bool:
+    grayscale = image.convert("L")
+    grayscale.thumbnail((1024, 1024))
+    histogram = grayscale.histogram()
+    pixels = int(sum(histogram))
+    if pixels <= 0:
+        return False
+    nonwhite = int(sum(histogram[:245]))
+    dark = int(sum(histogram[:200]))
+    return bool(nonwhite <= max(8, int(pixels * 0.0005)) and dark <= max(2, int(pixels * 0.00005)))
+
+
+def _stable_bounded_png_rgb_evidence(
+    path: Path,
+    *,
+    label: str,
+    require_rgb: bool,
+) -> tuple[Image.Image, dict[str, object]]:
+    try:
+        before_path = path.stat()
+        if not stat.S_ISREG(before_path.st_mode):
+            raise RuntimeError(f"{label} is not a regular file")
+        with path.open("rb") as stream:
+            before_descriptor = os.fstat(stream.fileno())
+            if (
+                before_descriptor.st_size <= 0
+                or before_descriptor.st_size > _MAX_CHANDRA_ATTEMPT_IMAGE_BYTES
+            ):
+                raise RuntimeError(f"{label} exceeds the bounded byte policy")
+            payload = stream.read(_MAX_CHANDRA_ATTEMPT_IMAGE_BYTES + 1)
+            after_descriptor = os.fstat(stream.fileno())
+        after_path = path.stat()
+        if any(
+            getattr(record, field) != getattr(before_descriptor, field)
+            for record in (before_path, after_descriptor, after_path)
+            for field in _STABLE_FILE_STAT_FIELDS
+        ):
+            raise RuntimeError(f"{label} changed while reading")
+        if len(payload) != before_descriptor.st_size:
+            raise RuntimeError(f"{label} exceeds the bounded byte policy")
+        with Image.open(io.BytesIO(payload)) as opened:
+            if opened.format != "PNG":
+                raise RuntimeError(f"{label} is not PNG")
+            if int(getattr(opened, "n_frames", 1)) != 1:
+                raise RuntimeError(f"{label} PNG is multi-frame")
+            if (
+                opened.width > _MAX_CHANDRA_ATTEMPT_IMAGE_DIMENSION
+                or opened.height > _MAX_CHANDRA_ATTEMPT_IMAGE_DIMENSION
+                or opened.width * opened.height > _MAX_CHANDRA_ATTEMPT_IMAGE_PIXELS
+            ):
+                raise RuntimeError(f"{label} exceeds the bounded pixel policy")
+            opened.load()
+            if require_rgb and opened.mode != "RGB":
+                raise RuntimeError(f"{label} is not canonical RGB")
+            image = cast(Image.Image, opened.convert("RGB").copy())
+        return image, {
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "bytes": len(payload),
+        }
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Cannot read {label}: {exc}") from exc
+
+
+def _bounded_png_rgb_image(
+    path: Path,
+    *,
+    label: str,
+    require_rgb: bool,
+) -> Image.Image:
+    image, _fingerprint = _stable_bounded_png_rgb_evidence(
+        path,
+        label=label,
+        require_rgb=require_rgb,
+    )
+    return image
+
+
+def _source_raster_evidence(
+    path: Path,
+    *,
+    source_page: int,
+    require_rgb: bool,
+) -> tuple[dict[str, object], dict[str, object], Image.Image]:
+    if not isinstance(source_page, int) or isinstance(source_page, bool) or source_page <= 0:
+        raise RuntimeError(f"Invalid source page for raster identity: {source_page!r}")
+    image, fingerprint = _stable_bounded_png_rgb_evidence(
+        path,
+        label=f"source raster {path}",
+        require_rgb=require_rgb,
+    )
+    identity: dict[str, object] = {
+        "pixel_sha256": _canonical_rgb_pixel_sha256(image),
+        "width": int(image.width),
+        "height": int(image.height),
+        "name": path.name,
+        "source_page": source_page,
+        "verified_blank": _is_effectively_blank_rgb_image(image),
+    }
+    artifact: dict[str, object] = {
+        "path": str(path.resolve()),
+        "sha256": fingerprint["sha256"],
+        "bytes": fingerprint["bytes"],
+    }
+    return identity, artifact, image
+
+
+def _source_raster_identity(
+    path: Path,
+    *,
+    source_page: int,
+) -> dict[str, object]:
+    identity, _artifact, _image = _source_raster_evidence(
+        path,
+        require_rgb=False,
+        source_page=source_page,
+    )
+    return identity
+
+
+def _source_raster_artifact(path: Path) -> dict[str, object]:
+    _image, fingerprint = _stable_bounded_png_rgb_evidence(
+        path,
+        label=f"source raster artifact {path}",
+        require_rgb=True,
+    )
+    return {
+        "path": str(path.resolve()),
+        "sha256": fingerprint["sha256"],
+        "bytes": fingerprint["bytes"],
+    }
+
+
+def _validate_source_raster_seal(
+    *,
+    path: Path,
+    source_page: int,
+    identity: dict[str, object],
+    artifact: dict[str, object],
+) -> None:
+    observed_identity, observed_artifact, _image = _source_raster_evidence(
+        path,
+        source_page=source_page,
+        require_rgb=True,
+    )
+    if observed_identity != identity or observed_artifact != artifact:
+        raise RuntimeError(f"Source raster seal changed for page {source_page}: {path}")
 
 
 def _stable_file_fingerprint(path: Path) -> dict[str, object]:
@@ -438,17 +638,120 @@ def _structured_surya_zero_output(
     return row
 
 
-def _copy_retry_evidence(*, source: Path, target: Path) -> Path:
-    if not source.is_file():
-        raise RuntimeError(f"OCR retry evidence source is missing: {source}")
-    if target.exists():
-        raise RuntimeError(f"OCR retry evidence target already exists: {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
-    if _sha256_path(target) != _sha256_path(source):
-        target.unlink(missing_ok=True)
-        raise RuntimeError(f"OCR retry evidence copy failed verification: {target}")
-    return target
+def _strict_retry_copy_source(path: Path, *, max_bytes: int) -> tuple[Path, os.stat_result]:
+    candidate = Path(os.path.abspath(path))
+    parent_stat = candidate.parent.lstat()
+    if not stat.S_ISDIR(parent_stat.st_mode) or _stat_has_reparse_point(parent_stat):
+        raise RuntimeError(f"OCR retry evidence source parent is unsafe: {candidate.parent}")
+    if candidate.parent.resolve(strict=True) != candidate.parent:
+        raise RuntimeError(f"OCR retry evidence source parent traverses a link: {candidate.parent}")
+    file_stat = candidate.lstat()
+    if (
+        not stat.S_ISREG(file_stat.st_mode)
+        or stat.S_ISLNK(file_stat.st_mode)
+        or _stat_has_reparse_point(file_stat)
+        or int(file_stat.st_nlink) != 1
+        or candidate.resolve(strict=True) != candidate
+    ):
+        raise RuntimeError(f"OCR retry evidence source is not singly owned: {candidate}")
+    if not 0 < file_stat.st_size <= max_bytes:
+        raise RuntimeError(f"OCR retry evidence source exceeds byte limit: {candidate}")
+    return candidate, file_stat
+
+
+def _strict_retry_copy_target_parent(path: Path) -> tuple[Path, os.stat_result]:
+    candidate = Path(os.path.abspath(path))
+    missing: list[Path] = []
+    current = candidate
+    while not os.path.lexists(current):
+        parent = current.parent
+        if parent == current:
+            raise RuntimeError(f"OCR retry evidence target parent is unsafe: {candidate}")
+        missing.append(current)
+        current = parent
+
+    for directory in [current, *reversed(missing)]:
+        if directory != current:
+            parent_stat = current.lstat()
+            if (
+                not stat.S_ISDIR(parent_stat.st_mode)
+                or stat.S_ISLNK(parent_stat.st_mode)
+                or _stat_has_reparse_point(parent_stat)
+                or current.resolve(strict=True) != current
+            ):
+                raise RuntimeError(f"OCR retry evidence target parent is unsafe: {candidate}")
+            try:
+                directory.mkdir()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"OCR retry evidence target parent cannot be created safely: {candidate}"
+                ) from exc
+            current = directory
+
+        directory_stat = directory.lstat()
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or stat.S_ISLNK(directory_stat.st_mode)
+            or _stat_has_reparse_point(directory_stat)
+            or directory.resolve(strict=True) != directory
+        ):
+            raise RuntimeError(f"OCR retry evidence target parent is unsafe: {candidate}")
+    return candidate, directory_stat
+
+
+def _strict_retry_copy_target_parent_seal(path: Path, *, expected: os.stat_result) -> None:
+    candidate = Path(os.path.abspath(path))
+    try:
+        current = candidate.lstat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"OCR retry evidence target parent changed before copying: {candidate}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or stat.S_ISLNK(current.st_mode)
+        or _stat_has_reparse_point(current)
+        or candidate.resolve(strict=True) != candidate
+        or any(
+            getattr(current, field) != getattr(expected, field)
+            for field in _STABLE_DIRECTORY_STAT_FIELDS
+        )
+    ):
+        raise RuntimeError(f"OCR retry evidence target parent changed before copying: {candidate}")
+
+
+def _copy_retry_evidence(*, source: Path, target: Path, max_bytes: int) -> Path:
+    source_path, source_stat = _strict_retry_copy_source(source, max_bytes=max_bytes)
+    target_path = Path(os.path.abspath(target))
+    _target_parent, target_parent_stat = _strict_retry_copy_target_parent(target_path.parent)
+    if os.path.lexists(target_path):
+        raise RuntimeError(f"OCR retry evidence target already exists: {target_path}")
+    digest, copied = _copy_bounded_snapshot_file(
+        source=source_path,
+        source_stat=source_stat,
+        destination=target_path,
+        max_bytes=max_bytes,
+        destination_parent_stat=target_parent_stat,
+    )
+    target_stat: os.stat_result | None = None
+    try:
+        target_stat = target_path.lstat()
+        target_is_valid = (
+            stat.S_ISREG(target_stat.st_mode)
+            and not stat.S_ISLNK(target_stat.st_mode)
+            and not _stat_has_reparse_point(target_stat)
+            and int(target_stat.st_nlink) == 1
+            and target_path.resolve(strict=True) == target_path
+            and _stable_file_fingerprint(target_path) == {"sha256": digest, "bytes": copied}
+        )
+    except Exception:
+        if target_stat is not None:
+            _remove_failed_snapshot_copy(target_path, expected=target_stat)
+        raise
+    if not target_is_valid:
+        _remove_failed_snapshot_copy(target_path, expected=target_stat)
+        raise RuntimeError(f"OCR retry evidence target seal is invalid: {target_path}")
+    return target_path
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -492,45 +795,85 @@ def _copy_bounded_snapshot_file(
     source_stat: os.stat_result,
     destination: Path,
     max_bytes: int,
+    destination_parent_stat: os.stat_result | None = None,
 ) -> tuple[str, int]:
     if max_bytes < 0 or source_stat.st_size > max_bytes:
         raise RuntimeError("Surya failure evidence exceeds the byte limit")
     digest = hashlib.sha256()
     copied = 0
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with source.open("rb") as source_stream:
-        opened_stat = os.fstat(source_stream.fileno())
+    if destination_parent_stat is None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    destination_created_stat: os.stat_result | None = None
+    try:
+        with source.open("rb") as source_stream:
+            opened_stat = os.fstat(source_stream.fileno())
+            if any(
+                getattr(opened_stat, field) != getattr(source_stat, field)
+                for field in _STABLE_FILE_STAT_FIELDS
+            ):
+                raise RuntimeError(f"Surya failure evidence changed before copying: {source}")
+            if destination_parent_stat is not None:
+                _strict_retry_copy_target_parent_seal(
+                    destination.parent,
+                    expected=destination_parent_stat,
+                )
+            with destination.open("xb") as destination_stream:
+                destination_created_stat = os.fstat(destination_stream.fileno())
+                if (
+                    not stat.S_ISREG(destination_created_stat.st_mode)
+                    or int(destination_created_stat.st_nlink) != 1
+                ):
+                    raise RuntimeError(
+                        f"Surya failure evidence destination is unsafe: {destination}"
+                    )
+                while True:
+                    read_size = min(1024 * 1024, max_bytes - copied + 1)
+                    block = source_stream.read(read_size)
+                    if not block:
+                        break
+                    copied += len(block)
+                    if copied > max_bytes:
+                        raise RuntimeError("Surya failure evidence exceeds the byte limit")
+                    destination_stream.write(block)
+                    digest.update(block)
+            descriptor_after = os.fstat(source_stream.fileno())
+        path_after = source.lstat()
         if any(
-            getattr(opened_stat, field) != getattr(source_stat, field)
+            getattr(record, field) != getattr(source_stat, field)
+            for record in (descriptor_after, path_after)
             for field in _STABLE_FILE_STAT_FIELDS
         ):
-            raise RuntimeError(f"Surya failure evidence changed before copying: {source}")
-        with destination.open("xb") as destination_stream:
-            while True:
-                read_size = min(1024 * 1024, max_bytes - copied + 1)
-                block = source_stream.read(read_size)
-                if not block:
-                    break
-                copied += len(block)
-                if copied > max_bytes:
-                    raise RuntimeError("Surya failure evidence exceeds the byte limit")
-                destination_stream.write(block)
-                digest.update(block)
-        descriptor_after = os.fstat(source_stream.fileno())
-    path_after = source.lstat()
-    if any(
-        getattr(record, field) != getattr(source_stat, field)
-        for record in (descriptor_after, path_after)
-        for field in _STABLE_FILE_STAT_FIELDS
-    ):
-        raise RuntimeError(f"Surya failure evidence changed while copying: {source}")
-    if copied != source_stat.st_size:
-        raise RuntimeError(f"Surya failure evidence file ended before its sealed size: {source}")
-    destination_fingerprint = _stable_file_fingerprint(destination)
-    expected_fingerprint = {"sha256": digest.hexdigest(), "bytes": copied}
-    if destination_fingerprint != expected_fingerprint:
-        raise RuntimeError(f"Surya failure evidence copy is invalid: {source}")
-    return digest.hexdigest(), copied
+            raise RuntimeError(f"Surya failure evidence changed while copying: {source}")
+        if copied != source_stat.st_size:
+            raise RuntimeError(
+                f"Surya failure evidence file ended before its sealed size: {source}"
+            )
+        destination_fingerprint = _stable_file_fingerprint(destination)
+        expected_fingerprint = {"sha256": digest.hexdigest(), "bytes": copied}
+        if destination_fingerprint != expected_fingerprint:
+            raise RuntimeError(f"Surya failure evidence copy is invalid: {source}")
+        return digest.hexdigest(), copied
+    except Exception:
+        if destination_created_stat is not None:
+            _remove_failed_snapshot_copy(destination, expected=destination_created_stat)
+        raise
+
+
+def _remove_failed_snapshot_copy(path: Path, *, expected: os.stat_result) -> None:
+    try:
+        current = path.lstat()
+        if (
+            stat.S_ISREG(current.st_mode)
+            and not stat.S_ISLNK(current.st_mode)
+            and not _stat_has_reparse_point(current)
+            and int(current.st_nlink) == 1
+            and current.st_dev == expected.st_dev
+            and current.st_ino == expected.st_ino
+            and path.resolve(strict=True) == path
+        ):
+            path.unlink()
+    except (OSError, RuntimeError):
+        return
 
 
 def _snapshot_surya_failure_evidence(
@@ -773,17 +1116,10 @@ def _read_utf8_artifact(path: Path) -> str:
 def _is_effectively_blank_page_image(path: Path) -> bool:
     try:
         with Image.open(path) as source:
-            grayscale = source.convert("L")
-            grayscale.thumbnail((1024, 1024))
-            histogram = grayscale.histogram()
-    except OSError:
+            source.load()
+            return _is_effectively_blank_rgb_image(source.convert("RGB"))
+    except Exception:
         return False
-    pixels = int(sum(histogram))
-    if pixels <= 0:
-        return False
-    nonwhite = int(sum(histogram[:245]))
-    dark = int(sum(histogram[:200]))
-    return bool(nonwhite <= max(8, int(pixels * 0.0005)) and dark <= max(2, int(pixels * 0.00005)))
 
 
 @dataclass(slots=True)
@@ -1329,6 +1665,89 @@ _CHANDRA_NON_TEXT_LABELS: set[str] = {
     "diagram",
 }
 _CHANDRA_GRAPHIC_LABELS: set[str] = {"image", "figure", "diagram"}
+_CHANDRA_VISIBLE_TEXT_TAGS: set[str] = {
+    "blockquote",
+    "caption",
+    "chem",
+    "code",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "li",
+    "math",
+    "p",
+    "pre",
+    "td",
+    "th",
+}
+_CHANDRA_BLOCKED_MEDIA_TAGS: set[str] = {"div", "noscript", "script", "style", "svg"}
+
+
+class _ChandraVisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.ignored_parts: list[str] = []
+        self.visible_depth = 0
+        self.blocked_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        normalized = tag.lower()
+        if normalized in _CHANDRA_BLOCKED_MEDIA_TAGS:
+            self.blocked_depth += 1
+            self.ignored_parts.append("\n")
+        if normalized in _CHANDRA_VISIBLE_TEXT_TAGS:
+            self.visible_depth += 1
+            self.parts.append("\n")
+        elif normalized == "br" and self.visible_depth > 0 and self.blocked_depth == 0:
+            self.parts.append("\n")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.lower()
+        if normalized in _CHANDRA_VISIBLE_TEXT_TAGS and self.visible_depth > 0:
+            self.parts.append("\n")
+            self.visible_depth -= 1
+        if normalized in _CHANDRA_BLOCKED_MEDIA_TAGS and self.blocked_depth > 0:
+            self.ignored_parts.append("\n")
+            self.blocked_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self.blocked_depth > 0:
+            self.ignored_parts.append(data)
+        elif self.visible_depth > 0:
+            self.parts.append(data)
+
+
+def _chandra_graphic_chunk_lines(raw_content: Any) -> list[str]:
+    if raw_content is None:
+        return []
+    parser = _ChandraVisibleTextParser()
+    try:
+        parser.feed(str(raw_content))
+        parser.close()
+    except Exception:
+        return []
+    return _chandra_chunk_lines("".join(parser.parts))
+
+
+def _chandra_graphic_chunk_ignored_lines(raw_content: Any) -> list[str]:
+    if raw_content is None:
+        return []
+    parser = _ChandraVisibleTextParser()
+    try:
+        parser.feed(str(raw_content))
+        parser.close()
+    except Exception:
+        return []
+    return _chandra_chunk_lines("".join(parser.ignored_parts))
 
 
 def _chandra_chunk_lines(raw_content: Any) -> list[str]:
@@ -1351,6 +1770,49 @@ def _chandra_chunk_lines(raw_content: Any) -> list[str]:
     raw = re.sub(r"\n{2,}", "\n", raw)
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
     return lines
+
+
+def _chandra_canonical_alnum(lines: Sequence[str]) -> str:
+    normalized = unicodedata.normalize("NFKC", "\n".join(lines))
+    normalized = unicodedata.normalize("NFKC", normalized.casefold())
+    return "".join(char for char in normalized if char.isalnum())
+
+
+def _chandra_normalized_text(lines: Sequence[str]) -> str:
+    return unicodedata.normalize("NFKC", "\n".join(lines))
+
+
+def _chandra_alternative_text_evidence(
+    *,
+    raw_result: dict[str, Any],
+    texts: Sequence[str],
+    ignored_graphic_lines: Sequence[str],
+) -> dict[str, str]:
+    html_lines = _chandra_chunk_lines(raw_result.get("html"))
+    raw_markdown = str(raw_result.get("markdown") or "").strip()
+    markdown_lines = _chandra_chunk_lines(_strip_markdown(raw_markdown))
+    html_text = _chandra_normalized_text(html_lines)
+    markdown_text = _chandra_normalized_text(markdown_lines)
+    parsed_text = _chandra_normalized_text(texts)
+    ignored_text = _chandra_normalized_text(ignored_graphic_lines)
+    alternatives = [value for value in (html_text, markdown_text) if value]
+    if not alternatives:
+        accounting = "empty"
+    elif parsed_text and all(value == parsed_text for value in alternatives):
+        accounting = "parsed"
+    elif ignored_text and all(value == ignored_text for value in alternatives):
+        accounting = "ignored_graphic_description"
+    else:
+        accounting = "unaccounted"
+    return {
+        "policy": _CHANDRA_ALTERNATIVE_TEXT_POLICY,
+        "accounting": accounting,
+        "html_normalized_sha256": hashlib.sha256(html_text.encode("utf-8")).hexdigest(),
+        "markdown_normalized_sha256": hashlib.sha256(markdown_text.encode("utf-8")).hexdigest(),
+        "ignored_graphic_normalized_sha256": hashlib.sha256(
+            ignored_text.encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def _wrap_text_to_target_chars(text: str, *, target_chars: int) -> list[str]:
@@ -1467,6 +1929,88 @@ def _markerized_pages_text(
     return payload + "\n" if payload else ""
 
 
+def _persist_source_raster_artifact(
+    *,
+    engine_dir: Path,
+    page_meta: dict[str, Any],
+    source_page: int,
+    engine: str,
+    directory_suffix: str,
+) -> dict[str, object]:
+    raw_artifact = page_meta.get("source_raster_artifact")
+    raw_identity = page_meta.get("source_raster_identity")
+    if not isinstance(raw_artifact, dict) or not isinstance(raw_identity, dict):
+        raise RuntimeError(f"{engine} page {source_page} source raster seal is malformed.")
+    raw_path = raw_artifact.get("path")
+    if not isinstance(raw_path, str):
+        raise RuntimeError(f"{engine} page {source_page} source raster path is malformed.")
+    source_raster = Path(raw_path)
+    if not source_raster.is_file():
+        raise RuntimeError(f"{engine} page {source_page} source raster artifact is missing.")
+    observed_identity, observed_artifact, _observed_image = _source_raster_evidence(
+        source_raster,
+        source_page=source_page,
+        require_rgb=True,
+    )
+    if observed_artifact != raw_artifact or observed_identity != raw_identity:
+        raise RuntimeError(f"{engine} page {source_page} source raster seal changed.")
+    durable_source = _copy_retry_evidence(
+        source=source_raster,
+        target=engine_dir / f"page_{source_page:04d}.{directory_suffix}" / "source.png",
+        max_bytes=_MAX_CHANDRA_ATTEMPT_IMAGE_BYTES,
+    )
+    durable_identity, durable_artifact, durable_image = _source_raster_evidence(
+        durable_source,
+        source_page=source_page,
+        require_rgb=True,
+    )
+    expected_durable_identity = dict(raw_identity)
+    expected_durable_identity["name"] = "source.png"
+    if (
+        durable_identity != expected_durable_identity
+        or durable_artifact["sha256"] != raw_artifact["sha256"]
+        or durable_artifact["bytes"] != raw_artifact["bytes"]
+        or durable_image.size != (raw_identity["width"], raw_identity["height"])
+        or _canonical_rgb_pixel_sha256(durable_image) != raw_identity["pixel_sha256"]
+        or _is_effectively_blank_rgb_image(durable_image) is not raw_identity["verified_blank"]
+    ):
+        raise RuntimeError(f"{engine} page {source_page} durable source raster pixels changed.")
+    page_meta["source_raster_artifact"] = durable_artifact
+    return durable_artifact
+
+
+def _persist_surya_source_raster(
+    *,
+    engine_dir: Path,
+    page_meta: dict[str, Any],
+    source_page: int,
+) -> None:
+    durable_artifact = _persist_source_raster_artifact(
+        engine_dir=engine_dir,
+        page_meta=page_meta,
+        source_page=source_page,
+        engine="Surya",
+        directory_suffix="surya-source",
+    )
+    raw_selected_sidecar = page_meta.get("surya_page_lines_path")
+    if not isinstance(raw_selected_sidecar, str):
+        raise RuntimeError(f"Surya page {source_page} selected sidecar is missing.")
+    selected_sidecar = Path(raw_selected_sidecar)
+    try:
+        payload = json.loads(selected_sidecar.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Surya page {source_page} selected sidecar is unreadable: {exc}"
+        ) from exc
+    images = payload.get("images") if isinstance(payload, dict) else None
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise RuntimeError(f"Surya page {source_page} selected sidecar is malformed.")
+    if images[0].get("source_raster_identity") != page_meta.get("source_raster_identity"):
+        raise RuntimeError(f"Surya page {source_page} selected source identity changed.")
+    images[0]["source_raster_artifact"] = durable_artifact
+    _write_json_atomic(selected_sidecar, payload)
+
+
 def _persist_surya_retry_history(
     *,
     engine_dir: Path,
@@ -1511,10 +2055,12 @@ def _persist_surya_retry_history(
         durable_image = _copy_retry_evidence(
             source=source_image,
             target=attempt_dir / source_image.name,
+            max_bytes=_MAX_CHANDRA_ATTEMPT_IMAGE_BYTES,
         )
         durable_sidecar = _copy_retry_evidence(
             source=source_sidecar,
             target=attempt_dir / "surya_page_lines.json",
+            max_bytes=_MAX_OCR_TEXT_ARTIFACT_BYTES,
         )
         item = dict(raw_item)
         item.update(
@@ -1545,6 +2091,121 @@ def _persist_surya_retry_history(
         raise RuntimeError(f"Surya page {source_page} selected sidecar is malformed.")
     for key in ("selected_attempt", "retry_policy", "attempt_history"):
         images[0][key] = page_meta[key]
+    _write_json_atomic(selected_sidecar, payload)
+
+
+def _persist_chandra_attempt_history(
+    *,
+    engine_dir: Path,
+    page_meta: dict[str, Any],
+    source_page: int,
+) -> None:
+    durable_source_artifact = _persist_source_raster_artifact(
+        engine_dir=engine_dir,
+        page_meta=page_meta,
+        source_page=source_page,
+        engine="Chandra",
+        directory_suffix="chandra-source",
+    )
+
+    raw_history = page_meta.get("attempt_history")
+    if not isinstance(raw_history, list) or not raw_history:
+        raise RuntimeError(f"Chandra page {source_page} attempt history is missing or malformed.")
+    durable_history: list[dict[str, object]] = []
+    for expected_attempt, raw_item in enumerate(raw_history, start=1):
+        if not isinstance(raw_item, dict) or raw_item.get("attempt") != expected_attempt:
+            raise RuntimeError(f"Chandra page {source_page} attempt history is malformed.")
+        raw_image_path = raw_item.get("image_path")
+        raw_sidecar_path = raw_item.get("sidecar_path")
+        if not isinstance(raw_image_path, str) or not isinstance(raw_sidecar_path, str):
+            raise RuntimeError(f"Chandra page {source_page} attempt has no linked artifacts.")
+        source_image = Path(raw_image_path)
+        source_sidecar = Path(raw_sidecar_path)
+        if not source_image.is_file() or not source_sidecar.is_file():
+            raise RuntimeError(f"Chandra page {source_page} attempt artifact is missing.")
+        if raw_item.get("image_sha256") != _sha256_path(source_image):
+            raise RuntimeError(f"Chandra page {source_page} attempt image digest changed.")
+        if raw_item.get("sidecar_sha256") != _sha256_path(source_sidecar):
+            raise RuntimeError(f"Chandra page {source_page} attempt sidecar digest changed.")
+        declared_image_bytes = raw_item.get("image_bytes")
+        declared_image_size = raw_item.get("image_size")
+        if (
+            not isinstance(declared_image_bytes, int)
+            or isinstance(declared_image_bytes, bool)
+            or declared_image_bytes <= 0
+            or declared_image_bytes > _MAX_CHANDRA_ATTEMPT_IMAGE_BYTES
+            or not isinstance(declared_image_size, list)
+            or len(declared_image_size) != 2
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                for value in declared_image_size
+            )
+            or declared_image_size[0] > _MAX_CHANDRA_ATTEMPT_IMAGE_DIMENSION
+            or declared_image_size[1] > _MAX_CHANDRA_ATTEMPT_IMAGE_DIMENSION
+            or declared_image_size[0] * declared_image_size[1] > _MAX_CHANDRA_ATTEMPT_IMAGE_PIXELS
+        ):
+            raise RuntimeError(f"Chandra page {source_page} attempt image bounds are invalid.")
+        if source_image.stat().st_size != declared_image_bytes:
+            raise RuntimeError(f"Chandra page {source_page} attempt image byte size changed.")
+        decoded_source_image = _bounded_png_rgb_image(
+            source_image,
+            label=f"Chandra page {source_page} attempt {expected_attempt} image",
+            require_rgb=True,
+        )
+        actual_image_size = [int(decoded_source_image.width), int(decoded_source_image.height)]
+        if declared_image_size != actual_image_size:
+            raise RuntimeError(f"Chandra page {source_page} attempt image size changed.")
+
+        attempt_dir = (
+            engine_dir / f"page_{source_page:04d}.chandra-attempts" / f"attempt_{expected_attempt}"
+        )
+        durable_image = _copy_retry_evidence(
+            source=source_image,
+            target=attempt_dir / "input.png",
+            max_bytes=_MAX_CHANDRA_ATTEMPT_IMAGE_BYTES,
+        )
+        durable_decoded_image = _bounded_png_rgb_image(
+            durable_image,
+            label=f"Chandra page {source_page} durable attempt {expected_attempt} image",
+            require_rgb=True,
+        )
+        if durable_decoded_image.size != decoded_source_image.size:
+            raise RuntimeError(f"Chandra page {source_page} durable attempt image size changed.")
+        durable_sidecar = _copy_retry_evidence(
+            source=source_sidecar,
+            target=attempt_dir / "chandra_attempt.json",
+            max_bytes=_MAX_OCR_TEXT_ARTIFACT_BYTES,
+        )
+        item = dict(raw_item)
+        item.update(
+            {
+                "image_path": str(durable_image.resolve()),
+                "sidecar_path": str(durable_sidecar.resolve()),
+                "image_sha256": _sha256_path(durable_image),
+                "image_bytes": int(durable_image.stat().st_size),
+                "sidecar_sha256": _sha256_path(durable_sidecar),
+                "sidecar_bytes": int(durable_sidecar.stat().st_size),
+            }
+        )
+        durable_history.append(item)
+
+    page_meta["attempt_history"] = durable_history
+    raw_selected_sidecar = page_meta.get("chandra_page_lines_path")
+    if not isinstance(raw_selected_sidecar, str):
+        raise RuntimeError(f"Chandra page {source_page} selected sidecar is missing.")
+    selected_sidecar = Path(raw_selected_sidecar)
+    try:
+        payload = json.loads(selected_sidecar.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Chandra page {source_page} selected sidecar is unreadable: {exc}"
+        ) from exc
+    images = payload.get("images") if isinstance(payload, dict) else None
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise RuntimeError(f"Chandra page {source_page} selected sidecar is malformed.")
+    images[0]["attempt_history"] = durable_history
+    images[0]["source_raster_identity"] = page_meta["source_raster_identity"]
+    images[0]["source_raster_artifact"] = durable_source_artifact
     _write_json_atomic(selected_sidecar, payload)
 
 
@@ -1592,7 +2253,7 @@ def _write_pagewise_text_artifacts(
     total_chars = 0
     for source_page, text in zip(source_pages_1based, page_texts, strict=True):
         page_file = engine_dir / f"page_{source_page:04d}.txt"
-        page_file.write_text(text, encoding="utf-8")
+        page_file.write_bytes(text.encode("utf-8"))
         chars = len(text)
         total_chars += chars
         page_info: dict[str, Any] = {
@@ -1601,8 +2262,20 @@ def _write_pagewise_text_artifacts(
             "text_chars": chars,
         }
         page_meta = metadata_by_page.get(source_page, {})
+        if engine == OCR_ENGINE_SURYA and page_meta.get("surya_page_lines_path") is not None:
+            _persist_surya_source_raster(
+                engine_dir=engine_dir,
+                page_meta=page_meta,
+                source_page=source_page,
+            )
         if engine == OCR_ENGINE_SURYA and page_meta.get("attempt_history") is not None:
             _persist_surya_retry_history(
+                engine_dir=engine_dir,
+                page_meta=page_meta,
+                source_page=source_page,
+            )
+        if engine == OCR_ENGINE_CHANDRA and page_meta.get("attempt_history") is not None:
+            _persist_chandra_attempt_history(
                 engine_dir=engine_dir,
                 page_meta=page_meta,
                 source_page=source_page,
@@ -1613,14 +2286,18 @@ def _write_pagewise_text_artifacts(
             "ocr_outcome",
             "explicit_nontext",
             "attempt_count",
+            "terminal_attempt",
             "retry_preprocessing",
             "selected_attempt",
+            "chandra_retry_policy",
             "retry_policy",
             "attempt_history",
             "geometry_coordinate_space",
             "geometry_transform",
             "alnum_line_count",
             "alnum_chars",
+            "source_raster_identity",
+            "source_raster_artifact",
         ):
             evidence_value = page_meta.get(evidence_key)
             if evidence_value is not None:
@@ -1657,8 +2334,9 @@ def _write_pagewise_text_artifacts(
         page_texts=page_texts,
         source_pages_1based=source_pages_1based,
     )
-    (engine_dir / "all_pages.txt").write_text(markerized, encoding="utf-8")
-    aggregate_path.write_text(markerized, encoding="utf-8")
+    markerized_bytes = markerized.encode("utf-8")
+    (engine_dir / "all_pages.txt").write_bytes(markerized_bytes)
+    aggregate_path.write_bytes(markerized_bytes)
 
     pages_index = {
         "pdf_path": str(pdf_path),
@@ -1695,23 +2373,46 @@ def _collect_chandra_batch_outputs(
     images_payload = payload.get("images")
     if not isinstance(images_payload, list):
         raise RuntimeError("Chandra sidecar payload has no 'images' list.")
+    if len(image_paths) != len(source_pages_1based):
+        raise RuntimeError("Chandra raster/page mapping is not bijective.")
+
+    strict_sidecar = _chandra_require_sidecar()
+    expected_names = {image_path.name for image_path in image_paths}
+    if strict_sidecar and len(images_payload) != len(image_paths):
+        raise RuntimeError(
+            "Chandra sidecar image cardinality does not match requested raster count: "
+            f"expected {len(image_paths)}, got {len(images_payload)}."
+        )
 
     by_name: dict[str, dict[str, Any]] = {}
     for item in images_payload:
         if not isinstance(item, dict):
+            if strict_sidecar:
+                raise RuntimeError("Chandra sidecar contains a non-object image entry.")
             continue
         image_name = str(item.get("image_name") or "").strip()
         if not image_name:
+            if strict_sidecar:
+                raise RuntimeError("Chandra sidecar contains an image entry without image_name.")
             continue
+        if strict_sidecar and image_name not in expected_names:
+            raise RuntimeError(f"Chandra sidecar contains an unexpected image: {image_name!r}.")
+        if image_name in by_name:
+            raise RuntimeError(f"Chandra sidecar contains duplicate image_name: {image_name!r}.")
         by_name[image_name] = item
-        by_name[Path(image_name).stem] = item
+        if not strict_sidecar:
+            by_name[Path(image_name).stem] = item
+    if strict_sidecar and set(by_name) != expected_names:
+        raise RuntimeError("Chandra sidecar image mapping is not an exact raster bijection.")
 
     page_texts: list[str] = []
     total_chars = 0
     page_errors: list[dict[str, Any]] = []
     page_metadata: list[dict[str, Any]] = []
     for image_path, source_page in zip(image_paths, source_pages_1based, strict=True):
-        image_payload = by_name.get(image_path.name) or by_name.get(image_path.stem)
+        image_payload = by_name.get(image_path.name)
+        if image_payload is None and not strict_sidecar:
+            image_payload = by_name.get(image_path.stem)
         page_meta: dict[str, Any] = {"source_page": source_page}
         text_lines: list[str] = []
         if image_payload is not None:
@@ -1755,7 +2456,13 @@ def _collect_chandra_batch_outputs(
                 "ocr_outcome",
                 "explicit_nontext",
                 "attempt_count",
+                "terminal_attempt",
                 "retry_preprocessing",
+                "selected_attempt",
+                "chandra_retry_policy",
+                "attempt_history",
+                "source_raster_identity",
+                "source_raster_artifact",
             ):
                 value = image_payload.get(key)
                 if value is not None:
@@ -1801,7 +2508,13 @@ def _collect_chandra_batch_outputs(
                 "ocr_outcome",
                 "explicit_nontext",
                 "attempt_count",
+                "terminal_attempt",
                 "retry_preprocessing",
+                "selected_attempt",
+                "chandra_retry_policy",
+                "attempt_history",
+                "source_raster_identity",
+                "source_raster_artifact",
             ):
                 value = page_meta.get(key)
                 if value is not None:
@@ -1989,6 +2702,54 @@ def _collect_surya_batch_outputs(
     return page_texts, total_chars, page_errors, page_metadata
 
 
+def _attach_source_raster_identities(
+    *,
+    page_metadata: Sequence[dict[str, Any]],
+    identities_by_page: dict[int, dict[str, object]],
+    artifacts_by_page: dict[int, dict[str, object]] | None,
+    sidecar_key: str,
+) -> None:
+    seen: set[int] = set()
+    for row in page_metadata:
+        source_page = row.get("source_page")
+        if (
+            not isinstance(source_page, int)
+            or isinstance(source_page, bool)
+            or source_page in seen
+            or source_page not in identities_by_page
+        ):
+            raise RuntimeError("OCR page metadata cannot be bound to a unique source raster.")
+        seen.add(source_page)
+        identity = dict(identities_by_page[source_page])
+        row["source_raster_identity"] = identity
+        artifact: dict[str, object] | None = None
+        if artifacts_by_page is not None:
+            raw_artifact = artifacts_by_page.get(source_page)
+            if not isinstance(raw_artifact, dict):
+                raise RuntimeError(f"OCR page {source_page} has no sealed source raster artifact.")
+            artifact = dict(raw_artifact)
+            row["source_raster_artifact"] = artifact
+        raw_sidecar = row.get(sidecar_key)
+        if not isinstance(raw_sidecar, str):
+            continue
+        sidecar = Path(raw_sidecar)
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot attach source raster identity for page {source_page}: {exc}"
+            ) from exc
+        images = payload.get("images") if isinstance(payload, dict) else None
+        if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+            raise RuntimeError(
+                f"Cannot attach source raster identity to malformed page {source_page}."
+            )
+        images[0]["source_raster_identity"] = identity
+        if artifact is not None:
+            images[0]["source_raster_artifact"] = artifact
+        _write_json_atomic(sidecar, payload)
+
+
 def _persist_validated_surya_attempt_metadata(
     *,
     sidecar_path: Path,
@@ -2062,7 +2823,57 @@ def _run_extraction_engine_pagewise(
     if len(image_paths) != len(source_pages_1based):
         raise ValueError("image_paths and source_pages_1based lengths must match.")
 
+    source_raster_identities = [
+        _source_raster_identity(image_path, source_page=source_page)
+        for image_path, source_page in zip(
+            image_paths,
+            source_pages_1based,
+            strict=True,
+        )
+    ]
+    identities_by_page: dict[int, dict[str, object]] = {}
+    for identity in source_raster_identities:
+        raw_source_page = identity.get("source_page")
+        if (
+            not isinstance(raw_source_page, int)
+            or isinstance(raw_source_page, bool)
+            or raw_source_page <= 0
+            or raw_source_page in identities_by_page
+        ):
+            raise RuntimeError("Source raster identities are not page-bijective.")
+        identities_by_page[raw_source_page] = identity
+    if len(identities_by_page) != len(source_raster_identities):
+        raise RuntimeError("Source raster identities are not page-bijective.")
+
     if engine == OCR_ENGINE_SURYA and len(image_paths) > 0:
+        staged_image_paths: list[Path] = []
+        artifacts_by_page: dict[int, dict[str, object]] = {}
+        staged_root = work_dir / "source_evidence"
+        for image_path, source_page in zip(
+            image_paths,
+            source_pages_1based,
+            strict=True,
+        ):
+            source_image = _bounded_png_rgb_image(
+                image_path,
+                label=f"Surya source raster page {source_page}",
+                require_rgb=False,
+            )
+            staged_path = staged_root / image_path.name
+            if staged_path.exists():
+                raise RuntimeError(f"Surya staged source raster already exists: {staged_path}")
+            staged_path.parent.mkdir(parents=True, exist_ok=True)
+            source_image.save(staged_path, format="PNG")
+            staged_identity, staged_artifact, _staged_image = _source_raster_evidence(
+                staged_path,
+                source_page=source_page,
+                require_rgb=True,
+            )
+            if staged_identity != identities_by_page[source_page]:
+                raise RuntimeError(f"Surya staged source raster changed page {source_page} pixels")
+            staged_image_paths.append(staged_path)
+            artifacts_by_page[source_page] = staged_artifact
+        image_paths = tuple(staged_image_paths)
         batch_work_dir = work_dir / "batch"
         try:
             aggregate_text, aggregate_chars = _run_surya_direct(
@@ -2075,6 +2886,17 @@ def _run_extraction_engine_pagewise(
         except Exception as exc:
             preview = "; ".join(f"p{page}: {exc}" for page in source_pages_1based[:3])
             raise RuntimeError(f"all sampled pages failed for {engine}: {preview}") from exc
+        for image_path, source_page in zip(
+            image_paths,
+            source_pages_1based,
+            strict=True,
+        ):
+            _validate_source_raster_seal(
+                path=image_path,
+                source_page=source_page,
+                identity=identities_by_page[source_page],
+                artifact=artifacts_by_page[source_page],
+            )
 
         sidecar_path = batch_work_dir / "surya_page_lines.json"
         if sidecar_path.exists():
@@ -2104,6 +2926,9 @@ def _run_extraction_engine_pagewise(
         for page_index, (image_path, source_page) in enumerate(
             zip(image_paths, source_pages_1based, strict=True)
         ):
+            initial_rows = [
+                item for item in page_metadata if item.get("source_page") == source_page
+            ]
             initial_row = _structured_surya_zero_output(
                 page_errors=page_errors,
                 page_metadata=page_metadata,
@@ -2114,32 +2939,58 @@ def _run_extraction_engine_pagewise(
                 permitted_execution_paths=_SURYA_DIRECT_EXECUTION_PATHS,
                 label="initial zero-output evidence",
             )
-            if initial_row is None:
-                continue
-            initial_sidecar_raw = initial_row.get("surya_page_lines_path")
+            if len(initial_rows) != 1:
+                matching_errors = [
+                    item for item in page_errors if item.get("source_page") == source_page
+                ]
+                if not defer_empty_pages and _surya_require_geometry_sidecar() and matching_errors:
+                    preview = "; ".join(
+                        f"p{item['source_page']}: {item['error']}" for item in matching_errors[:3]
+                    )
+                    raise RuntimeError(
+                        f"surya geometry sidecar is required for each page: {preview}"
+                    )
+                raise RuntimeError("Cannot seal Surya attempt 1 without exact page metadata.")
+            initial_metadata = initial_rows[0]
+            initial_outcome = initial_metadata.get("ocr_outcome")
+            if initial_outcome not in {
+                _OCR_OUTCOME_TEXT,
+                _OCR_OUTCOME_VERIFIED_BLANK,
+                _OCR_OUTCOME_ZERO,
+            }:
+                raise RuntimeError("Cannot seal invalid Surya attempt 1 outcome.")
+            initial_sidecar_raw = initial_metadata.get("surya_page_lines_path")
             if not isinstance(initial_sidecar_raw, str):
-                raise RuntimeError(
-                    "Invalid initial zero-output evidence: durable geometry path is missing."
-                )
+                raise RuntimeError("Cannot seal Surya attempt 1 without durable geometry.")
             initial_sidecar = Path(initial_sidecar_raw)
             retry_root = work_dir / "zero_output_retry" / f"page_{source_page:04d}"
             retained_initial_image = _copy_retry_evidence(
                 source=image_path,
                 target=retry_root / "attempt_1_original" / "input" / image_path.name,
+                max_bytes=_MAX_CHANDRA_ATTEMPT_IMAGE_BYTES,
             )
             retained_initial_sidecar = _copy_retry_evidence(
                 source=initial_sidecar,
                 target=(retry_root / "attempt_1_original" / "module" / "surya_page_lines.json"),
+                max_bytes=_MAX_OCR_TEXT_ARTIFACT_BYTES,
             )
             attempt_history = [
                 _attempt_history_record(
                     attempt=1,
                     preprocessing="original",
-                    ocr_outcome=_OCR_OUTCOME_ZERO,
+                    ocr_outcome=str(initial_outcome),
                     image_path=retained_initial_image,
                     sidecar_path=retained_initial_sidecar,
                 )
             ]
+            _attach_surya_retry_provenance(
+                page_metadata=page_metadata,
+                source_page=source_page,
+                selected_attempt=1,
+                attempt_history=attempt_history,
+            )
+            if initial_row is None:
+                continue
 
             retry_image = retry_root / "attempt_2_autocontrast" / "input" / image_path.name
             retry_image_evidence = _write_autocontrast_retry_image(
@@ -2354,6 +3205,23 @@ def _run_extraction_engine_pagewise(
                 item for item in page_metadata if item.get("source_page") != source_page
             ]
             page_metadata.extend(selected_metadata)
+        for image_path, source_page in zip(
+            image_paths,
+            source_pages_1based,
+            strict=True,
+        ):
+            _validate_source_raster_seal(
+                path=image_path,
+                source_page=source_page,
+                identity=identities_by_page[source_page],
+                artifact=artifacts_by_page[source_page],
+            )
+        _attach_source_raster_identities(
+            page_metadata=page_metadata,
+            identities_by_page=identities_by_page,
+            artifacts_by_page=artifacts_by_page,
+            sidecar_key="surya_page_lines_path",
+        )
         total_chars = sum(len(text) for text in page_texts)
 
         successful_pages = {
@@ -2397,6 +3265,7 @@ def _run_extraction_engine_pagewise(
             which_fn=which_fn,
             run_cmd=run_cmd,
             page_progress_cb=_on_chandra_page_progress,
+            source_raster_identities=source_raster_identities,
         )
         sidecar = batch_work_dir / "chandra_page_lines.json"
         if sidecar.exists():
@@ -2763,14 +3632,6 @@ def _run_surya_module_cli(
     os.environ.setdefault("MODEL_CACHE_DIR", str(_DEFAULT_SURYA_MODEL_CACHE_HOME))
     os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
     os.environ.setdefault("MODELSCOPE_CACHE", str(_DEFAULT_MODELSCOPE_CACHE_HOME))
-    # Surya opens images via PIL internally — lift the decompression-bomb
-    # guard so it can process high-resolution pages.
-    try:
-        from PIL import Image as _PIL_Image
-
-        _PIL_Image.MAX_IMAGE_PIXELS = None
-    except Exception:
-        pass
     try:
         from surya.scripts.ocr_text import ocr_text_cli
     except Exception as exc:
@@ -2855,14 +3716,6 @@ def _run_mineru_module_cli(
             stacklevel=2,
         )
         mineru_lang = "en"
-    # MinerU converts input images to PDF internally via PIL — lift the
-    # decompression-bomb guard before importing the module.
-    try:
-        from PIL import Image as _PIL_Image
-
-        _PIL_Image.MAX_IMAGE_PIXELS = None
-    except Exception:
-        pass
     from mineru.cli.client import main as mineru_main
 
     args = [
@@ -3095,26 +3948,45 @@ def _run_chandra_module(
     lang: str,
     work_dir: Path,
     page_progress_cb: Callable[[int, int], None] | None = None,
+    source_raster_identities: Sequence[dict[str, object]] | None = None,
 ) -> tuple[str, int]:
     """Run Chandra OCR via direct Python module import (preferred path)."""
     if len(image_paths) == 0:
         raise ValueError("No images for Chandra OCR.")
 
+    if source_raster_identities is None:
+        source_raster_identities = [
+            _source_raster_identity(image_path, source_page=index)
+            for index, image_path in enumerate(image_paths, start=1)
+        ]
+    if len(source_raster_identities) != len(image_paths):
+        raise RuntimeError("Chandra source raster identity cardinality is invalid.")
+    sealed_source_identities: list[dict[str, object]] = []
+    for image_path, raw_identity in zip(
+        image_paths,
+        source_raster_identities,
+        strict=True,
+    ):
+        if not isinstance(raw_identity, dict):
+            raise RuntimeError("Chandra source raster identity is malformed.")
+        source_page = raw_identity.get("source_page")
+        if not isinstance(source_page, int) or isinstance(source_page, bool):
+            raise RuntimeError("Chandra source raster page identity is malformed.")
+        expected_identity = _source_raster_identity(image_path, source_page=source_page)
+        if raw_identity != expected_identity:
+            raise RuntimeError(
+                f"Chandra source raster identity changed before OCR: {image_path.name}"
+            )
+        sealed_source_identities.append(expected_identity)
+
     work_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("HF_HOME", str(_DEFAULT_HF_CACHE_HOME))
     _ensure_chandra_cache_ready()
     selected_device = _configure_chandra_runtime_device()
-    # Chandra uses PIL internally; lift the decompression-bomb guard.
-    try:
-        from PIL import Image as _PIL_Image
-
-        _PIL_Image.MAX_IMAGE_PIXELS = None
-    except Exception:
-        pass
-
     from chandra.model import InferenceManager
     from chandra.model.schema import BatchInputItem
     from chandra.input import load_image
+    from chandra.prompts import PROMPT_MAPPING
 
     def _safe_bbox(raw_bbox: Any, width: int, height: int) -> list[float] | None:
         parsed = _bbox_values(raw_bbox)
@@ -3151,12 +4023,18 @@ def _run_chandra_module(
         *,
         width: int,
         height: int,
-    ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+        allow_graphic_text: bool = False,
+    ) -> tuple[list[str], list[dict[str, Any]], list[str], list[str]]:
         page_texts: list[str] = []
         page_lines: list[dict[str, Any]] = []
         labels: list[str] = []
+        ignored_graphic_lines: list[str] = []
         for result in results:
-            chunks = getattr(result, "chunks", None)
+            chunks = (
+                result.get("chunks")
+                if isinstance(result, dict)
+                else getattr(result, "chunks", None)
+            )
             if isinstance(chunks, list):
                 for chunk in chunks:
                     if not isinstance(chunk, dict):
@@ -3165,8 +4043,18 @@ def _run_chandra_module(
                     if label:
                         labels.append(label)
                     if label in _CHANDRA_NON_TEXT_LABELS:
-                        continue
-                    chunk_lines = _chandra_chunk_lines(chunk.get("content"))
+                        if label in _CHANDRA_GRAPHIC_LABELS:
+                            ignored_graphic_lines.extend(
+                                _chandra_graphic_chunk_ignored_lines(chunk.get("content"))
+                            )
+                        if not allow_graphic_text:
+                            continue
+                        chunk_lines = _chandra_graphic_chunk_lines(chunk.get("content"))
+                    else:
+                        chunk_lines = _chandra_chunk_lines(chunk.get("content"))
+                    chunk_lines = [
+                        cleaned for line in chunk_lines if (cleaned := _clean_overlay_line(line))
+                    ]
                     if not chunk_lines:
                         continue
                     page_texts.extend(chunk_lines)
@@ -3178,50 +4066,288 @@ def _run_chandra_module(
                                 bbox=bbox,
                             )
                         )
-            if not page_texts:
-                md = getattr(result, "markdown", "") or ""
+            raw_markdown = (
+                result.get("markdown", "")
+                if isinstance(result, dict)
+                else getattr(result, "markdown", "")
+            )
+            if (
+                not page_texts
+                and not allow_graphic_text
+                and not (set(labels) & _CHANDRA_GRAPHIC_LABELS)
+            ):
+                md = raw_markdown or ""
                 md = _strip_markdown(md.strip())
                 if md:
-                    for line in md.splitlines():
-                        line = line.strip()
-                        if line:
-                            page_texts.append(line)
-        return page_texts, page_lines, labels
+                    raise RuntimeError("Chandra OCR recovered text without complete geometry.")
+        return page_texts, page_lines, labels, ignored_graphic_lines
 
     def _explicit_nontext(labels: Sequence[str]) -> bool:
         normalized = {label.strip().lower() for label in labels if label.strip()}
         return bool(normalized & _CHANDRA_GRAPHIC_LABELS) and normalized <= _CHANDRA_NON_TEXT_LABELS
 
+    prompt_sha256 = {
+        prompt_type: hashlib.sha256(PROMPT_MAPPING[prompt_type].encode("utf-8")).hexdigest()
+        for prompt_type in (_CHANDRA_LAYOUT_PROMPT_TYPE, _CHANDRA_PLAIN_PROMPT_TYPE)
+    }
+
+    def _nonspace_text(lines: Sequence[str]) -> str:
+        normalized = unicodedata.normalize("NFKC", "\n".join(lines))
+        return "".join(char for char in normalized if not char.isspace())
+
+    def _canonical_alnum_text(lines: Sequence[str]) -> str:
+        return _chandra_canonical_alnum(lines)
+
+    def _normalized_raw_result(result: Any) -> dict[str, Any]:
+        raw_chunks = (
+            result.get("chunks") if isinstance(result, dict) else getattr(result, "chunks", None)
+        )
+        if raw_chunks is None:
+            raw_chunks = []
+        if not isinstance(raw_chunks, list):
+            raise RuntimeError("Chandra returned malformed chunks.")
+        chunks: list[dict[str, Any]] = []
+        for raw_chunk in raw_chunks:
+            if not isinstance(raw_chunk, dict):
+                raise RuntimeError("Chandra returned a non-object chunk.")
+            raw_bbox = raw_chunk.get("bbox")
+            if raw_bbox is None:
+                normalized_bbox: Any = None
+            elif (
+                isinstance(raw_bbox, Sequence)
+                and not isinstance(raw_bbox, (str, bytes))
+                and len(raw_bbox) == 4
+                and all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    for value in raw_bbox
+                )
+            ):
+                normalized_bbox = [float(value) for value in raw_bbox]
+            else:
+                raise RuntimeError("Chandra returned an invalid chunk bbox.")
+            raw_label = raw_chunk.get("label")
+            raw_content = raw_chunk.get("content")
+            if raw_label is not None and not isinstance(raw_label, str):
+                raise RuntimeError("Chandra returned a non-string chunk label.")
+            if raw_content is not None and not isinstance(raw_content, str):
+                raise RuntimeError("Chandra returned non-string chunk content.")
+            chunks.append(
+                {
+                    "label": raw_label or "",
+                    "content": raw_content,
+                    "bbox": normalized_bbox,
+                }
+            )
+        raw_html = (
+            result.get("html", "") if isinstance(result, dict) else getattr(result, "html", "")
+        )
+        raw_markdown = (
+            result.get("markdown", "")
+            if isinstance(result, dict)
+            else getattr(result, "markdown", "")
+        )
+        if raw_html is not None and not isinstance(raw_html, str):
+            raise RuntimeError("Chandra returned non-string html.")
+        if raw_markdown is not None and not isinstance(raw_markdown, str):
+            raise RuntimeError("Chandra returned non-string markdown.")
+        return {
+            "error": False,
+            "chunks": chunks,
+            "html": raw_html or "",
+            "markdown": raw_markdown or "",
+        }
+
+    def _generate_attempt(
+        *,
+        attempt: int,
+        image: Image.Image,
+        prompt_type: str,
+        preprocessing: str,
+        width: int,
+        height: int,
+        evidence_dir: Path,
+        source_raster_identity: dict[str, object],
+        allow_graphic_text: bool = False,
+    ) -> tuple[
+        list[str],
+        list[dict[str, Any]],
+        list[str],
+        dict[str, Any],
+        dict[str, object],
+    ]:
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        if image.size != (width, height):
+            raise RuntimeError("Chandra attempt dimensions disagree with its declared image size.")
+        if (
+            width > _MAX_CHANDRA_ATTEMPT_IMAGE_DIMENSION
+            or height > _MAX_CHANDRA_ATTEMPT_IMAGE_DIMENSION
+            or width * height > _MAX_CHANDRA_ATTEMPT_IMAGE_PIXELS
+        ):
+            raise RuntimeError(
+                "Chandra attempt image exceeds the bounded dimension/pixel policy: "
+                f"{width}x{height}."
+            )
+        model_image = image.convert("RGB")
+        attempt_image_path = evidence_dir / "input.png"
+        model_image.save(attempt_image_path, format="PNG")
+        attempt_image_bytes = int(attempt_image_path.stat().st_size)
+        if attempt_image_bytes > _MAX_CHANDRA_ATTEMPT_IMAGE_BYTES:
+            raise RuntimeError(
+                f"Chandra attempt PNG exceeds the bounded byte policy: {attempt_image_bytes} bytes."
+            )
+        results = model.generate(
+            [BatchInputItem(image=model_image, prompt_type=prompt_type)],
+            include_images=False,
+            include_headers_footers=False,
+        )
+        if not isinstance(results, Sequence) or isinstance(results, (str, bytes)):
+            raise RuntimeError("Chandra returned a non-sequence batch result.")
+        if len(results) != 1:
+            raise RuntimeError(f"Chandra returned {len(results)} results for a one-image attempt.")
+        result_error = (
+            results[0].get("error", False)
+            if isinstance(results[0], dict)
+            else getattr(results[0], "error", False)
+        )
+        if result_error is not False:
+            raise RuntimeError("Chandra marked the one-image attempt as failed.")
+        raw_result = _normalized_raw_result(results[0])
+        texts, lines, labels, ignored_graphic_lines = _parse_page_results(
+            [raw_result],
+            width=width,
+            height=height,
+            allow_graphic_text=allow_graphic_text,
+        )
+        nonspace_text = _nonspace_text(texts)
+        geometry_text = _nonspace_text([str(line.get("text") or "") for line in lines])
+        if texts and (not lines or geometry_text != nonspace_text):
+            raise RuntimeError("Chandra OCR recovered text without complete geometry.")
+        if lines:
+            ordered_bboxes: list[tuple[float, float, float, float]] = []
+            for line in lines:
+                parsed_line_bbox = _bbox_values(line.get("bbox"))
+                if parsed_line_bbox is None:
+                    raise RuntimeError("Chandra parsed line has invalid geometry.")
+                ordered_bboxes.append(parsed_line_bbox)
+            order = _bbox_reading_order_indices(
+                ordered_bboxes,
+                page_width=float(width),
+            )
+            canonical_text = _canonical_alnum_text(
+                [str(lines[index].get("text") or "") for index in order]
+            )
+        else:
+            canonical_text = ""
+        alternative_text_evidence = _chandra_alternative_text_evidence(
+            raw_result=raw_result,
+            texts=texts,
+            ignored_graphic_lines=ignored_graphic_lines,
+        )
+        if texts and alternative_text_evidence["accounting"] == "unaccounted":
+            raise RuntimeError("Chandra OCR recovered text with unaccounted alternative text.")
+        explicit_nontext = (
+            not texts
+            and _explicit_nontext(labels)
+            and alternative_text_evidence["accounting"] in {"empty", "ignored_graphic_description"}
+        )
+        if texts:
+            outcome = _OCR_OUTCOME_TEXT
+        elif explicit_nontext:
+            outcome = _OCR_OUTCOME_EXPLICIT_NONTEXT
+        else:
+            outcome = _OCR_OUTCOME_ZERO
+        evidence = {
+            "attempt": attempt,
+            "source_raster_identity": dict(source_raster_identity),
+            "prompt_type": prompt_type,
+            "prompt_sha256": prompt_sha256[prompt_type],
+            "preprocessing": preprocessing,
+            "content_filter_policy": (
+                _CHANDRA_PLAIN_CONTENT_FILTER
+                if prompt_type == _CHANDRA_PLAIN_PROMPT_TYPE
+                else _CHANDRA_LAYOUT_CONTENT_FILTER
+            ),
+            "alternative_text_evidence": alternative_text_evidence,
+            "labels": sorted(set(labels)),
+            "text_chars": sum(len(line) for line in texts),
+            "canonical_alnum_chars": len(canonical_text),
+            "canonical_alnum_sha256": hashlib.sha256(canonical_text.encode("utf-8")).hexdigest(),
+            "geometry_lines": len(lines),
+            "explicit_nontext": explicit_nontext,
+            "ocr_outcome": outcome,
+        }
+        attempt_sidecar_path = evidence_dir / "chandra_attempt.json"
+        _write_json_atomic(
+            attempt_sidecar_path,
+            {
+                "schema": _CHANDRA_ATTEMPT_EVIDENCE_SCHEMA,
+                "source_raster_identity": dict(source_raster_identity),
+                "image_name": attempt_image_path.name,
+                "image_bbox": [0.0, 0.0, float(width), float(height)],
+                "raw_result": raw_result,
+                "parsed": {
+                    "texts": texts,
+                    "text_lines": lines,
+                    "labels": sorted(set(labels)),
+                },
+                "evidence": evidence,
+            },
+        )
+        history = {
+            "attempt": attempt,
+            "image_size": [width, height],
+            "image_path": str(attempt_image_path.resolve()),
+            "image_sha256": _sha256_path(attempt_image_path),
+            "image_bytes": attempt_image_bytes,
+            "sidecar_path": str(attempt_sidecar_path.resolve()),
+            "sidecar_sha256": _sha256_path(attempt_sidecar_path),
+            "sidecar_bytes": int(attempt_sidecar_path.stat().st_size),
+        }
+        return texts, lines, labels, evidence, history
+
     collected: list[str] = []
     sidecar_images: list[dict[str, Any]] = []
     total_pages = len(image_paths)
     sidecar_path = work_dir / "chandra_page_lines.json"
-    for page_idx, image_path in enumerate(image_paths, start=1):
-        pil_image = load_image(str(image_path))
-        width, height = pil_image.size
-        original_batch = [BatchInputItem(image=pil_image, prompt_type="ocr_layout")]
-        results = model.generate(
-            original_batch,
-            include_images=False,
-            include_headers_footers=False,
+    for page_idx, (image_path, source_raster_identity) in enumerate(
+        zip(image_paths, sealed_source_identities, strict=True),
+        start=1,
+    ):
+        page_attempt_root = work_dir / "attempt_evidence" / f"page_{page_idx:04d}"
+        with Image.open(image_path) as opened_source:
+            opened_source.load()
+            source_image = opened_source.convert("RGB")
+        source_raster_path = page_attempt_root / "source.png"
+        source_raster_path.parent.mkdir(parents=True, exist_ok=True)
+        source_image.save(source_raster_path, format="PNG")
+        source_raster_artifact = _source_raster_artifact(source_raster_path)
+        expected_model_size = _bounded_chandra_model_input_size(*source_image.size)
+        pil_image = load_image(
+            str(source_raster_path),
+            min_image_dim=_CHANDRA_MIN_IMAGE_DIM,
         )
-        page_texts, page_lines, labels = _parse_page_results(
-            results,
+        if pil_image.size != expected_model_size:
+            raise RuntimeError(
+                "Chandra loader returned unexpected model input dimensions: "
+                f"expected {expected_model_size}, got {pil_image.size}."
+            )
+        width, height = pil_image.size
+        page_texts, page_lines, labels, original_attempt, original_history = _generate_attempt(
+            attempt=1,
+            image=pil_image,
+            prompt_type=_CHANDRA_LAYOUT_PROMPT_TYPE,
+            preprocessing="original",
             width=width,
             height=height,
+            evidence_dir=page_attempt_root / "attempt_1",
+            source_raster_identity=source_raster_identity,
         )
         observed_labels = list(labels)
-        attempts: list[dict[str, Any]] = [
-            {
-                "attempt": 1,
-                "preprocessing": "original",
-                "labels": sorted(set(labels)),
-                "text_chars": sum(len(line) for line in page_texts),
-                "geometry_lines": len(page_lines),
-                "explicit_nontext": _explicit_nontext(labels),
-            }
-        ]
-        blank_page = not page_texts and _is_effectively_blank_page_image(image_path)
+        attempts: list[dict[str, Any]] = [original_attempt]
+        attempt_history: list[dict[str, object]] = [original_history]
+        blank_page = not page_texts and bool(source_raster_identity["verified_blank"])
         if not page_texts and not blank_page:
             retry_image = ImageOps.autocontrast(pil_image.convert("RGB"), cutoff=1)
             if retry_image.size != (width, height):
@@ -3229,40 +4355,45 @@ def _run_chandra_module(
                     "Chandra zero-output retry changed image dimensions "
                     f"from {(width, height)} to {retry_image.size}."
                 )
-            retry_batch = [BatchInputItem(image=retry_image, prompt_type="ocr_layout")]
-            retry_results = model.generate(
-                retry_batch,
-                include_images=False,
-                include_headers_footers=False,
-            )
-            page_texts, page_lines, labels = _parse_page_results(
-                retry_results,
+            page_texts, page_lines, labels, retry_attempt, retry_history = _generate_attempt(
+                attempt=2,
+                image=retry_image,
+                prompt_type=_CHANDRA_LAYOUT_PROMPT_TYPE,
+                preprocessing=_ZERO_OUTPUT_RETRY_PREPROCESSING,
                 width=width,
                 height=height,
+                evidence_dir=page_attempt_root / "attempt_2",
+                source_raster_identity=source_raster_identity,
             )
             observed_labels.extend(labels)
-            attempts.append(
-                {
-                    "attempt": 2,
-                    "preprocessing": _ZERO_OUTPUT_RETRY_PREPROCESSING,
-                    "labels": sorted(set(labels)),
-                    "text_chars": sum(len(line) for line in page_texts),
-                    "geometry_lines": len(page_lines),
-                    "explicit_nontext": _explicit_nontext(labels),
-                }
-            )
+            attempts.append(retry_attempt)
+            attempt_history.append(retry_history)
 
-        if not page_lines and page_texts:
-            # Keep geometry mode usable even when upstream parser returns
-            # content without valid per-block bboxes.
-            page_lines.extend(
-                _chandra_expand_chunk_to_line_boxes(
-                    lines=page_texts,
-                    bbox=[0.0, 0.0, float(width), float(height)],
-                )
+        if not page_texts and not blank_page:
+            page_texts, page_lines, labels, plain_attempt, plain_history = _generate_attempt(
+                attempt=3,
+                image=pil_image,
+                prompt_type=_CHANDRA_PLAIN_PROMPT_TYPE,
+                preprocessing="original",
+                width=width,
+                height=height,
+                evidence_dir=page_attempt_root / "attempt_3",
+                source_raster_identity=source_raster_identity,
+                allow_graphic_text=True,
             )
+            observed_labels.extend(labels)
+            attempts.append(plain_attempt)
+            attempt_history.append(plain_history)
 
-        explicit_nontext = not page_texts and _explicit_nontext(observed_labels)
+        plain_labels = set(attempts[2]["labels"]) if len(attempts) == 3 else set()
+        explicit_nontext = (
+            not page_texts
+            and not blank_page
+            and len(attempts) == 3
+            and all(item["explicit_nontext"] is True for item in attempts)
+            and bool(plain_labels & _CHANDRA_GRAPHIC_LABELS)
+            and plain_labels <= _CHANDRA_NON_TEXT_LABELS
+        )
         if page_texts:
             ocr_outcome = _OCR_OUTCOME_TEXT
         elif blank_page:
@@ -3275,13 +4406,18 @@ def _run_chandra_module(
         collected.append("\n".join(page_texts))
         image_evidence: dict[str, Any] = {
             "image_name": image_path.name,
+            "source_raster_identity": dict(source_raster_identity),
+            "source_raster_artifact": source_raster_artifact,
             "ocr_outcome": ocr_outcome,
             "explicit_nontext": explicit_nontext,
             "chandra_non_text_labels": sorted(
                 {label for label in observed_labels if label in _CHANDRA_NON_TEXT_LABELS}
             ),
             "attempt_count": len(attempts),
+            "terminal_attempt": len(attempts),
+            "chandra_retry_policy": _CHANDRA_ZERO_OUTPUT_RETRY_POLICY,
             "attempts": attempts,
+            "attempt_history": attempt_history,
             "pages": [
                 {
                     "image_bbox": [0.0, 0.0, float(width), float(height)],
@@ -3290,8 +4426,12 @@ def _run_chandra_module(
                 }
             ],
         }
+        if page_texts:
+            image_evidence["selected_attempt"] = len(attempts)
         if len(attempts) == 2:
             image_evidence["retry_preprocessing"] = _ZERO_OUTPUT_RETRY_PREPROCESSING
+        elif len(attempts) == 3:
+            image_evidence["retry_preprocessing"] = _CHANDRA_PLAIN_RETRY_PREPROCESSING
         sidecar_images.append(image_evidence)
         _write_json_atomic(sidecar_path, {"images": sidecar_images})
         if page_progress_cb is not None:
@@ -3370,6 +4510,7 @@ def _run_chandra_direct(
     which_fn: WhichExecutable = shutil.which,
     run_cmd: RunCommand = subprocess.run,
     page_progress_cb: Callable[[int, int], None] | None = None,
+    source_raster_identities: Sequence[dict[str, object]] | None = None,
 ) -> tuple[str, int]:
     (work_dir / "chandra_page_lines.json").unlink(missing_ok=True)
     # Primary: direct Python module import (no CLI binary needed).
@@ -3380,6 +4521,7 @@ def _run_chandra_direct(
             lang=lang,
             work_dir=work_dir,
             page_progress_cb=page_progress_cb,
+            source_raster_identities=source_raster_identities,
         )
     except Exception as exc:
         module_error = exc
