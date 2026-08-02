@@ -57,6 +57,19 @@ def _write_fixture_png(path: Path) -> None:
     Image.new("RGB", (120, 80), color=(96, 96, 96)).save(path, format="PNG")
 
 
+def _set_exact_gpu0_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UNISCAN_GPU_DEVICE_ID", ocr_benchmark_mod._EXPECTED_GPU0_UUID)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+
+
+def _gpu0_attestation_result() -> SimpleNamespace:
+    return SimpleNamespace(
+        returncode=0,
+        stdout=f"0, {ocr_benchmark_mod._EXPECTED_GPU0_UUID}\n",
+        stderr="",
+    )
+
+
 def _load_fixture_chandra_image(path: str, min_image_dim: int = 1536) -> Image.Image:
     image = Image.open(path).convert("RGB")
     if image.width < min_image_dim or image.height < min_image_dim:
@@ -882,6 +895,9 @@ def test_olmocr_docker_defaults_single_page_to_permissive_error_rate(tmp_path, m
     monkeypatch.delenv("UNISCAN_OLMOCR_DOCKER_MAX_PAGE_ERROR_RATE", raising=False)
     monkeypatch.delenv("UNISCAN_OLMOCR_DOCKER_MAX_PAGE_RETRIES", raising=False)
     monkeypatch.delenv("UNISCAN_OLMOCR_DOCKER_PAGES_PER_GROUP", raising=False)
+    monkeypatch.delenv("UNISCAN_OLMOCR_DOCKER_GPU", raising=False)
+    monkeypatch.setenv("UNISCAN_OLMOCR_REQUIRE_GPU", "1")
+    _set_exact_gpu0_environment(monkeypatch)
 
     def fake_render(_image_paths, out_pdf):
         out_pdf.write_bytes(b"%PDF-1.4\n")
@@ -889,7 +905,9 @@ def test_olmocr_docker_defaults_single_page_to_permissive_error_rate(tmp_path, m
     def fake_collect(_workspace: Path):
         return "ok", 2
 
-    def fake_run(command, capture_output, text):
+    def fake_run(command, **_kwargs):
+        if command[0] == "nvidia-smi":
+            return _gpu0_attestation_result()
         captured["command"] = command
         workspace_dir = work_dir / "olmocr_docker" / "work" / "ws"
         workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -908,6 +926,10 @@ def test_olmocr_docker_defaults_single_page_to_permissive_error_rate(tmp_path, m
     assert text == "ok"
     assert chars == 2
     command = captured["command"]
+    assert command[command.index("--gpus") + 1] == ocr_benchmark_mod._EXPECTED_GPU0_DOCKER_SELECTOR
+    assert "CUDA_VISIBLE_DEVICES=0" in command
+    assert f"NVIDIA_VISIBLE_DEVICES={ocr_benchmark_mod._EXPECTED_GPU0_UUID}" in command
+    assert f"UNISCAN_GPU_DEVICE_ID={ocr_benchmark_mod._EXPECTED_GPU0_UUID}" in command
     assert "--max_page_error_rate" in command
     assert command[command.index("--max_page_error_rate") + 1] == "1.0"
 
@@ -920,6 +942,9 @@ def test_olmocr_docker_defaults_multi_page_to_relaxed_error_rate(tmp_path, monke
     captured: dict[str, list[str]] = {}
 
     monkeypatch.delenv("UNISCAN_OLMOCR_DOCKER_MAX_PAGE_ERROR_RATE", raising=False)
+    monkeypatch.delenv("UNISCAN_OLMOCR_DOCKER_GPU", raising=False)
+    monkeypatch.setenv("UNISCAN_OLMOCR_REQUIRE_GPU", "1")
+    _set_exact_gpu0_environment(monkeypatch)
 
     def fake_render(_image_paths, out_pdf):
         out_pdf.write_bytes(b"%PDF-1.4\n")
@@ -927,7 +952,9 @@ def test_olmocr_docker_defaults_multi_page_to_relaxed_error_rate(tmp_path, monke
     def fake_collect(_workspace: Path):
         return "ok", 2
 
-    def fake_run(command, capture_output, text):
+    def fake_run(command, **_kwargs):
+        if command[0] == "nvidia-smi":
+            return _gpu0_attestation_result()
         captured["command"] = command
         workspace_dir = work_dir / "olmocr_docker" / "work" / "ws"
         workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -958,6 +985,9 @@ def test_olmocr_docker_respects_error_rate_overrides(tmp_path, monkeypatch) -> N
     monkeypatch.setenv("UNISCAN_OLMOCR_DOCKER_PAGES_PER_GROUP", "6")
     monkeypatch.setenv("UNISCAN_OLMOCR_DOCKER_MAX_PAGE_RETRIES", "12")
     monkeypatch.setenv("UNISCAN_OLMOCR_DOCKER_MAX_PAGE_ERROR_RATE", "0.25")
+    monkeypatch.delenv("UNISCAN_OLMOCR_DOCKER_GPU", raising=False)
+    monkeypatch.setenv("UNISCAN_OLMOCR_REQUIRE_GPU", "1")
+    _set_exact_gpu0_environment(monkeypatch)
 
     def fake_render(_image_paths, out_pdf):
         out_pdf.write_bytes(b"%PDF-1.4\n")
@@ -965,7 +995,9 @@ def test_olmocr_docker_respects_error_rate_overrides(tmp_path, monkeypatch) -> N
     def fake_collect(_workspace: Path):
         return "ok", 2
 
-    def fake_run(command, capture_output, text):
+    def fake_run(command, **_kwargs):
+        if command[0] == "nvidia-smi":
+            return _gpu0_attestation_result()
         captured["command"] = command
         workspace_dir = work_dir / "olmocr_docker" / "work" / "ws"
         workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -987,6 +1019,217 @@ def test_olmocr_docker_respects_error_rate_overrides(tmp_path, monkeypatch) -> N
     assert command[command.index("--pages_per_group") + 1] == "6"
     assert command[command.index("--max_page_retries") + 1] == "12"
     assert command[command.index("--max_page_error_rate") + 1] == "0.25"
+
+
+def test_olmocr_docker_rejects_unscoped_gpu_selector(tmp_path, monkeypatch) -> None:
+    image_path = tmp_path / "p1.png"
+    image_path.write_bytes(b"fake")
+    monkeypatch.setenv("UNISCAN_OLMOCR_DOCKER_GPU", "all")
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_render_images_to_pdf",
+        lambda _images, output: output.write_bytes(b"%PDF-1.4\n"),
+    )
+
+    with pytest.raises(RuntimeError, match="GPU-required olmOCR requires"):
+        ocr_benchmark_mod._run_olmocr_docker(
+            [image_path],
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: "docker",
+            run_cmd=lambda *_args, **_kwargs: pytest.fail("docker must not run"),
+        )
+
+
+def test_olmocr_docker_cpu_mode_never_queries_or_reserves_gpu(tmp_path, monkeypatch) -> None:
+    image_path = tmp_path / "p1.png"
+    image_path.write_bytes(b"fake")
+    work_dir = tmp_path / "work"
+    monkeypatch.setenv("UNISCAN_OLMOCR_REQUIRE_GPU", "0")
+    monkeypatch.delenv("UNISCAN_OLMOCR_DOCKER_GPU", raising=False)
+    _set_exact_gpu0_environment(monkeypatch)
+    monkeypatch.setenv("NVIDIA_VISIBLE_DEVICES", "all")
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_render_images_to_pdf",
+        lambda _images, output: output.write_bytes(b"%PDF-1.4\n"),
+    )
+    monkeypatch.setattr(
+        ocr_benchmark_mod, "_collect_olmocr_workspace_text", lambda _root: ("ok", 2)
+    )
+
+    def fake_run(command, **_kwargs):
+        assert command[0] == "docker"
+        assert "--gpus" not in command
+        assert "CUDA_VISIBLE_DEVICES=" in command
+        assert "NVIDIA_VISIBLE_DEVICES=none" in command
+        assert "UNISCAN_GPU_DEVICE_ID=" in command
+        assert "TORCH_DEVICE=cpu" in command
+        (work_dir / "olmocr_docker" / "work" / "ws").mkdir(parents=True)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    assert ocr_benchmark_mod._run_olmocr_docker(
+        [image_path],
+        work_dir=work_dir,
+        which_fn=lambda _name: "docker",
+        run_cmd=fake_run,
+    ) == ("ok", 2)
+
+
+@pytest.mark.parametrize("backend", ["local", "auto"])
+@pytest.mark.parametrize(
+    ("configured_uuid", "visible", "error"),
+    [
+        (None, "0", "UNISCAN_GPU_DEVICE_ID"),
+        ("GPU-wrong", "0", "UNISCAN_GPU_DEVICE_ID"),
+        (ocr_benchmark_mod._EXPECTED_GPU0_UUID, "1", "CUDA_VISIBLE_DEVICES"),
+    ],
+)
+def test_olmocr_local_and_auto_block_invalid_gpu0_contract_before_launch(
+    tmp_path,
+    monkeypatch,
+    backend,
+    configured_uuid,
+    visible,
+    error,
+) -> None:
+    image_path = tmp_path / "p1.png"
+    image_path.write_bytes(b"fake")
+    monkeypatch.setenv("UNISCAN_OLMOCR_BACKEND", backend)
+    monkeypatch.setenv("UNISCAN_OLMOCR_REQUIRE_GPU", "1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+    if configured_uuid is None:
+        monkeypatch.delenv("UNISCAN_GPU_DEVICE_ID", raising=False)
+    else:
+        monkeypatch.setenv("UNISCAN_GPU_DEVICE_ID", configured_uuid)
+
+    with pytest.raises(RuntimeError, match=error):
+        ocr_benchmark_mod._run_olmocr_direct(
+            [image_path],
+            lang="rus",
+            work_dir=tmp_path / "work",
+            which_fn=lambda _name: pytest.fail("backend discovery must not run"),
+            run_cmd=lambda *_args, **_kwargs: pytest.fail("backend must not run"),
+        )
+
+
+def test_olmocr_local_attests_gpu0_before_backend_launch(tmp_path, monkeypatch) -> None:
+    image_path = tmp_path / "p1.png"
+    image_path.write_bytes(b"fake")
+    monkeypatch.setenv("UNISCAN_OLMOCR_BACKEND", "local")
+    monkeypatch.setenv("UNISCAN_OLMOCR_REQUIRE_GPU", "1")
+    _set_exact_gpu0_environment(monkeypatch)
+    monkeypatch.setenv("NVIDIA_VISIBLE_DEVICES", "all")
+    monkeypatch.setattr(
+        ocr_benchmark_mod, "_collect_olmocr_workspace_text", lambda _root: ("ok", 2)
+    )
+    events: list[str] = []
+
+    def fake_run(command, **kwargs):
+        if command[0] == "nvidia-smi":
+            events.append("attest")
+            return _gpu0_attestation_result()
+        events.append("backend")
+        environment = kwargs["env"]
+        assert environment["CUDA_VISIBLE_DEVICES"] == "0"
+        assert environment["NVIDIA_VISIBLE_DEVICES"] == ocr_benchmark_mod._EXPECTED_GPU0_UUID
+        assert environment["UNISCAN_GPU_DEVICE_ID"] == ocr_benchmark_mod._EXPECTED_GPU0_UUID
+        assert environment["TORCH_DEVICE"] == "cuda:0"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    assert ocr_benchmark_mod._run_olmocr_direct(
+        [image_path],
+        lang="rus",
+        work_dir=tmp_path / "work",
+        which_fn=lambda name: "olmocr" if name == "olmocr" else None,
+        run_cmd=fake_run,
+    ) == ("ok", 2)
+    assert events == ["attest", "backend"]
+
+
+def test_olmocr_local_cpu_mode_hides_inherited_gpu_without_query(tmp_path, monkeypatch) -> None:
+    image_path = tmp_path / "p1.png"
+    image_path.write_bytes(b"fake")
+    monkeypatch.setenv("UNISCAN_OLMOCR_BACKEND", "local")
+    monkeypatch.setenv("UNISCAN_OLMOCR_REQUIRE_GPU", "0")
+    _set_exact_gpu0_environment(monkeypatch)
+    monkeypatch.setenv("NVIDIA_VISIBLE_DEVICES", "all")
+    monkeypatch.setenv("TORCH_DEVICE", "auto")
+    monkeypatch.setattr(
+        ocr_benchmark_mod, "_collect_olmocr_workspace_text", lambda _root: ("ok", 2)
+    )
+
+    def fake_run(command, **kwargs):
+        assert command[0] != "nvidia-smi"
+        environment = kwargs["env"]
+        assert environment["CUDA_VISIBLE_DEVICES"] == ""
+        assert environment["NVIDIA_VISIBLE_DEVICES"] == "none"
+        assert "UNISCAN_GPU_DEVICE_ID" not in environment
+        assert environment["TORCH_DEVICE"] == "cpu"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    assert ocr_benchmark_mod._run_olmocr_direct(
+        [image_path],
+        lang="rus",
+        work_dir=tmp_path / "work",
+        which_fn=lambda name: "olmocr" if name == "olmocr" else None,
+        run_cmd=fake_run,
+    ) == ("ok", 2)
+
+
+def test_gpu0_contract_attests_exact_uuid_and_index(monkeypatch) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setenv("UNISCAN_GPU_DEVICE_ID", ocr_benchmark_mod._EXPECTED_GPU0_UUID)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=f"0, {ocr_benchmark_mod._EXPECTED_GPU0_UUID}\n",
+            stderr="",
+        )
+
+    assert (
+        ocr_benchmark_mod._require_gpu0_contract(fake_run) == ocr_benchmark_mod._EXPECTED_GPU0_UUID
+    )
+    assert calls == [
+        [
+            "nvidia-smi",
+            "--id=0",
+            "--query-gpu=index,uuid",
+            "--format=csv,noheader,nounits",
+        ]
+    ]
+
+
+def test_gpu0_contract_rejects_missing_environment(monkeypatch) -> None:
+    monkeypatch.delenv("UNISCAN_GPU_DEVICE_ID", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+    with pytest.raises(RuntimeError, match="UNISCAN_GPU_DEVICE_ID"):
+        ocr_benchmark_mod._require_gpu0_contract(
+            lambda *_args, **_kwargs: pytest.fail("nvidia-smi must not run")
+        )
+
+
+@pytest.mark.parametrize(
+    ("configured_uuid", "visible", "error"),
+    [
+        ("GPU-wrong", "0", "UNISCAN_GPU_DEVICE_ID"),
+        (ocr_benchmark_mod._EXPECTED_GPU0_UUID, "", "CUDA_VISIBLE_DEVICES"),
+        (ocr_benchmark_mod._EXPECTED_GPU0_UUID, "1", "CUDA_VISIBLE_DEVICES"),
+    ],
+)
+def test_gpu0_contract_rejects_wrong_uuid_or_visibility_before_query(
+    monkeypatch, configured_uuid, visible, error
+) -> None:
+    monkeypatch.setenv("UNISCAN_GPU_DEVICE_ID", configured_uuid)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+
+    with pytest.raises(RuntimeError, match=error):
+        ocr_benchmark_mod._require_gpu0_contract(
+            lambda *_args, **_kwargs: pytest.fail("nvidia-smi must not run")
+        )
 
 
 def test_run_extraction_engine_pagewise_keeps_partial_results(tmp_path, monkeypatch) -> None:
@@ -1146,11 +1389,7 @@ def test_run_extraction_engine_pagewise_collects_surya_sidecar(tmp_path, monkeyp
     for row, source_page in zip(pages_payload["pages"], source_pages, strict=True):
         artifact = row["source_raster_artifact"]
         expected_path = (
-            tmp_path
-            / "out"
-            / "surya"
-            / f"page_{source_page:04d}.surya-source"
-            / "source.png"
+            tmp_path / "out" / "surya" / f"page_{source_page:04d}.surya-source" / "source.png"
         ).resolve()
         assert artifact["path"] == str(expected_path)
         assert artifact["sha256"] == ocr_benchmark_mod._sha256_path(expected_path)
@@ -1808,6 +2047,8 @@ def test_write_pagewise_text_artifacts_copies_chandra_geometry(tmp_path: Path) -
 
 
 def test_configure_chandra_runtime_device_prefers_cuda(monkeypatch) -> None:
+    monkeypatch.setattr(ocr_benchmark_mod, "_require_gpu0_contract", lambda: "gpu0")
+
     class _Cuda:
         @staticmethod
         def is_available() -> bool:
@@ -1829,6 +2070,8 @@ def test_configure_chandra_runtime_device_prefers_cuda(monkeypatch) -> None:
 def test_configure_chandra_runtime_device_raises_when_gpu_required_without_cuda(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(ocr_benchmark_mod, "_require_gpu0_contract", lambda: "gpu0")
+
     class _Cuda:
         @staticmethod
         def is_available() -> bool:
@@ -1845,14 +2088,127 @@ def test_configure_chandra_runtime_device_raises_when_gpu_required_without_cuda(
 
 
 def test_configure_chandra_runtime_device_rejects_cpu_when_gpu_required(monkeypatch) -> None:
+    monkeypatch.setattr(ocr_benchmark_mod, "_require_gpu0_contract", lambda: "gpu0")
     monkeypatch.setenv("TORCH_DEVICE", "cpu")
     monkeypatch.delenv("UNISCAN_CHANDRA_REQUIRE_GPU", raising=False)
 
-    with pytest.raises(RuntimeError, match="TORCH_DEVICE='cpu'"):
+    with pytest.raises(RuntimeError, match="requires TORCH_DEVICE='cuda:0'"):
         ocr_benchmark_mod._configure_chandra_runtime_device()
 
 
+@pytest.mark.parametrize("explicit", ["auto", "mps", "cuda:1"])
+@pytest.mark.parametrize(
+    ("configure", "require_environment"),
+    [
+        (ocr_benchmark_mod._configure_chandra_runtime_device, "UNISCAN_CHANDRA_REQUIRE_GPU"),
+        (ocr_benchmark_mod._configure_surya_runtime_device, "UNISCAN_SURYA_REQUIRE_GPU"),
+    ],
+)
+def test_gpu_required_runtime_rejects_ambiguous_or_wrong_explicit_device(
+    monkeypatch, configure, require_environment, explicit
+) -> None:
+    monkeypatch.setenv(require_environment, "1")
+    monkeypatch.setenv("TORCH_DEVICE", explicit)
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_require_torch_cuda",
+        lambda _label: pytest.fail("invalid device must fail before GPU attestation"),
+    )
+
+    with pytest.raises(RuntimeError, match="requires TORCH_DEVICE='cuda:0'"):
+        configure()
+
+
+@pytest.mark.parametrize(
+    ("configure", "require_environment"),
+    [
+        (ocr_benchmark_mod._configure_chandra_runtime_device, "UNISCAN_CHANDRA_REQUIRE_GPU"),
+        (ocr_benchmark_mod._configure_surya_runtime_device, "UNISCAN_SURYA_REQUIRE_GPU"),
+    ],
+)
+@pytest.mark.parametrize("explicit", [None, "auto", "cpu"])
+def test_optional_runtime_forces_cpu_and_never_attests_gpu(
+    monkeypatch, configure, require_environment, explicit
+) -> None:
+    monkeypatch.setenv(require_environment, "0")
+    monkeypatch.setenv("UNISCAN_CHANDRA_DEVICE_POLICY", "auto")
+    if explicit is None:
+        monkeypatch.delenv("TORCH_DEVICE", raising=False)
+    else:
+        monkeypatch.setenv("TORCH_DEVICE", explicit)
+    _set_exact_gpu0_environment(monkeypatch)
+    monkeypatch.setenv("NVIDIA_VISIBLE_DEVICES", "all")
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_require_torch_cuda",
+        lambda _label: pytest.fail("optional CPU path must not query GPU"),
+    )
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_require_gpu0_contract",
+        lambda *_args, **_kwargs: pytest.fail("optional CPU path must not run nvidia-smi"),
+    )
+
+    assert configure() == "cpu"
+    assert os.environ["TORCH_DEVICE"] == "cpu"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == ""
+    assert os.environ["NVIDIA_VISIBLE_DEVICES"] == "none"
+    assert "UNISCAN_GPU_DEVICE_ID" not in os.environ
+
+
+def test_chandra_optional_legacy_preference_never_probes_gpu(monkeypatch) -> None:
+    monkeypatch.setenv("UNISCAN_CHANDRA_REQUIRE_GPU", "0")
+    monkeypatch.setenv("UNISCAN_CHANDRA_DEVICE_POLICY", "legacy")
+    monkeypatch.setenv("UNISCAN_CHANDRA_PREFER_GPU", "1")
+    monkeypatch.delenv("TORCH_DEVICE", raising=False)
+    _set_exact_gpu0_environment(monkeypatch)
+    monkeypatch.setenv("NVIDIA_VISIBLE_DEVICES", "all")
+    monkeypatch.setattr(
+        ocr_benchmark_mod,
+        "_require_gpu0_contract",
+        lambda *_args, **_kwargs: pytest.fail("optional legacy path must not run nvidia-smi"),
+    )
+
+    assert ocr_benchmark_mod._configure_chandra_runtime_device() == "cpu"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == ""
+    assert os.environ["NVIDIA_VISIBLE_DEVICES"] == "none"
+    assert "UNISCAN_GPU_DEVICE_ID" not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("configure", "require_environment"),
+    [
+        (ocr_benchmark_mod._configure_chandra_runtime_device, "UNISCAN_CHANDRA_REQUIRE_GPU"),
+        (ocr_benchmark_mod._configure_surya_runtime_device, "UNISCAN_SURYA_REQUIRE_GPU"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("configured_uuid", "visible", "error"),
+    [
+        (None, "0", "UNISCAN_GPU_DEVICE_ID"),
+        ("GPU-wrong", "0", "UNISCAN_GPU_DEVICE_ID"),
+        (ocr_benchmark_mod._EXPECTED_GPU0_UUID, "1", "CUDA_VISIBLE_DEVICES"),
+    ],
+)
+def test_gpu_required_runtime_blocks_invalid_contract_before_cuda_backend(
+    monkeypatch, configure, require_environment, configured_uuid, visible, error
+) -> None:
+    monkeypatch.setenv(require_environment, "1")
+    monkeypatch.delenv("TORCH_DEVICE", raising=False)
+    monkeypatch.setenv("UNISCAN_CHANDRA_DEVICE_POLICY", "cuda")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+    if configured_uuid is None:
+        monkeypatch.delenv("UNISCAN_GPU_DEVICE_ID", raising=False)
+    else:
+        monkeypatch.setenv("UNISCAN_GPU_DEVICE_ID", configured_uuid)
+
+    with pytest.raises(RuntimeError, match=error):
+        configure()
+
+
 def test_configure_surya_runtime_device_requires_cuda_by_default(monkeypatch) -> None:
+    monkeypatch.setattr(ocr_benchmark_mod, "_require_gpu0_contract", lambda: "gpu0")
+
     class _Cuda:
         @staticmethod
         def is_available() -> bool:
@@ -1868,6 +2224,8 @@ def test_configure_surya_runtime_device_requires_cuda_by_default(monkeypatch) ->
 
 
 def test_configure_surya_runtime_device_sets_cuda_when_required(monkeypatch) -> None:
+    monkeypatch.setattr(ocr_benchmark_mod, "_require_gpu0_contract", lambda: "gpu0")
+
     class _Cuda:
         @staticmethod
         def is_available() -> bool:
@@ -2071,6 +2429,7 @@ def test_run_surya_direct_disables_text_fallback_by_default(monkeypatch, tmp_pat
     monkeypatch.setattr(ocr_benchmark_mod, "_run_text_engine_from_cli", fail_if_called)
     monkeypatch.setattr(ocr_benchmark_mod, "_ensure_surya_cache_ready", lambda: None)
     monkeypatch.delenv("UNISCAN_SURYA_ALLOW_TEXT_FALLBACK", raising=False)
+    monkeypatch.delenv("TORCH_DEVICE", raising=False)
     monkeypatch.setenv("UNISCAN_SURYA_REQUIRE_GPU", "0")
 
     with pytest.raises(RuntimeError, match="Text-only fallback is disabled"):
@@ -2098,6 +2457,7 @@ def test_run_surya_direct_allows_text_fallback_when_enabled(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(ocr_benchmark_mod, "_ensure_surya_cache_ready", lambda: None)
     monkeypatch.setenv("UNISCAN_SURYA_ALLOW_TEXT_FALLBACK", "1")
+    monkeypatch.delenv("TORCH_DEVICE", raising=False)
     monkeypatch.setenv("UNISCAN_SURYA_REQUIRE_GPU", "0")
 
     text, chars = ocr_benchmark_mod._run_surya_direct(

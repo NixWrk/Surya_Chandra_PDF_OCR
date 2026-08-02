@@ -49,7 +49,9 @@ Expected versions after a healthy setup:
 1. `.venv_surya`: `torch==2.11.0+<selected CUDA wheel>`, `torchvision==0.26.0+<selected CUDA wheel>`, `torchaudio==2.11.0+<selected CUDA wheel>`, `pillow>=10.2,<11.0`.
 2. `.venv_chandra`: `torch==2.11.0+<selected CUDA wheel>`, `torchvision==0.26.0+<selected CUDA wheel>`, `torchaudio==2.11.0+<selected CUDA wheel>`.
 
-`setup_dual_venv.cmd` selects the PyTorch CUDA wheel from the first NVIDIA GPU reported by `nvidia-smi`:
+`setup_dual_venv.cmd` first attests host GPU index `0` against UUID
+`GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f`, then selects the PyTorch CUDA
+wheel from that device only. Any missing/mismatched device is a hard failure.
 
 1. `cu126` for GPUs below compute capability `7.5`, for example GTX 1070 / Pascal `sm_61`.
 2. `cu128` for GPUs with compute capability `7.5` or newer.
@@ -420,12 +422,14 @@ Docker GPU requirements:
 
 1. NVIDIA driver on the host.
 2. Docker with GPU support.
-3. Docker Compose with `gpus: all` support.
+3. Docker Compose with exact UUID device reservations.
 
 Quick GPU check:
 
 ```powershell
-docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus "device=GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f" `
+  nvidia/cuda:12.8.1-base-ubuntu22.04 `
+  nvidia-smi --id=0 --query-gpu=index,uuid,name --format=csv,noheader
 ```
 
 ## Runtime Caches
@@ -460,7 +464,8 @@ production fallbacks and are not exposed by the searchable-PDF service.
 Run `.\setup_dual_venv.cmd` again. The current setup script requires CUDA PyTorch and fails if a CUDA build cannot be installed.
 
 `cuda_available: False`:
-Check `nvidia-smi` first. If the driver cannot see the GPU, PyTorch cannot use it either.
+Run the scoped Docker check above. UniScan refuses to start unless container GPU
+index `0` maps to the permitted host UUID.
 
 `no kernel image is available for execution on the device`:
 The installed PyTorch CUDA wheel does not support your GPU architecture. For example, GTX 1070 is `sm_61`, while PyTorch `cu128` wheels support `sm_75+`. Re-run `setup_dual_venv.cmd`; it auto-selects `cu126` for older GPUs and verifies compatibility by running a tiny CUDA tensor before setup succeeds.

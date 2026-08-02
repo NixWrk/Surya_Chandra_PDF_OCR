@@ -10,7 +10,10 @@ services:
       - "127.0.0.1:${UNISCAN_HOST_PORT:-8000}:8000"
     environment:
       UNISCAN_HTTP_PORT: "8000"
-      CUDA_VISIBLE_DEVICES: "${UNISCAN_GPU_DEVICE_ID:-1}"
+      # Deliberately immutable: an environment override must never retarget
+      # the container to a foreign adapter before application preflight.
+      UNISCAN_GPU_DEVICE_ID: "GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f"
+      CUDA_VISIBLE_DEVICES: "0"
       UNISCAN_DEFAULT_LANG: "rus+eng"
       UNISCAN_WORK_ROOT: "/data/work"
       UNISCAN_CHANDRA_DEVICE_POLICY: "cuda"
@@ -45,7 +48,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["${UNISCAN_GPU_DEVICE_ID:-1}"]
+              device_ids: ["GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f"]
               capabilities: [gpu]
     restart: "no"
 

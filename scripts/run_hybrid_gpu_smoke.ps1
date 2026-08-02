@@ -12,6 +12,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+. (Join-Path $PSScriptRoot "gpu0_contract.ps1")
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $RepoRoot "outputs\gpu_hybrid_smoke"
 }
@@ -25,9 +26,7 @@ if (-not (Test-Path -LiteralPath $pyChandra)) {
 if (-not (Test-Path -LiteralPath $pySurya)) {
     throw "Missing Surya python: $pySurya. Run setup_dual_venv.cmd first."
 }
-if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
-    throw "nvidia-smi was not found. UniScan OCR smoke requires CUDA GPU."
-}
+$gpu0 = Assert-UniscanGpu0Contract -AdditionalFields @("name", "driver_version")
 
 $env:UNISCAN_CHANDRA_PYTHON = $pyChandra
 $env:UNISCAN_SURYA_PYTHON = $pySurya
@@ -65,7 +64,7 @@ $workPdf = Join-Path $runRoot "input.pdf"
 Copy-Item -LiteralPath $resolvedInput -Destination $workPdf -Force
 
 Write-Host "[gpu-smoke] CUDA inventory:" -ForegroundColor Cyan
-nvidia-smi
+Write-Host "  index=$($gpu0.index) uuid=$($gpu0.uuid) name=$($gpu0.name) driver=$($gpu0.driver_version)"
 
 $workRoot = Join-Path $runRoot "work"
 $args = @(

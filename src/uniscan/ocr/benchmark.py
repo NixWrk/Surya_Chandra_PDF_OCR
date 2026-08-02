@@ -20,7 +20,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Sequence, cast
+from typing import Any, Callable, MutableMapping, Sequence, cast
 
 from PIL import Image, ImageOps
 
@@ -78,6 +78,8 @@ _MAX_CHANDRA_ATTEMPT_IMAGE_PIXELS = 50_000_000
 _MAX_CHANDRA_ATTEMPT_IMAGE_DIMENSION = 32_768
 _SURYA_DIRECT_EXECUTION_PATHS = ("cli", "module")
 _SURYA_MODULE_EXECUTION_PATHS = ("module",)
+_EXPECTED_GPU0_UUID = "GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f"
+_EXPECTED_GPU0_DOCKER_SELECTOR = f"device={_EXPECTED_GPU0_UUID}"
 _OCR_OUTCOME_TEXT = "text"
 _OCR_OUTCOME_VERIFIED_BLANK = "verified_blank"
 _OCR_OUTCOME_EXPLICIT_NONTEXT = "explicit_nontext"
@@ -1372,7 +1374,62 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _hide_gpu_visibility(environment: MutableMapping[str, str]) -> None:
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    environment["NVIDIA_VISIBLE_DEVICES"] = "none"
+    environment.pop("UNISCAN_GPU_DEVICE_ID", None)
+
+
+def _configure_cpu_only_runtime() -> str:
+    _hide_gpu_visibility(os.environ)
+    os.environ["TORCH_DEVICE"] = "cpu"
+    return "cpu"
+
+
+def _require_gpu0_contract(
+    run_cmd: RunCommand = subprocess.run,
+) -> str:
+    configured_uuid = (os.environ.get("UNISCAN_GPU_DEVICE_ID") or "").strip()
+    if configured_uuid != _EXPECTED_GPU0_UUID:
+        raise RuntimeError(
+            "UNISCAN_GPU_DEVICE_ID must identify the permitted GPU0 UUID "
+            f"({_EXPECTED_GPU0_UUID}); got {configured_uuid or '<unset>'}."
+        )
+    visible = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    if visible != "0":
+        raise RuntimeError(f"CUDA_VISIBLE_DEVICES must be exactly 0; got {visible or '<unset>'}.")
+
+    command = [
+        "nvidia-smi",
+        "--id=0",
+        "--query-gpu=index,uuid",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        completed = run_cmd(command, capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"GPU0 attestation failed: {exc}") from exc
+    if int(getattr(completed, "returncode", 1)) != 0:
+        detail = (getattr(completed, "stderr", "") or "").strip() or "nvidia-smi failed"
+        raise RuntimeError(f"GPU0 attestation failed: {detail}")
+    rows = [
+        line.strip()
+        for line in (getattr(completed, "stdout", "") or "").splitlines()
+        if line.strip()
+    ]
+    if len(rows) != 1:
+        raise RuntimeError(f"GPU0 attestation must return exactly one row; got {len(rows)}.")
+    fields = [field.strip() for field in rows[0].split(",")]
+    if len(fields) != 2 or fields[0] != "0" or fields[1] != _EXPECTED_GPU0_UUID:
+        raise RuntimeError(f"GPU0 attestation mismatch: {rows[0]!r}.")
+    return _EXPECTED_GPU0_UUID
+
+
 def _torch_cuda_probe() -> tuple[bool, str]:
+    try:
+        _require_gpu0_contract()
+    except RuntimeError as exc:
+        return False, f"GPU0 contract failed: {exc}"
     try:
         import torch
     except Exception as exc:
@@ -1578,33 +1635,43 @@ def _configure_chandra_runtime_device() -> str:
     device_policy = (
         (os.environ.get("UNISCAN_CHANDRA_DEVICE_POLICY") or default_policy).strip().lower()
     )
-    prefer_gpu = _env_bool("UNISCAN_CHANDRA_PREFER_GPU", default=True)
-
     if explicit:
-        if explicit.lower().startswith("cpu") and require_gpu:
-            raise RuntimeError(
-                "Chandra GPU mode requires CUDA, but TORCH_DEVICE='cpu' was requested."
-            )
-        if explicit.lower().startswith("cuda"):
+        normalized_explicit = explicit.lower()
+        if require_gpu:
+            if normalized_explicit not in {"cuda", "cuda:0"}:
+                raise RuntimeError(
+                    f"Chandra GPU mode requires TORCH_DEVICE='cuda:0'; got {explicit!r}."
+                )
             _require_torch_cuda("Chandra")
-        return explicit
+            os.environ["TORCH_DEVICE"] = "cuda:0"
+            return "cuda:0"
+        if normalized_explicit not in {"auto", "cpu"}:
+            raise RuntimeError(
+                "Chandra optional/CPU mode forbids a GPU TORCH_DEVICE; "
+                "set UNISCAN_CHANDRA_REQUIRE_GPU=1 for CUDA."
+            )
+        return _configure_cpu_only_runtime()
 
     if device_policy == "auto":
-        # Leave TORCH_DEVICE unset so Chandra/Hugging Face can use device_map="auto".
         if require_gpu:
-            _require_torch_cuda("Chandra")
-        os.environ.pop("TORCH_DEVICE", None)
-        return "auto"
+            raise RuntimeError(
+                "Chandra GPU mode forbids UNISCAN_CHANDRA_DEVICE_POLICY='auto'; use 'cuda'."
+            )
+        return _configure_cpu_only_runtime()
 
     if device_policy == "cpu":
         if require_gpu:
             raise RuntimeError(
                 "Chandra GPU mode requires CUDA, but UNISCAN_CHANDRA_DEVICE_POLICY='cpu' was requested."
             )
-        os.environ["TORCH_DEVICE"] = "cpu"
-        return "cpu"
+        return _configure_cpu_only_runtime()
 
     if device_policy == "cuda":
+        if not require_gpu:
+            raise RuntimeError(
+                "Chandra optional/CPU mode forbids UNISCAN_CHANDRA_DEVICE_POLICY='cuda'; "
+                "set UNISCAN_CHANDRA_REQUIRE_GPU=1."
+            )
         _require_torch_cuda("Chandra")
         os.environ["TORCH_DEVICE"] = "cuda:0"
         return "cuda:0"
@@ -1614,20 +1681,12 @@ def _configure_chandra_runtime_device() -> str:
             "Unsupported UNISCAN_CHANDRA_DEVICE_POLICY. Use one of: auto, cuda, cpu."
         )
 
-    if not prefer_gpu and not require_gpu:
-        os.environ.setdefault("TORCH_DEVICE", "cpu")
-        return os.environ["TORCH_DEVICE"]
-
-    has_cuda, _detail = _torch_cuda_probe()
-    if has_cuda:
+    if require_gpu:
+        _require_torch_cuda("Chandra")
         os.environ["TORCH_DEVICE"] = "cuda:0"
         return "cuda:0"
 
-    if require_gpu:
-        _require_torch_cuda("Chandra")
-
-    os.environ.setdefault("TORCH_DEVICE", "cpu")
-    return os.environ["TORCH_DEVICE"]
+    return _configure_cpu_only_runtime()
 
 
 def _configure_surya_runtime_device() -> str:
@@ -1637,20 +1696,28 @@ def _configure_surya_runtime_device() -> str:
     require_gpu = _env_bool("UNISCAN_SURYA_REQUIRE_GPU", default=True)
 
     if explicit:
-        if explicit.lower().startswith("cpu") and require_gpu:
-            raise RuntimeError(
-                "Surya GPU mode requires CUDA, but TORCH_DEVICE='cpu' was requested."
-            )
-        if explicit.lower().startswith("cuda"):
+        normalized_explicit = explicit.lower()
+        if require_gpu:
+            if normalized_explicit not in {"cuda", "cuda:0"}:
+                raise RuntimeError(
+                    f"Surya GPU mode requires TORCH_DEVICE='cuda:0'; got {explicit!r}."
+                )
             _require_torch_cuda("Surya")
-        return explicit
+            os.environ["TORCH_DEVICE"] = "cuda:0"
+            return "cuda:0"
+        if normalized_explicit not in {"auto", "cpu"}:
+            raise RuntimeError(
+                "Surya optional/CPU mode forbids a GPU TORCH_DEVICE; "
+                "set UNISCAN_SURYA_REQUIRE_GPU=1 for CUDA."
+            )
+        return _configure_cpu_only_runtime()
 
     if require_gpu:
         _require_torch_cuda("Surya")
         os.environ["TORCH_DEVICE"] = "cuda:0"
         return "cuda:0"
 
-    return "auto"
+    return _configure_cpu_only_runtime()
 
 
 def _artifact_path_for_engine(output_dir: Path, pdf_stem: str, engine: str) -> Path:
@@ -4707,6 +4774,23 @@ def _run_olmocr_docker(
     if not docker_cmd:
         raise RuntimeError("docker is not available in PATH for olmOCR docker fallback.")
 
+    require_gpu = _env_bool("UNISCAN_OLMOCR_REQUIRE_GPU", default=True)
+    configured_gpu = (os.environ.get("UNISCAN_OLMOCR_DOCKER_GPU") or "").strip()
+    if require_gpu:
+        gpu = configured_gpu or _EXPECTED_GPU0_DOCKER_SELECTOR
+        if gpu != _EXPECTED_GPU0_DOCKER_SELECTOR:
+            raise RuntimeError(
+                "GPU-required olmOCR requires UNISCAN_OLMOCR_DOCKER_GPU="
+                f"{_EXPECTED_GPU0_DOCKER_SELECTOR!r}; got {gpu or '<unset>'!r}."
+            )
+        _require_gpu0_contract(run_cmd)
+    else:
+        if configured_gpu and configured_gpu.lower() != "none":
+            raise RuntimeError(
+                "CPU-only olmOCR requires UNISCAN_OLMOCR_DOCKER_GPU='none' or unset."
+            )
+        gpu = "none"
+
     docker_root = work_dir / "olmocr_docker"
     data_dir = docker_root / "data"
     work_root = docker_root / "work"
@@ -4720,7 +4804,6 @@ def _run_olmocr_docker(
     _render_images_to_pdf(image_paths, input_pdf)
 
     image = (os.environ.get("UNISCAN_OLMOCR_DOCKER_IMAGE") or "chatdoc/ocrflux:latest").strip()
-    gpu = (os.environ.get("UNISCAN_OLMOCR_DOCKER_GPU") or "all").strip()
     model = (os.environ.get("UNISCAN_OLMOCR_DOCKER_MODEL") or "").strip()
     workers = (os.environ.get("UNISCAN_OLMOCR_DOCKER_WORKERS") or "1").strip()
     gpu_mem_util = (os.environ.get("UNISCAN_OLMOCR_DOCKER_GPU_MEM_UTIL") or "").strip()
@@ -4745,8 +4828,16 @@ def _run_olmocr_docker(
     mount_cache = cache_dir.resolve().as_posix()
 
     command: list[str] = [str(docker_cmd), "run", "--rm"]
-    if gpu and gpu.lower() != "none":
+    if require_gpu:
         command.extend(["--gpus", gpu])
+        command.extend(["--env", "CUDA_VISIBLE_DEVICES=0"])
+        command.extend(["--env", f"NVIDIA_VISIBLE_DEVICES={_EXPECTED_GPU0_UUID}"])
+        command.extend(["--env", f"UNISCAN_GPU_DEVICE_ID={_EXPECTED_GPU0_UUID}"])
+    else:
+        command.extend(["--env", "CUDA_VISIBLE_DEVICES="])
+        command.extend(["--env", "NVIDIA_VISIBLE_DEVICES=none"])
+        command.extend(["--env", "UNISCAN_GPU_DEVICE_ID="])
+        command.extend(["--env", "TORCH_DEVICE=cpu"])
     command.extend(
         [
             "-v",
@@ -4828,6 +4919,7 @@ def _run_olmocr_direct(
     backend = (os.environ.get("UNISCAN_OLMOCR_BACKEND") or "auto").strip().lower()
     if backend not in {"auto", "local", "docker"}:
         raise ValueError("UNISCAN_OLMOCR_BACKEND must be one of: auto, local, docker")
+    require_gpu = _env_bool("UNISCAN_OLMOCR_REQUIRE_GPU", default=True)
 
     workspace = work_dir / "olmocr_workspace"
     workspace.mkdir(parents=True, exist_ok=True)
@@ -4850,6 +4942,8 @@ def _run_olmocr_direct(
 
     errors: list[str] = []
     if backend in {"auto", "local"}:
+        if require_gpu:
+            _require_gpu0_contract(run_cmd)
         command_candidates: list[list[str]] = []
         olmocr_cmd = which_fn("olmocr") or which_fn("olmocr.exe")
         if olmocr_cmd:
@@ -4861,6 +4955,14 @@ def _run_olmocr_direct(
         else:
             for command in command_candidates:
                 command_env = dict(os.environ)
+                if require_gpu:
+                    command_env["CUDA_VISIBLE_DEVICES"] = "0"
+                    command_env["NVIDIA_VISIBLE_DEVICES"] = _EXPECTED_GPU0_UUID
+                    command_env["UNISCAN_GPU_DEVICE_ID"] = _EXPECTED_GPU0_UUID
+                    command_env["TORCH_DEVICE"] = "cuda:0"
+                else:
+                    _hide_gpu_visibility(command_env)
+                    command_env["TORCH_DEVICE"] = "cpu"
                 command_path = Path(command[0])
                 if command_path.exists():
                     bin_dir = str(command_path.resolve().parent)

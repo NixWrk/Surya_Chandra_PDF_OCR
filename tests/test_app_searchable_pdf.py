@@ -772,6 +772,13 @@ def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
 ) -> None:
     import fitz
 
+    # This test exercises chunk lifecycle and evidence reuse, not production raster sizing.
+    # Keep its 23-page fixture small enough that repeated evidence validation stays fast.
+    monkeypatch.setenv("UNISCAN_OCR_RENDER_DPI", "72")
+    monkeypatch.setenv("UNISCAN_TEXTLESS_DPI", "72")
+    monkeypatch.setattr(ocr_benchmark, "_CHANDRA_MIN_IMAGE_DIM", 72)
+    monkeypatch.setattr(ocr_pipeline, "_CHANDRA_MIN_IMAGE_DIM", 72)
+
     tmp_path = _new_test_dir()
     source_pdf = tmp_path / "source.pdf"
     _write_numbered_pdf(source_pdf, page_count=23)

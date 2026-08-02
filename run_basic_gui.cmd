@@ -7,6 +7,8 @@ set "VENV_CHANDRA=%CD%\.venv_chandra"
 set "VENV_SURYA=%CD%\.venv_surya"
 set "PY_MAIN=%VENV_CHANDRA%\Scripts\python.exe"
 set "PY_SURYA=%VENV_SURYA%\Scripts\python.exe"
+set "UNISCAN_GPU_DEVICE_ID=GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f"
+set "CUDA_VISIBLE_DEVICES=0"
 
 if not exist "%PY_MAIN%" (
   echo [OCR GUI] Missing %PY_MAIN%

@@ -14,6 +14,9 @@ set "SURYA_HF_HUB_CACHE=%SURYA_HF_HOME%\hub"
 set "SURYA_MODEL_CACHE_DIR=%CD%\.surya_cache"
 set "SURYA_MODELSCOPE_CACHE=%CD%\.modelscope_cache"
 set "SETUPTOOLS_VERSION=70.2.0"
+set "EXPECTED_GPU0_UUID=GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f"
+set "UNISCAN_GPU_DEVICE_ID=%EXPECTED_GPU0_UUID%"
+set "CUDA_VISIBLE_DEVICES=0"
 
 if not exist "%UV_CACHE_DIR%" mkdir "%UV_CACHE_DIR%"
 if not exist "%TMP_BOOT%" mkdir "%TMP_BOOT%"
@@ -29,6 +32,8 @@ set "TMP=%TMP_BOOT%"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
 set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
 
+call :require_gpu0
+if errorlevel 1 goto :error
 call :select_torch_cuda_flavor
 if errorlevel 1 goto :error
 echo [dual-venv] Selected PyTorch CUDA wheel: %TORCH_CUDA_FLAVOR% for GPU compute capability %GPU_COMPUTE_CAP%
@@ -97,6 +102,42 @@ echo [dual-venv] CHANDRA python: %PY_CHANDRA%
 echo [dual-venv] Run: .\run_basic_gui.cmd
 exit /b 0
 
+:require_gpu0
+where nvidia-smi >nul 2>nul
+if errorlevel 1 (
+  echo [dual-venv] ERROR: nvidia-smi was not found; GPU0 cannot be attested.
+  exit /b 1
+)
+set "GPU0_ATTEST_FILE=%TMP_BOOT%\gpu0_attestation.txt"
+nvidia-smi --id=0 --query-gpu=index,uuid --format=csv,noheader,nounits > "%GPU0_ATTEST_FILE%" 2>nul
+if errorlevel 1 (
+  echo [dual-venv] ERROR: nvidia-smi failed while attesting GPU index 0.
+  exit /b 1
+)
+set "GPU0_ROWS=0"
+set "GPU0_INDEX="
+set "GPU0_UUID="
+for /f "usebackq tokens=1,2 delims=," %%A in ("%GPU0_ATTEST_FILE%") do (
+  set /a GPU0_ROWS+=1
+  set "GPU0_INDEX=%%A"
+  set "GPU0_UUID=%%B"
+)
+for /f "tokens=* delims= " %%A in ("%GPU0_INDEX%") do set "GPU0_INDEX=%%A"
+for /f "tokens=* delims= " %%A in ("%GPU0_UUID%") do set "GPU0_UUID=%%A"
+if not "%GPU0_ROWS%"=="1" (
+  echo [dual-venv] ERROR: GPU0 attestation returned %GPU0_ROWS% rows; expected exactly one.
+  exit /b 1
+)
+if not "%GPU0_INDEX%"=="0" (
+  echo [dual-venv] ERROR: GPU0 attestation returned index %GPU0_INDEX%; expected 0.
+  exit /b 1
+)
+if not "%GPU0_UUID%"=="%EXPECTED_GPU0_UUID%" (
+  echo [dual-venv] ERROR: GPU0 UUID mismatch: %GPU0_UUID%.
+  exit /b 1
+)
+exit /b 0
+
 :select_torch_cuda_flavor
 set "GPU_COMPUTE_CAP=unknown"
 set "TORCH_CUDA_FLAVOR=cu126"
@@ -107,11 +148,9 @@ if defined UNISCAN_TORCH_CUDA_FLAVOR (
   set "GPU_COMPUTE_CAP=override"
   goto :set_torch_cuda_vars
 )
-where nvidia-smi >nul 2>nul
-if errorlevel 1 goto :set_torch_cuda_vars
 set "GPU_CC_FILE=%TMP_BOOT%\gpu_compute_cap.txt"
-nvidia-smi --query-gpu=compute_cap --format=csv,noheader > "%GPU_CC_FILE%" 2>nul
-if errorlevel 1 goto :set_torch_cuda_vars
+nvidia-smi --id=0 --query-gpu=compute_cap --format=csv,noheader,nounits > "%GPU_CC_FILE%" 2>nul
+if errorlevel 1 exit /b 1
 set /p GPU_COMPUTE_CAP=<"%GPU_CC_FILE%"
 for /f "tokens=1,2 delims=." %%A in ("%GPU_COMPUTE_CAP%") do (
   set "GPU_CC_MAJOR=%%A"

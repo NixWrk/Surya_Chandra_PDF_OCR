@@ -19,6 +19,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "gpu0_contract.ps1")
+
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
         $scriptDir = Split-Path -Parent $PSCommandPath
@@ -85,21 +87,11 @@ else {
 $toolPath = (($extraPaths + @($basePath)) -join ";")
 
 # ---------------------------------------------------------------------------
-# GPU detection: query nvidia-smi for compute capability
+# GPU detection: attest only the permitted GPU0 and query its compute capability.
 # ---------------------------------------------------------------------------
-$gpuComputeCap = 0.0
-$gpuName = "none"
-try {
-    $nvOut = & nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>$null
-    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($nvOut)) {
-        $parts = $nvOut.Split(",")
-        $gpuName = $parts[0].Trim()
-        $gpuComputeCap = [double]($parts[1].Trim())
-    }
-}
-catch { }
-
-$hasCuda = $gpuComputeCap -gt 0
+$gpu0 = Assert-UniscanGpu0Contract -AdditionalFields @("name", "compute_cap")
+$gpuName = $gpu0.name
+$gpuComputeCap = [double]$gpu0.compute_cap
 $paddleGpuOk = $gpuComputeCap -ge 7.5   # PaddlePaddle requires > 7.5
 $torchGpuOk  = $gpuComputeCap -ge 3.5   # PyTorch cu121 supports 3.5+
 
@@ -546,6 +538,7 @@ foreach ($engine in $engineMatrix) {
         if ($engineName -eq "olmocr") {
             # On Windows, local vLLM startup is fragile; use dockerized backend.
             $env:UNISCAN_OLMOCR_BACKEND = "docker"
+            $env:UNISCAN_OLMOCR_DOCKER_GPU = "device=$script:UniscanExpectedGpu0Uuid"
             $env:UNISCAN_OLMOCR_DOCKER_IMAGE = "chatdoc/ocrflux:latest"
             $env:UNISCAN_OLMOCR_DOCKER_WORKERS = "1"
             $env:UNISCAN_OLMOCR_DOCKER_CACHE = (Join-Path $RepoRoot ".hf_cache_ocrflux")

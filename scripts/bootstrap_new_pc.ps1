@@ -20,6 +20,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "gpu0_contract.ps1")
+
 $RepoRoot = if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
     (Resolve-Path (Join-Path (Split-Path -Parent $PSCommandPath) "..")).Path
 } else {
@@ -49,12 +51,12 @@ catch {
 # --- 2. NVIDIA / CUDA ---
 Write-Host "[2/5] GPU / CUDA..." -ForegroundColor Cyan
 try {
-    $nvOut = & nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader 2>$null
-    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($nvOut)) {
-        $parts = $nvOut.Split(",")
-        $gpuName = $parts[0].Trim()
-        $driverVer = $parts[1].Trim()
-        $computeCap = [double]($parts[2].Trim())
+    $gpu = Assert-UniscanGpu0Contract -AdditionalFields @("name", "driver_version", "compute_cap")
+    if ($null -ne $gpu) {
+        $gpuName = $gpu.name
+        $driverVer = $gpu.driver_version
+        $computeCap = [double]$gpu.compute_cap
+        Write-Host "  UUID:    $($gpu.uuid)" -ForegroundColor Green
         Write-Host "  GPU:     $gpuName" -ForegroundColor Green
         Write-Host "  Driver:  $driverVer" -ForegroundColor Green
         Write-Host "  Compute: $computeCap" -ForegroundColor Green
@@ -70,12 +72,10 @@ try {
             Write-Host "  -> PyTorch CUDA:     NOT supported (need >= 3.5)" -ForegroundColor Yellow
         }
     }
-    else {
-        Write-Host "  No NVIDIA GPU detected. UniScan OCR requires CUDA GPU for Chandra/Surya." -ForegroundColor Yellow
-    }
 }
 catch {
-    Write-Host "  nvidia-smi not found. UniScan OCR requires CUDA GPU for Chandra/Surya." -ForegroundColor Yellow
+    Write-Host "  FAIL: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
 }
 
 # --- 3. Production OCR contract ---
