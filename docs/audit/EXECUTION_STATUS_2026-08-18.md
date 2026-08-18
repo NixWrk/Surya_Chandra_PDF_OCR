@@ -15,6 +15,9 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 - The repository has a deterministic model-free benchmark corpus and evaluator.
   No OCR accuracy or performance tuning has been accepted without a real engine
   baseline.
+- A private real-engine incident/timing baseline now covers one page from each
+  observed failure class. Both pass strict reconciliation; CER/WER and full
+  exact-retention chunk context remain unmeasured.
 - GPU selection is host-configured, Compose starts standalone by default, and a
   read-only new-PC preflight plus deployment/incident/benchmark runbooks exist.
 - CI, `AGENTS.md`, and the repo-local operator skill are present. The HTTP trust
@@ -42,9 +45,9 @@ existing Surya venv lacks the local `uniscan` install; it did not mutate it.
 
 ## Open high-value work
 
-1. Capture an accepted real Surya+Chandra OCR baseline with fixed private or
-   licensed fixtures, ground truth, warm/cold state, time, RAM/VRAM, invocation
-   counts, output hashes, and raw machine-readable results.
+1. Extend the accepted real Surya+Chandra incident/timing baseline with reviewed
+   Ground Truth, CER/WER, warm-run repetitions, peak RAM/VRAM, and full pages
+   11–20 exact-retention context.
 2. Reproduce the exact-retention incident from a preserved failed candidate, or
    capture a new equivalent failure. Do not guess a merge fix from the final PDF.
 3. Resolve run configuration once per run and complete cache/run identity across
