@@ -14,10 +14,10 @@ from typing import Any
 
 
 SCHEMA = "uniscan.synthetic-benchmark.v1"
-GENERATOR_VERSION = "1.0.0"
+GENERATOR_VERSION = "1.0.1"
 SEED = 20260818
 
-_TEXT_FONT = "cjk"
+_TEXT_FONT = "china-s"
 _FALLBACK_FONT = "helv"
 _PAGE_WIDTH = 612.0
 _PAGE_HEIGHT = 792.0
@@ -74,10 +74,15 @@ def _fixed_metadata(fitz: Any, fixture_id: str) -> dict[str, str]:
 
 
 def _insert_text(page: Any, point: tuple[float, float], text: str, *, size: float, color: tuple[float, float, float] = (0.08, 0.08, 0.08), render_mode: int = 0) -> str:
-    """Insert Unicode text, preferring PyMuPDF's bundled CJK fallback."""
+    """Insert Unicode text using PyMuPDF's bundled built-in font."""
     for font_name in (_TEXT_FONT, _FALLBACK_FONT):
         try:
-            page.insert_text(point, text, fontname=font_name, fontsize=size, color=color, render_mode=render_mode)
+            available_width = max(float(page.rect.x1) - point[0] - _MARGIN, 1.0)
+            text_width = _fitz().get_text_length(text, fontname=font_name, fontsize=size)
+            fitted_size = size
+            if text_width > available_width:
+                fitted_size *= available_width / text_width
+            page.insert_text(point, text, fontname=font_name, fontsize=fitted_size, color=color, render_mode=render_mode)
             return font_name
         except Exception:
             continue
@@ -131,17 +136,57 @@ def _draw_two_columns(page: Any, record: dict[str, Any]) -> None:
         for line in lines:
             _insert_text(page, (x, y), str(line["text"]), size=13.0, color=(0.08, 0.08, 0.08))
             y += 25.0
-    page.draw_line((306.0, 70.0), (306.0, 700.0), color=(0.7, 0.7, 0.7), width=0.5)
+    page.draw_line((306.0, 92.0), (306.0, 700.0), color=(0.7, 0.7, 0.7), width=0.5)
 
 
 def _draw_table(page: Any, record: dict[str, Any]) -> None:
     x0, y0, cell_w, cell_h = 52.0, 420.0, 127.0, 34.0
-    for row in range(3):
-        for column in range(4):
-            rect = _fitz().Rect(x0 + column * cell_w, y0 + row * cell_h, x0 + (column + 1) * cell_w, y0 + (row + 1) * cell_h)
-            page.draw_rect(rect, color=(0.2, 0.2, 0.2), width=0.6)
-            value = str(record["lines"][row * 4 + column]["text"])
-            _insert_text(page, (rect.x0 + 8, rect.y0 + 22), value, size=11.0, color=(0.08, 0.08, 0.08))
+    table_lines = [
+        line for line in record["lines"] if line["region_type"] == "table-cell"
+    ]
+    if not table_lines or len(table_lines) % 4:
+        raise ValueError("Synthetic table must contain a positive multiple of four cells")
+    for index, line in enumerate(table_lines):
+        row, column = divmod(index, 4)
+        rect = _fitz().Rect(
+            x0 + column * cell_w,
+            y0 + row * cell_h,
+            x0 + (column + 1) * cell_w,
+            y0 + (row + 1) * cell_h,
+        )
+        page.draw_rect(rect, color=(0.2, 0.2, 0.2), width=0.6)
+        value = str(line["text"])
+        _insert_text(page, (rect.x0 + 8, rect.y0 + 22), value, size=11.0, color=(0.08, 0.08, 0.08))
+
+
+def _draw_mixed_layout(page: Any, record: dict[str, Any]) -> None:
+    heading = next(
+        (line for line in record["lines"] if line["region_type"] == "heading"),
+        None,
+    )
+    if heading is not None:
+        _insert_text(
+            page,
+            (_MARGIN, 74.0),
+            str(heading["text"]),
+            size=18.0,
+            color=(0.08, 0.08, 0.08),
+        )
+
+    _draw_two_columns(page, record)
+    _draw_table(page, record)
+
+    footnote_y = 690.0
+    for line in record["lines"]:
+        if line["region_type"] == "footnote":
+            _insert_text(
+                page,
+                (_MARGIN, footnote_y),
+                str(line["text"]),
+                size=11.0,
+                color=(0.08, 0.08, 0.08),
+            )
+            footnote_y += 16.0
 
 
 def _draw_noise(page: Any, *, seed: int, low_contrast: bool = False) -> None:
@@ -172,7 +217,9 @@ def _build_fixture_pdf(fixture_id: str, pages: list[dict[str, Any]], output: Pat
             else:
                 _draw_background(page)
                 features = set(record.get("features", []))
-                if "columns" in features:
+                if {"columns", "table"}.issubset(features):
+                    _draw_mixed_layout(page, record)
+                elif "columns" in features:
                     _draw_two_columns(page, record)
                 elif "table" in features:
                     _draw_text_page(page, record, font_size=13.0)
@@ -308,7 +355,7 @@ def generate_corpus(output: Path) -> dict[str, Any]:
     manifest: dict[str, Any] = {
         "schema": SCHEMA,
         "corpus_id": "uniscan-synthetic-offline",
-        "revision": "1.0.0",
+        "revision": GENERATOR_VERSION,
         "provenance": {"source_kind": "procedural-original", "contains_private_data": False, "external_assets": [], "generated_pdf_policy": "caller-output-only"},
         "generator": {"name": "generate.py", "version": GENERATOR_VERSION, "seed": SEED, "python": platform.python_version(), "pymupdf": str(getattr(fitz, "VersionBind", "unknown"))},
         "metrics": {"model_status": "not_run", "text": {"cer": "levenshtein-codepoint-v1", "wer": "whitespace-token-v1"}, "searchability": {"exact_text": "nfkc-collapse-whitespace-v1", "page_bijection": "exact-page-set-v1"}, "geometry": {"bbox_iou": "axis-aligned-iou-v1", "reading_order": "exact-order-v1"}, "unavailable_without_models": ["engine CER/WER", "VRAM", "cold/warm model latency", "model cache-hit latency"]},
