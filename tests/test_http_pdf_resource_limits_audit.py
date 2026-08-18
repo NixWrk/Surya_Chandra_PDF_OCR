@@ -179,3 +179,99 @@ def test_http_queue_accepts_jobs_beyond_worker_concurrency_without_admission_bou
             assert summary["counts"]["queued"] == len(submissions) - 1
     finally:
         release.set()
+
+
+def test_handler_runtime_shutdown_stops_worker_and_watchdog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OCR_WORKER_TIMEOUT_SECONDS", "60")
+    monkeypatch.setenv("OCR_WORKER_WATCHDOG_INTERVAL_SECONDS", "60")
+    monkeypatch.setenv("UNISCAN_JOB_CLEANUP_INTERVAL_SECONDS", "0")
+    existing_threads = set(threading.enumerate())
+
+    handler = _build_handler(work_root=tmp_path / "work", default_lang="rus+eng")
+    runtime_threads = [
+        thread
+        for thread in threading.enumerate()
+        if thread not in existing_threads
+        and thread.name.startswith(
+            ("uniscan-ocr-job-worker-", "uniscan-ocr-job-watchdog")
+        )
+    ]
+
+    assert {thread.name for thread in runtime_threads} == {
+        "uniscan-ocr-job-worker-1",
+        "uniscan-ocr-job-watchdog",
+    }
+    shutdown_runtime = getattr(handler, "shutdown_runtime", None)
+    assert callable(shutdown_runtime), "Handler runtime must expose bounded shutdown."
+
+    shutdown_runtime(join_timeout_seconds=2.0)
+    for thread in runtime_threads:
+        thread.join(timeout=2)
+
+    assert [thread.name for thread in runtime_threads if thread.is_alive()] == []
+
+
+def test_handler_runtime_shutdown_does_not_start_next_queued_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OCR_WORKER_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("UNISCAN_JOB_CLEANUP_INTERVAL_SECONDS", "0")
+    first_started = threading.Event()
+    release_first = threading.Event()
+    first_finished = threading.Event()
+    second_started = threading.Event()
+
+    def blocked_build(**_kwargs: object) -> None:
+        if not first_started.is_set():
+            first_started.set()
+            release_first.wait(timeout=5)
+            first_finished.set()
+            raise RuntimeError("runtime-shutdown audit first job")
+        second_started.set()
+        raise RuntimeError("runtime-shutdown audit queued job")
+
+    monkeypatch.setattr(
+        "uniscan.web.service.build_searchable_pdf",
+        blocked_build,
+    )
+    handler = _build_handler(work_root=tmp_path / "work", default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    shutdown_runtime = getattr(handler, "shutdown_runtime", None)
+    try:
+        payload = _valid_pdf_bytes("runtime-shutdown-audit")
+        first_status, _ = _post_pdf(server, payload)
+        second_status, _ = _post_pdf(server, payload)
+        assert first_status == HTTPStatus.ACCEPTED
+        assert second_status == HTTPStatus.ACCEPTED
+        assert first_started.wait(timeout=2)
+        assert callable(shutdown_runtime), "Handler runtime must expose bounded shutdown."
+
+        shutdown_runtime(join_timeout_seconds=0.05)
+        release_first.set()
+        shutdown_runtime(join_timeout_seconds=2.0)
+
+        assert first_finished.wait(timeout=2)
+        assert second_started.is_set() is False
+
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        try:
+            conn.request("GET", "/api/jobs")
+            response = conn.getresponse()
+            summary = json.loads(response.read().decode("utf-8"))
+        finally:
+            conn.close()
+        assert response.status == HTTPStatus.OK
+        assert summary["counts"]["queued"] == 1
+    finally:
+        release_first.set()
+        if callable(shutdown_runtime):
+            shutdown_runtime(join_timeout_seconds=2.0)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
