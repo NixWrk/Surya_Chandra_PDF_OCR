@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import FrozenInstanceError, asdict
 import html
 import hashlib
 import json
@@ -3125,6 +3125,207 @@ def test_hybrid_cache_identity_includes_retry_and_reconciliation_revision() -> N
         "ocr-layout-original+ocr-layout-autocontrast-cutoff-1+ocr-original-max3-v1"
     )
     assert config["page_reconciliation_policy"] == (
+        "explicit-chandra-nontext+quiet-surya+scaled-terminal-lineage+"
+        "durable-source-rasters+durable-chandra-attempts+exact-text-artifacts+"
+        "bounded-png+accounted-alternative-text+plain-cross-engine-agreement-v9"
+    )
+
+
+def _hybrid_identity_kwargs(source: Path) -> dict[str, object]:
+    return {
+        "input_path": source,
+        "mode": "chandra+surya",
+        "lang": "rus+eng",
+        "strict": True,
+        "delete_original_text_layer": True,
+        "chunk_pages": 10,
+        "page_count": 11,
+    }
+
+
+def _clear_hybrid_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "UNISCAN_OCR_RENDER_DPI",
+        "UNISCAN_TEXTLESS_DPI",
+        "UNISCAN_TEXTLESS_JPEG_QUALITY",
+        "UNISCAN_SURYA_MODEL_CACHE_DIR",
+        "UNISCAN_CHANDRA_HF_HOME",
+        "UNISCAN_SURYA_TORCH_DEVICE",
+        "UNISCAN_CHANDRA_TORCH_DEVICE",
+        "TORCH_DEVICE",
+        "UNISCAN_SURYA_PYTHON",
+        "UNISCAN_CHANDRA_PYTHON",
+        "UNISCAN_ENGINE_SUBPROCESS_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("UNISCAN_CHANDRA_REQUIRE_GPU", "0")
+    monkeypatch.setenv("UNISCAN_SURYA_REQUIRE_GPU", "0")
+
+
+def test_hybrid_resolved_run_config_is_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_hybrid_runtime_env(monkeypatch)
+
+    config = ocr_pipeline._resolve_hybrid_run_config()
+
+    assert isinstance(config, ocr_pipeline._ResolvedHybridRunConfig)
+    with pytest.raises(FrozenInstanceError):
+        setattr(config, "effective_ocr_render_dpi", 401)
+
+
+def test_hybrid_identity_uses_passed_snapshot_after_live_env_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_hybrid_runtime_env(monkeypatch)
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"sealed source")
+    kwargs = _hybrid_identity_kwargs(source)
+
+    monkeypatch.setenv("UNISCAN_OCR_RENDER_DPI", "220")
+    monkeypatch.setenv("UNISCAN_TEXTLESS_DPI", "300")
+    config = ocr_pipeline._resolve_hybrid_run_config()
+    identity_before, key_before = ocr_pipeline._hybrid_run_identity(
+        **kwargs,
+        runtime_config=config,
+    )
+
+    for name, value in {
+        "UNISCAN_OCR_RENDER_DPI": "400",
+        "UNISCAN_TEXTLESS_DPI": "72",
+        "UNISCAN_TEXTLESS_JPEG_QUALITY": "1",
+        "UNISCAN_SURYA_MODEL_CACHE_DIR": "drift-surya-cache",
+        "UNISCAN_CHANDRA_HF_HOME": "drift-chandra-hf",
+        "UNISCAN_SURYA_TORCH_DEVICE": "auto",
+        "UNISCAN_CHANDRA_TORCH_DEVICE": "auto",
+        "TORCH_DEVICE": "auto",
+        "UNISCAN_SURYA_PYTHON": "drift-surya-python",
+        "UNISCAN_CHANDRA_PYTHON": "drift-chandra-python",
+        "UNISCAN_ENGINE_SUBPROCESS_TIMEOUT_SECONDS": "1",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    identity_after, key_after = ocr_pipeline._hybrid_run_identity(
+        **kwargs,
+        runtime_config=config,
+    )
+
+    assert identity_after == identity_before
+    assert key_after == key_before
+
+
+@pytest.mark.parametrize(
+    ("name", "value_a", "value_b"),
+    [
+        (
+            "UNISCAN_SURYA_MODEL_CACHE_DIR",
+            "surya-cache-a",
+            "surya-cache-b",
+        ),
+        (
+            "UNISCAN_CHANDRA_HF_HOME",
+            "chandra-hf-a",
+            "chandra-hf-b",
+        ),
+        (
+            "UNISCAN_SURYA_TORCH_DEVICE",
+            "cpu",
+            "auto",
+        ),
+        (
+            "UNISCAN_CHANDRA_TORCH_DEVICE",
+            "cpu",
+            "auto",
+        ),
+        (
+            "TORCH_DEVICE",
+            "cpu",
+            "auto",
+        ),
+        (
+            "UNISCAN_SURYA_PYTHON",
+            "surya-python-a",
+            "surya-python-b",
+        ),
+        (
+            "UNISCAN_CHANDRA_PYTHON",
+            "chandra-python-a",
+            "chandra-python-b",
+        ),
+        (
+            "UNISCAN_ENGINE_SUBPROCESS_TIMEOUT_SECONDS",
+            "60",
+            "61",
+        ),
+    ],
+)
+def test_hybrid_identity_changes_for_runtime_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value_a: str,
+    value_b: str,
+) -> None:
+    _clear_hybrid_runtime_env(monkeypatch)
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"sealed source")
+    kwargs = _hybrid_identity_kwargs(source)
+
+    if name.endswith(("_MODEL_CACHE_DIR", "_HF_HOME")):
+        value_a = str(tmp_path / value_a)
+        value_b = str(tmp_path / value_b)
+        Path(value_a).mkdir()
+        Path(value_b).mkdir()
+    elif name.endswith("_PYTHON"):
+        value_a = str(tmp_path / f"{value_a}.exe")
+        value_b = str(tmp_path / f"{value_b}.exe")
+        Path(value_a).write_text("python-a", encoding="utf-8")
+        Path(value_b).write_text("python-b", encoding="utf-8")
+
+    monkeypatch.setenv(name, value_a)
+    config_a = ocr_pipeline._resolve_hybrid_run_config()
+    _, key_a = ocr_pipeline._hybrid_run_identity(
+        **kwargs,
+        runtime_config=config_a,
+    )
+
+    monkeypatch.setenv(name, value_b)
+    config_b = ocr_pipeline._resolve_hybrid_run_config()
+    _, key_b = ocr_pipeline._hybrid_run_identity(
+        **kwargs,
+        runtime_config=config_b,
+    )
+
+    assert key_a != key_b
+
+
+def test_hybrid_identity_preserves_existing_sensitive_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_hybrid_runtime_env(monkeypatch)
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"sealed source")
+
+    config = ocr_pipeline._resolve_hybrid_run_config()
+    identity, _ = ocr_pipeline._hybrid_run_identity(
+        **_hybrid_identity_kwargs(source),
+        runtime_config=config,
+    )
+    runtime_config = identity["runtime_config"]
+
+    assert isinstance(runtime_config, dict)
+    assert runtime_config["effective_ocr_render_dpi"] == 220
+    assert runtime_config["effective_textless_dpi"] == 300
+    assert runtime_config["chandra_min_image_dim"] == 1536
+    assert runtime_config["zero_output_retry_policy"] == (
+        "original+autocontrast-cutoff-1+rgb-scale-0.5-center-white-lanczos-max3-v3"
+    )
+    assert runtime_config["chandra_zero_output_retry_policy"] == (
+        "ocr-layout-original+ocr-layout-autocontrast-cutoff-1+ocr-original-max3-v1"
+    )
+    assert runtime_config["page_reconciliation_policy"] == (
         "explicit-chandra-nontext+quiet-surya+scaled-terminal-lineage+"
         "durable-source-rasters+durable-chandra-attempts+exact-text-artifacts+"
         "bounded-png+accounted-alternative-text+plain-cross-engine-agreement-v9"
