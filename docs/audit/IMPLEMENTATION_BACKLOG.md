@@ -41,8 +41,7 @@ Risk describes implementation/regression risk, not the severity of leaving an it
 | 27 | Add repo-local skill | P2 | Medium: repeatable evidence | Medium | M | Medium | Items 25-26 | Skill validation and dry run | Remove skill; runtime unchanged |
 | 28 | Assess thin MCP last | P2 | Low until consumer exists | Medium-low | M-L | High | Items 11, 16-17 | HTTP-only consumer acceptance | Remove adapter; HTTP unchanged |
 | 29 | Reconcile stale documentation | P3 | Medium: operator confusion | High | S | Low | Confirm hybrid-only contract | Link/path/current-help checks | Revert/supersede docs |
-| 30 | Add license file | P3 | Medium-high: distribution clarity | Medium | S | Medium | Owner/legal decision | Approval and package check | Revert if terms unauthorized |
-| 31 | Classify warnings and skips | P3 | Medium: CI signal | High | S | Low | None | Full suite accounts for every warning/skip | Revert policy; retain notes |
+| 30 | Classify warnings and skips | P3 | Medium: CI signal | High | S | Low | None | Full suite accounts for every warning/skip | Revert policy; retain notes |
 
 
 ## P1 — Immediate durable-job integrity
@@ -291,11 +290,7 @@ over HTTP, not OCR internals or filesystem access.
 Update the three-mode claims and absent installer reference only after confirming
 the supported contract remains hybrid-only.
 
-### 30. Add license file
-
-Confirm intended ownership/licensing, then add the appropriate MIT license text.
-
-### 31. Classify test warnings and skips
+### 30. Classify test warnings and skips
 
 Record why all seven skips and five warnings occur and which are acceptable in CI.
 

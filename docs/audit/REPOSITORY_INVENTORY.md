@@ -322,7 +322,6 @@ SHA-256 content. Only container labels are stale; source mismatch is not a findi
   current GUI/production exposes one.
 - The same document references absent
   `scripts/install_local_ocrmypdf_plugins.ps1` at line 90.
-- `pyproject.toml:11` declares MIT text, but no tracked `LICENSE` exists.
 
 ## Assumptions
 

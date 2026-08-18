@@ -35,11 +35,10 @@ The planning scan found:
    - `src/uniscan/ocr/artifact_searchable.py`: about 3,572 lines;
    - `src/uniscan/web/service.py`: about 1,970 lines.
 3. CI, dependency lock files, `AGENTS.md`, a repository skill, and an MCP adapter are absent.
-4. The declared MIT license has no committed license file.
-5. A machine-specific GPU UUID is embedded in setup and Docker configuration.
-6. Dependency declarations are split between `pyproject.toml`, the Dockerfile, and Windows setup scripts.
-7. Some older documentation describes contracts that no longer match the production-only hybrid path.
-8. Running OCR jobs cannot currently be cancelled safely.
+4. A machine-specific GPU UUID is embedded in setup and Docker configuration.
+5. Dependency declarations are split between `pyproject.toml`, the Dockerfile, and Windows setup scripts.
+6. Some older documentation describes contracts that no longer match the production-only hybrid path.
+7. Running OCR jobs cannot currently be cancelled safely.
 
 These are starting observations, not final audit conclusions.
 

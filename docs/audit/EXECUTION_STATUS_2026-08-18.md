@@ -58,7 +58,6 @@ existing Surya venv lacks the local `uniscan` install; it did not mutate it.
    plus 31 queued jobs and acceptance of a 101-page PDF; no threshold is invented.
 7. Remove normal-response absolute paths only with a versioned compatibility
    decision. The service remains documented as trusted-network-only.
-8. Confirm legal owner/terms before adding a root MIT license file.
 
 ## Guardrails still in force
 

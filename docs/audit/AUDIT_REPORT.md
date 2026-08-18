@@ -149,7 +149,6 @@ neither is a complete benchmark.
 - `docs/REPO_INVENTORY_KEEP_REMOVE.md:14,100` claims three GUI modes; current
   production exposes only hybrid mode.
 - It references absent `scripts/install_local_ocrmypdf_plugins.ps1` at line 90.
-- `pyproject.toml:11` declares MIT text, but no `LICENSE` is tracked.
 - No CI workflow, `AGENTS.md`, repo-local skill or MCP exists.
 
 ## OCR incident evidence
