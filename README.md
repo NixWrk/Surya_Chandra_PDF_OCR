@@ -98,6 +98,13 @@ coordination with the LLM orchestrator, see
 
 Last checked on 2026-04-21 with Python 3.11 on Windows. The setup script now auto-selects the PyTorch CUDA wheel from GPU compute capability. GTX 1070 / `sm_61` requires `cu126`; `cu128` is not compatible with that card because current PyTorch `cu128` wheels start at `sm_75`.
 
+These are Windows setup observations, not cross-platform dependency locks. A
+separate Docker `cu126` environment was observed on 2026-08-18 and differs in
+several transitive versions. Its immutable image digest, complete external
+package snapshots, and limitations are recorded in
+[`constraints/observed/README.md`](constraints/observed/README.md). Do not copy
+those observations into Windows setup or enforce them without clean builds.
+
 Surya venv:
 
 1. `torch==2.11.0+cu126` on GTX 1070 / `sm_61`, or `torch==2.11.0+cu128` on `sm_75+`.
