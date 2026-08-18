@@ -1,0 +1,19 @@
+# Optional integration layer for callers that already share the Zotero network.
+# The base docker-compose.yml remains standalone and creates only its project
+# network. Use both files when an external orchestrator needs the stable OCR
+# aliases on a pre-created shared network:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.shared-network.yml up -d
+
+services:
+  ocr-api:
+    networks:
+      zotero-automation:
+        aliases:
+          - surya-chandra-ocr-api
+          - ocr-api
+
+networks:
+  zotero-automation:
+    name: "${UNISCAN_SHARED_NETWORK_NAME:-zotero-automation}"
+    external: true

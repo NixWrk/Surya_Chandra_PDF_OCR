@@ -387,8 +387,17 @@ docker compose build
 docker compose up -d
 ```
 
-`docker-compose.yml` attaches the service to the external `zotero-automation`
-network. Create it once first if it does not already exist:
+The default Compose file is standalone: it uses the project-local default
+network and does not require a pre-created Docker network. For integration with
+an existing Zotero worker stack, opt in to the external shared network:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.shared-network.yml up -d
+```
+
+The shared-network override expects the external network to exist. Create it
+once when setting up that integration (the default standalone deployment does
+not need this step):
 
 ```powershell
 docker network create zotero-automation

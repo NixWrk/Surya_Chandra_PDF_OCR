@@ -36,12 +36,6 @@ services:
       - ./.modelscope_cache:/cache/modelscope
       - ./outputs:/data/work
       - ./PDFs:/data/in
-    networks:
-      default:
-      zotero-automation:
-        aliases:
-          - surya-chandra-ocr-api
-          - ocr-api
     deploy:
       resources:
         reservations:
@@ -50,7 +44,3 @@ services:
               device_ids: ["${UNISCAN_GPU_DEVICE_ID:?Set UNISCAN_GPU_DEVICE_ID in the local .env file}"]
               capabilities: [gpu]
     restart: "no"
-
-networks:
-  zotero-automation:
-    external: true

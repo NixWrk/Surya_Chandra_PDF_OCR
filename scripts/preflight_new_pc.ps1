@@ -13,7 +13,9 @@ param(
     [ValidateSet("Windows", "Docker")]
     [string]$Target,
 
-    [switch]$Json
+    [switch]$Json,
+
+    [switch]$SharedNetwork
 )
 
 Set-StrictMode -Version Latest
@@ -129,7 +131,7 @@ sys.exit(0 if ok and value == 1.0 else 1)
     }
 }
 else {
-    foreach ($requiredFile in @("docker-compose.yml", "Dockerfile", "scripts\docker-entrypoint.sh")) {
+    foreach ($requiredFile in @("docker-compose.yml", "docker-compose.shared-network.yml", "Dockerfile", "scripts\docker-entrypoint.sh")) {
         Test-RequiredFile -RelativePath $requiredFile | Out-Null
     }
     $dockerCommand = Get-Command docker -ErrorAction SilentlyContinue
@@ -150,6 +152,15 @@ else {
             if ($configExitCode -eq 0) { "Compose configuration resolved successfully." }
             else { Format-CommandFailure -Output $configOutput -ExitCode $configExitCode }
         )
+        $sharedComposePath = Join-Path $RepoRoot "docker-compose.shared-network.yml"
+        $sharedConfigOutput = @(
+            & docker compose --project-directory $RepoRoot -f $composePath -f $sharedComposePath config 2>&1
+        )
+        $sharedConfigExitCode = $LASTEXITCODE
+        Add-PreflightCheck -Name "docker.compose.shared-network.config" -Ok ($sharedConfigExitCode -eq 0) -Detail $(
+            if ($sharedConfigExitCode -eq 0) { "Shared-network Compose override resolved successfully." }
+            else { Format-CommandFailure -Output $sharedConfigOutput -ExitCode $sharedConfigExitCode }
+        )
         $servicesOutput = @(& docker compose --project-directory $RepoRoot -f $composePath config --services 2>&1)
         $servicesExitCode = $LASTEXITCODE
         $services = @($servicesOutput | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
@@ -159,15 +170,22 @@ else {
             elseif ($servicesExitCode -ne 0) { Format-CommandFailure -Output $servicesOutput -ExitCode $servicesExitCode }
             else { "Compose services did not include ocr-api: $($services -join ', ')" }
         )
-        if ($versionExitCode -eq 0) {
-            $networkOutput = @(& docker network inspect zotero-automation 2>&1)
-            $networkExitCode = $LASTEXITCODE
-            Add-PreflightCheck -Name "docker.network.zotero-automation" -Ok ($networkExitCode -eq 0) -Detail $(
-                if ($networkExitCode -eq 0) { "External network zotero-automation exists." }
-                else { Format-CommandFailure -Output $networkOutput -ExitCode $networkExitCode }
-            )
-        } else {
-            Add-PreflightCheck -Name "docker.network.zotero-automation" -Ok $false -Detail "Skipped because the Docker daemon check failed."
+        if ($SharedNetwork) {
+            $sharedNetworkName = if ([string]::IsNullOrWhiteSpace($env:UNISCAN_SHARED_NETWORK_NAME)) {
+                "zotero-automation"
+            } else {
+                $env:UNISCAN_SHARED_NETWORK_NAME
+            }
+            if ($versionExitCode -eq 0) {
+                $networkOutput = @(& docker network inspect $sharedNetworkName 2>&1)
+                $networkExitCode = $LASTEXITCODE
+                Add-PreflightCheck -Name "docker.network.$sharedNetworkName" -Ok ($networkExitCode -eq 0) -Detail $(
+                    if ($networkExitCode -eq 0) { "External network $sharedNetworkName exists." }
+                    else { Format-CommandFailure -Output $networkOutput -ExitCode $networkExitCode }
+                )
+            } else {
+                Add-PreflightCheck -Name "docker.network.$sharedNetworkName" -Ok $false -Detail "Skipped because the Docker daemon check failed."
+            }
         }
     }
 }

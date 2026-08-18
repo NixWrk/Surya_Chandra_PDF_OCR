@@ -45,13 +45,17 @@ def test_windows_preflight_checks_both_venvs_imports_and_cuda_tensor() -> None:
     assert "& $environment.python -B -c $probe" in script
 
 
-def test_docker_preflight_checks_config_service_daemon_and_external_network() -> None:
+def test_docker_preflight_checks_default_and_shared_compose_config_without_network_precreation() -> None:
     script = _script_text()
     assert "docker version" in script
     assert "docker compose --project-directory" in script
     assert "config --services" in script
     assert '"ocr-api"' in script
-    assert "docker network inspect zotero-automation" in script
+    assert "docker-compose.shared-network.yml" in script
+    assert "docker.compose.shared-network.config" in script
+    assert "[switch]$SharedNetwork" in script
+    assert "if ($SharedNetwork)" in script
+    assert "docker network inspect $sharedNetworkName" in script
 
 
 def test_preflight_contains_no_mutating_or_ocr_commands() -> None:
