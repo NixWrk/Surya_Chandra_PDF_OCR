@@ -1,0 +1,4 @@
+interface:
+  display_name: "UniScan OCR Operator"
+  short_description: "Diagnose and operate UniScan OCR safely"
+  default_prompt: "Use $uniscan-ocr-operator to diagnose this OCR job and preserve its evidence."
