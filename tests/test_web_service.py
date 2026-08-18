@@ -1899,18 +1899,20 @@ def test_http_watchdog_does_not_publish_result_from_reclaimed_worker(
     worker_finished = threading.Event()
     job_id_holder: dict[str, str] = {}
 
-    original_sleep = web_service.time.sleep
     original_reclaim = web_service._JobStore.reclaim_stale_running_jobs
     original_cleanup = web_service._cleanup_generated_dir
 
-    def controlled_sleep(seconds: float) -> None:
+    def controlled_runtime_wait(
+        stop_event: threading.Event,
+        seconds: float,
+    ) -> bool:
         if threading.current_thread().name == "uniscan-ocr-job-watchdog":
             watchdog_sleeping.set()
             if not release_watchdog.wait(timeout=5):
                 raise RuntimeError("watchdog release barrier timed out")
             release_watchdog.clear()
-            return
-        original_sleep(seconds)
+            return stop_event.is_set()
+        return stop_event.wait(seconds)
 
     def force_reclaim(
         self: _JobStore,
@@ -1961,7 +1963,11 @@ def test_http_watchdog_does_not_publish_result_from_reclaimed_worker(
             partial_page_failures=0,
         )
 
-    monkeypatch.setattr(web_service.time, "sleep", controlled_sleep)
+    monkeypatch.setattr(
+        web_service,
+        "_wait_for_runtime_stop",
+        controlled_runtime_wait,
+    )
     monkeypatch.setattr(
         web_service._JobStore,
         "reclaim_stale_running_jobs",

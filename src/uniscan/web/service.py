@@ -1589,6 +1589,13 @@ def _html_ui() -> bytes:
     ).encode("utf-8")
 
 
+def _wait_for_runtime_stop(
+    stop_event: threading.Event,
+    timeout_seconds: float,
+) -> bool:
+    return stop_event.wait(timeout_seconds)
+
+
 def _build_handler(
     *,
     work_root: Path,
@@ -1604,6 +1611,8 @@ def _build_handler(
     job_store = _JobStore(jobs_root)
     job_queue: queue.PriorityQueue[tuple[int, str, str, _QueuedJob]] = queue.PriorityQueue()
     create_job_lock = threading.Lock()
+    runtime_stop = threading.Event()
+    runtime_shutdown_lock = threading.Lock()
 
     def _queue_job(job: _JobState) -> None:
         if job.input_path is None:
@@ -1772,11 +1781,16 @@ def _build_handler(
             keepalive.join(timeout=2)
 
     def _worker_loop() -> None:
-        while True:
+        while not runtime_stop.is_set():
             queued_job: _QueuedJob | None = None
             try:
-                _, _, _, queued_job = job_queue.get()
                 try:
+                    _, _, _, queued_job = job_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                try:
+                    if runtime_stop.is_set():
+                        continue
                     current = job_store.get(queued_job.job_id)
                     if current is None or current.status != "queued":
                         continue
@@ -1799,7 +1813,11 @@ def _build_handler(
     worker_threads_lock = threading.Lock()
 
     def _start_worker() -> None:
+        if runtime_stop.is_set():
+            return
         with worker_threads_lock:
+            if runtime_stop.is_set():
+                return
             alive_workers = [worker for worker in worker_threads if worker.is_alive()]
             worker_threads[:] = alive_workers
             while len(worker_threads) < UNISCAN_OCR_WORKER_CONCURRENCY:
@@ -1846,9 +1864,10 @@ def _build_handler(
         if worker_timeout_seconds <= 0 and cleanup_interval_seconds <= 0:
             return
         last_cleanup = time.monotonic()
-        while True:
+        while not runtime_stop.is_set():
             if worker_timeout_seconds > 0:
-                time.sleep(watchdog_interval_seconds)
+                if _wait_for_runtime_stop(runtime_stop, watchdog_interval_seconds):
+                    return
                 reclaimed = job_store.reclaim_stale_running_jobs(
                     timeout_seconds=worker_timeout_seconds,
                 )
@@ -1859,7 +1878,9 @@ def _build_handler(
                     )
                     _start_worker()
             else:
-                time.sleep(min(max(cleanup_interval_seconds, 1), 60))
+                cleanup_wait = min(max(cleanup_interval_seconds, 1), 60)
+                if _wait_for_runtime_stop(runtime_stop, cleanup_wait):
+                    return
 
             if cleanup_interval_seconds > 0 and time.monotonic() - last_cleanup >= cleanup_interval_seconds:
                 try:
@@ -1883,8 +1904,38 @@ def _build_handler(
     for recovered_job in job_store.requeueable_jobs():
         _queue_job(recovered_job)
 
+    def _shutdown_runtime(*, join_timeout_seconds: float = 5.0) -> None:
+        timeout = max(0.0, float(join_timeout_seconds))
+        deadline = time.monotonic() + timeout
+        with runtime_shutdown_lock:
+            runtime_stop.set()
+            current_thread = threading.current_thread()
+            threads: list[threading.Thread] = []
+            if watchdog is not current_thread:
+                threads.append(watchdog)
+            with worker_threads_lock:
+                threads.extend(
+                    worker
+                    for worker in worker_threads
+                    if worker is not current_thread
+                )
+            for thread in threads:
+                remaining = max(0.0, deadline - time.monotonic())
+                thread.join(timeout=remaining)
+            alive = [thread.name for thread in threads if thread.is_alive()]
+            if alive:
+                print(
+                    "Warning: OCR runtime shutdown timed out waiting for: "
+                    + ", ".join(alive),
+                    file=sys.stderr,
+                )
+
     class SearchablePdfApiHandler(BaseHTTPRequestHandler):
         server_version = "UniScanHTTP/0.2"
+
+        @staticmethod
+        def shutdown_runtime(*, join_timeout_seconds: float = 5.0) -> None:
+            _shutdown_runtime(join_timeout_seconds=join_timeout_seconds)
 
         def _send_json(self, status: int, payload: dict[str, object]) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -2250,6 +2301,7 @@ def run_http_server(
         raise RuntimeError("run_http_server must run in the main thread to handle SIGTERM.")
 
     server: ThreadingHTTPServer | None = None
+    handler: type[BaseHTTPRequestHandler] | None = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     sigterm_installed = False
 
@@ -2280,6 +2332,10 @@ def run_http_server(
         try:
             if server is not None:
                 server.server_close()
+            if handler is not None:
+                shutdown_runtime = getattr(handler, "shutdown_runtime", None)
+                if callable(shutdown_runtime):
+                    shutdown_runtime()
         finally:
             if sigterm_installed:
                 signal.signal(signal.SIGTERM, previous_sigterm)

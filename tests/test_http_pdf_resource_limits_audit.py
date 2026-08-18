@@ -35,6 +35,9 @@ def _http_server(
         yield server
     finally:
         server.shutdown()
+        shutdown_runtime = getattr(handler, "shutdown_runtime", None)
+        if callable(shutdown_runtime):
+            shutdown_runtime(join_timeout_seconds=2.0)
         server.server_close()
         thread.join(timeout=2)
 
@@ -136,6 +139,7 @@ def test_http_accepts_pdf_above_chunk_size_without_page_count_admission_limit(
             assert status == HTTPStatus.ACCEPTED
             assert response_payload["status"] in {"queued", "running"}
             assert started.wait(timeout=2)
+            release.set()
     finally:
         release.set()
 
@@ -177,6 +181,7 @@ def test_http_queue_accepts_jobs_beyond_worker_concurrency_without_admission_bou
             assert response.status == HTTPStatus.OK
             assert summary["counts"]["running"] == 1
             assert summary["counts"]["queued"] == len(submissions) - 1
+            release.set()
     finally:
         release.set()
 
