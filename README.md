@@ -362,7 +362,7 @@ OCR quality/performance tuning:
 
 ```env
 # Require Chandra's page-aware geometry sidecar instead of using page-1 fallback.
-UNISCAN_CHANDRA_REQUIRE_SIDECAR=0
+UNISCAN_CHANDRA_REQUIRE_SIDECAR=1
 # OCR input render DPI used by the basic/web workflow (clamped to 72..400).
 UNISCAN_OCR_RENDER_DPI=220
 # Set to 0 to disable banded token alignment and use the full dynamic program.
