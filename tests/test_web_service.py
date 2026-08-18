@@ -466,6 +466,98 @@ def test_job_store_does_not_promote_unsealed_stale_result_to_done_during_startup
     assert metadata.get("result_url") is None
     assert metadata.get("error")
 
+def test_job_store_publish_result_rolls_back_when_done_metadata_persistence_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    store.create(
+        _JobState(
+            job_id="PERSISTENCE",
+            status="running",
+            progress=90,
+            message="OCR is running",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+        )
+    )
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF result")
+    original_write = store._write_metadata_locked
+
+    def fail_done_metadata(job: _JobState) -> None:
+        if job.status == "done":
+            raise OSError("simulated done metadata failure")
+        original_write(job)
+
+    monkeypatch.setattr(store, "_write_metadata_locked", fail_done_metadata)
+
+    with pytest.raises(OSError, match="simulated done metadata failure"):
+        store.publish_result_if_running(
+            "PERSISTENCE",
+            source=source,
+            message="Done",
+            run_dir=None,
+        )
+
+    metadata = store.metadata("PERSISTENCE")
+    assert metadata is not None
+    assert metadata["status"] == "running"
+    assert metadata.get("result_path") is None
+    assert not (root / "PERSISTENCE" / "result.pdf").exists()
+
+
+def test_job_store_publish_result_rejects_symlinked_job_directory_before_copy(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    store.create(
+        _JobState(
+            job_id="LINKEDDIR",
+            status="running",
+            progress=90,
+            message="OCR is running",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+        )
+    )
+    job_dir = root / "LINKEDDIR"
+    preserved_job_dir = tmp_path / "preserved-job"
+    job_dir.rename(preserved_job_dir)
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    try:
+        job_dir.symlink_to(outside_dir, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        preserved_job_dir.rename(job_dir)
+        pytest.skip(f"directory symlink creation is unavailable: {exc}")
+
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF result")
+
+    with pytest.raises(RuntimeError, match="job directory"):
+        store.publish_result_if_running(
+            "LINKEDDIR",
+            source=source,
+            message="Done",
+            run_dir=None,
+        )
+
+    assert not (outside_dir / "result.pdf").exists()
+
+
 def test_job_store_recovers_corrupt_primary_metadata_from_sqlite(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
