@@ -14,7 +14,7 @@ import threading
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -122,6 +122,51 @@ class _QueuedJob:
     delete_original_text_layer: bool
 
 
+def _path_is_link_or_junction(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(os.path, "isjunction", None)
+        return bool(is_junction is not None and is_junction(path))
+    except OSError:
+        return True
+
+
+def _safe_job_dir(*, jobs_root: Path, job_id: str) -> Path | None:
+    job_dir = jobs_root / job_id
+    try:
+        root_resolved = jobs_root.resolve(strict=True)
+        if _path_is_link_or_junction(job_dir):
+            return None
+        job_dir_resolved = job_dir.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if job_dir_resolved.parent != root_resolved:
+        return None
+    return job_dir_resolved
+
+
+def _safe_job_artifact(
+    *,
+    jobs_root: Path,
+    job_id: str,
+    filename: str,
+) -> Path | None:
+    job_dir = _safe_job_dir(jobs_root=jobs_root, job_id=job_id)
+    if job_dir is None:
+        return None
+    candidate = job_dir / filename
+    try:
+        if _path_is_link_or_junction(candidate) or not candidate.is_file():
+            return None
+        candidate_resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if candidate_resolved.parent != job_dir:
+        return None
+    return candidate_resolved
+
+
 _ACTIVE_JOB_STATUSES = {"queued", "running"}
 
 
@@ -211,6 +256,70 @@ class _JobStore:
             if event:
                 self._append_event_locked(job, event, message or event, metadata or updates)
             return job
+
+    def publish_result_if_running(
+        self,
+        job_id: str,
+        *,
+        source: Path,
+        message: str,
+        run_dir: str | None,
+    ) -> Path | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status != "running":
+                return None
+
+            job_dir = _safe_job_dir(jobs_root=self.jobs_root, job_id=job_id)
+            if job_dir is None:
+                raise RuntimeError("OCR job directory is not a contained regular directory.")
+
+            result_target = job_dir / "result.pdf"
+            _atomic_copy_file(source, result_target)
+            result_path = _safe_job_artifact(
+                jobs_root=self.jobs_root,
+                job_id=job_id,
+                filename="result.pdf",
+            )
+            if result_path is None:
+                raise RuntimeError("Published OCR result is not a contained regular file.")
+
+            now = _utc_now()
+            completed_job = replace(
+                job,
+                status="done",
+                progress=100,
+                message=message,
+                run_dir=run_dir,
+                result_path=result_path,
+                result_bytes=result_path.stat().st_size,
+                error=None,
+                completed_at=now,
+                finished_at=now,
+                heartbeat_at=now,
+                updated_at=now,
+            )
+            try:
+                self._write_metadata_locked(completed_job)
+                self._upsert_sqlite_locked(completed_job)
+                self._append_event_locked(
+                    completed_job,
+                    "done",
+                    message,
+                    {"result_bytes": completed_job.result_bytes},
+                )
+            except Exception:
+                owned_result = _safe_job_artifact(
+                    jobs_root=self.jobs_root,
+                    job_id=job_id,
+                    filename="result.pdf",
+                )
+                if owned_result == result_path:
+                    owned_result.unlink(missing_ok=True)
+                raise
+
+            self._jobs[job_id] = completed_job
+            return result_path
 
     def reclaim_stale_running_jobs(
         self,
@@ -374,6 +483,15 @@ class _JobStore:
     def _load_existing_jobs(self) -> None:
         for metadata_path in sorted(self.jobs_root.glob("*/metadata.json")):
             expected_job_id = metadata_path.parent.name
+            if (
+                _safe_job_dir(jobs_root=self.jobs_root, job_id=expected_job_id) is None
+                or _path_is_link_or_junction(metadata_path)
+            ):
+                print(
+                    f"Warning: ignored unsafe OCR job directory {metadata_path.parent}.",
+                    file=sys.stderr,
+                )
+                continue
             try:
                 metadata_size = metadata_path.stat().st_size
                 if metadata_size <= 0 or metadata_size > _MAX_JOB_METADATA_BYTES:
@@ -406,20 +524,23 @@ class _JobStore:
                     file=sys.stderr,
                 )
 
-            result_candidate = metadata_path.parent / "result.pdf"
-            input_candidate = metadata_path.parent / "input.pdf"
-            job.input_path = input_candidate.resolve() if input_candidate.is_file() else None
-            job.result_path = result_candidate.resolve() if result_candidate.is_file() else None
-            if job.result_path is not None:
-                job.result_bytes = Path(job.result_path).stat().st_size
-                if job.status in _ACTIVE_JOB_STATUSES:
-                    job.status = "done"
-                    job.progress = 100
-                    job.message = "Recovered completed OCR result."
-                    job.completed_at = job.completed_at or _utc_now()
-                    job.finished_at = job.finished_at or job.completed_at
-                    job.heartbeat_at = job.heartbeat_at or job.completed_at
-            elif job.status == "queued" and job.input_path is not None and Path(job.input_path).exists():
+            job.input_path = _safe_job_artifact(
+                jobs_root=self.jobs_root,
+                job_id=job.job_id,
+                filename="input.pdf",
+            )
+            job.result_path = (
+                _safe_job_artifact(
+                    jobs_root=self.jobs_root,
+                    job_id=job.job_id,
+                    filename="result.pdf",
+                )
+                if job.status == "done"
+                else None
+            )
+            if job.status == "done" and job.result_path is not None:
+                job.result_bytes = job.result_path.stat().st_size
+            elif job.status == "queued" and job.input_path is not None:
                 job.progress = 0
                 job.message = "Recovered queued OCR job."
                 job.started_at = None
@@ -1589,9 +1710,6 @@ def _build_handler(
                     delete_original_text_layer=delete_original_text_layer,
                     hybrid_chunk_cache_root=hybrid_chunk_cache_root,
                 )
-            result_target = jobs_root / job_id / "result.pdf"
-            result_target.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_copy_file(summary.output_pdf_path, result_target)
             partial_page_failures = max(
                 0,
                 int(getattr(summary, "partial_page_failures", 0) or 0),
@@ -1601,14 +1719,14 @@ def _build_handler(
                 if partial_page_failures == 0
                 else f"Done: {partial_page_failures} pages without text"
             )
-            _set_state(
-                status="done",
-                progress=100,
+            published_result = job_store.publish_result_if_running(
+                job_id,
+                source=summary.output_pdf_path,
                 message=completion_message,
                 run_dir=str(summary.run_dir) if keep_job_runs else None,
-                result_path=result_target.resolve(),
-                error=None,
             )
+            if published_result is None:
+                return
             completed_successfully = True
         except Exception as exc:
             _set_state(status="error", progress=100, message="Failed", error=str(exc))
@@ -2010,13 +2128,23 @@ def _build_handler(
             if job is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Job not found: {job_id}"})
                 return
-            if job.status != "done" or job.result_path is None or not job.result_path.exists():
+            safe_result = _safe_job_artifact(
+                jobs_root=jobs_root,
+                job_id=job_id,
+                filename="result.pdf",
+            )
+            if (
+                job.status != "done"
+                or job.result_path is None
+                or safe_result is None
+                or job.result_path != safe_result
+            ):
                 self._send_json(HTTPStatus.CONFLICT, {"error": "Result is not ready yet."})
                 return
             filename = job.filename
             safe_name = filename[:-4] if filename.lower().endswith(".pdf") else filename
             download_name = f"{safe_name}.searchable.pdf"
-            self._send_pdf_file(path=job.result_path, filename=download_name)
+            self._send_pdf_file(path=safe_result, filename=download_name)
 
         def _handle_cancel_job(self, job_id: str) -> None:
             job, cancelled, error = job_store.cancel(job_id)
