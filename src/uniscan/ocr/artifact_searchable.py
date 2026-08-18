@@ -2819,6 +2819,7 @@ def _validate_searchable_text_retention(
     extracted_text: str | None = None,
     source_page_texts: Sequence[str] | None = None,
     extracted_page_texts: Sequence[str] | None = None,
+    selected_pages: frozenset[int] | None = None,
     expected_textless_pages: frozenset[int] = frozenset(),
     expect_empty_text_layer: bool = False,
 ) -> None:
@@ -2843,14 +2844,17 @@ def _validate_searchable_text_retention(
             f"expected {len(source_pages)}, got {len(extracted_pages)}."
         )
     all_pages = frozenset(range(1, len(source_pages) + 1))
-    if not expected_textless_pages <= all_pages:
+    if selected_pages is None:
+        selected_pages = all_pages
+    if not selected_pages <= all_pages or not expected_textless_pages <= selected_pages:
         raise RuntimeError("Verified textless-graphics page set is out of range.")
     if expect_empty_text_layer:
         expected_textless_pages = all_pages
+        selected_pages = all_pages
 
     canonical_source = tuple(_canonical_exact_page_text(text) for text in source_pages)
     canonical_extracted = tuple(_canonical_exact_page_text(text) for text in extracted_pages)
-    if not any(canonical_source) and expected_textless_pages != all_pages:
+    if not any(canonical_source) and expected_textless_pages != selected_pages:
         raise RuntimeError("Output PDF has empty extracted text layer.")
 
     for page_number, (expected, observed) in enumerate(
@@ -2900,7 +2904,62 @@ def _owned_exact_evidence_file(root: Path, raw_name: object, expected_name: str)
     return resolved_candidate
 
 
-def _textless_geometry_is_valid(path: Path, *, engine: str) -> bool:
+def _chandra_exhausted_zero_evidence_is_valid(evidence: dict[str, object]) -> bool:
+    attempts = evidence.get("attempts")
+    labels = evidence.get("chandra_non_text_labels")
+    return bool(
+        evidence.get("explicit_nontext") is False
+        and labels == []
+        and evidence.get("attempt_count") == 3
+        and not isinstance(evidence.get("attempt_count"), bool)
+        and evidence.get("terminal_attempt") == 3
+        and "selected_attempt" not in evidence
+        and isinstance(attempts, list)
+        and len(attempts) == 3
+        and all(
+            isinstance(attempt, dict)
+            and attempt.get("attempt") == expected_attempt
+            and not isinstance(attempt.get("attempt"), bool)
+            and attempt.get("ocr_outcome") == "zero_output"
+            and attempt.get("explicit_nontext") is False
+            and attempt.get("labels") == []
+            for expected_attempt, attempt in enumerate(attempts, start=1)
+        )
+    )
+
+
+def _chandra_exhausted_zero_row_is_valid(evidence: dict[str, object]) -> bool:
+    history = evidence.get("attempt_history")
+    reconciled_errors = evidence.get("reconciled_page_errors")
+    return bool(
+        evidence.get("explicit_nontext") is False
+        and evidence.get("attempt_count") == 3
+        and not isinstance(evidence.get("attempt_count"), bool)
+        and evidence.get("terminal_attempt") == 3
+        and "selected_attempt" not in evidence
+        and isinstance(history, list)
+        and len(history) == 3
+        and all(
+            isinstance(item, dict)
+            and item.get("attempt") == expected_attempt
+            and not isinstance(item.get("attempt"), bool)
+            for expected_attempt, item in enumerate(history, start=1)
+        )
+        and isinstance(reconciled_errors, list)
+        and len(reconciled_errors) == 1
+        and isinstance(reconciled_errors[0], dict)
+        and reconciled_errors[0].get("code") == "zero_output"
+        and isinstance(reconciled_errors[0].get("message"), str)
+        and bool(str(reconciled_errors[0]["message"]).strip())
+    )
+
+
+def _textless_geometry_is_valid(
+    path: Path,
+    *,
+    engine: str,
+    allow_chandra_exhausted_zero: bool = False,
+) -> bool:
     payload = _json_object_or_none(path)
     images = payload.get("images") if payload is not None else None
     if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
@@ -2908,7 +2967,7 @@ def _textless_geometry_is_valid(path: Path, *, engine: str) -> bool:
     image = images[0]
     if image.get("ocr_outcome") != "textless_graphics":
         return False
-    if engine == "chandra":
+    if engine == "chandra" and not allow_chandra_exhausted_zero:
         labels = image.get("chandra_non_text_labels")
         if (
             image.get("explicit_nontext") is not True
@@ -2921,6 +2980,8 @@ def _textless_geometry_is_valid(path: Path, *, engine: str) -> bool:
             return False
         if not normalized_labels <= {"blank-page", "image", "figure", "diagram"}:
             return False
+    elif engine == "chandra" and not _chandra_exhausted_zero_evidence_is_valid(image):
+        return False
     pages = image.get("pages")
     return bool(
         isinstance(pages, list)
@@ -2983,8 +3044,8 @@ def _validated_textless_graphics_pages(
         ):
             return frozenset()
         rows[source_page] = raw_row
-    expected_pages = frozenset(range(1, len(rows) + 1))
-    if not accepted <= expected_pages or frozenset(rows) != expected_pages:
+    expected_pages = frozenset(rows)
+    if not accepted <= expected_pages:
         return frozenset()
 
     def reject_claim(reason: str) -> NoReturn:
@@ -3053,19 +3114,44 @@ def _validated_textless_graphics_pages(
         computed_errors["chandra"] += chandra_errors
         if source_page not in accepted:
             continue
-        if (
-            raw_row.get("accepted") is not True
-            or raw_row.get("reason") != "explicit_chandra_nontext_with_quiet_surya"
-            or raw_row.get("chandra_outcome") != "explicit_nontext"
-            or raw_row.get("surya_outcome") not in {"zero_output", "text"}
-            or not isinstance(surya_lines, int)
-            or isinstance(surya_lines, bool)
-            or not 0 <= surya_lines <= 1
-            or not isinstance(surya_chars, int)
-            or isinstance(surya_chars, bool)
-            or not 0 <= surya_chars <= 8
-        ):
+        reason = raw_row.get("reason")
+        base_valid = (
+            raw_row.get("accepted") is True
+            and type(surya_lines) is int
+            and type(surya_chars) is int
+        )
+        explicit_graphics_valid = (
+            reason == "explicit_chandra_nontext_with_quiet_surya"
+            and raw_row.get("chandra_outcome") == "explicit_nontext"
+            and raw_row.get("surya_outcome") in {"zero_output", "text"}
+            and type(surya_lines) is int
+            and type(surya_chars) is int
+            and 0 <= surya_lines <= 1
+            and 0 <= surya_chars <= 8
+        )
+        exhausted_zero_valid = (
+            reason == "exhausted_chandra_zero_with_sparse_surya"
+            and raw_row.get("chandra_outcome") == "zero_output"
+            and raw_row.get("surya_outcome") == "text"
+            and type(surya_lines) is int
+            and type(surya_chars) is int
+            and surya_errors == 0
+            and chandra_errors == 1
+            and 0 <= surya_lines <= 2
+            and 0 <= surya_chars <= 24
+        )
+        if not base_valid or not (explicit_graphics_valid or exhausted_zero_valid):
             reject_claim(f"page {source_page} reconciliation row is inconsistent")
+    try:
+        import fitz
+
+        with fitz.open(str(resolved_source)) as source_document:
+            source_page_count = source_document.page_count
+    except Exception as exc:
+        reject_claim(f"the source PDF is unreadable: {exc}")
+    all_source_pages = frozenset(range(1, source_page_count + 1))
+    if not expected_pages <= all_source_pages:
+        reject_claim("the selected page identities are out of source PDF range")
     if any(
         not isinstance(error_totals.get(engine), int)
         or isinstance(error_totals.get(engine), bool)
@@ -3077,7 +3163,7 @@ def _validated_textless_graphics_pages(
     marker_pages = tuple(int(match.group(1)) for match in _PAGE_MARKER_RE.finditer(artifact_text))
     if len(marker_pages) != len(set(marker_pages)) or frozenset(marker_pages) != expected_pages:
         reject_claim("the selected artifact marker map is not exact")
-    artifact_page_texts = _split_text_to_pages(artifact_text, len(expected_pages))
+    artifact_page_texts = _split_text_to_pages(artifact_text, source_page_count)
     if any(
         _canonical_exact_page_text(artifact_page_texts[page_number - 1])
         for page_number in accepted
@@ -3169,6 +3255,7 @@ def _validated_textless_graphics_pages(
             computed_text_chars += row_text_chars
             if source_page not in accepted:
                 continue
+            allow_chandra_exhausted_zero = rows[source_page].get("reason") == "exhausted_chandra_zero_with_sparse_surya"
             if (
                 raw_row.get("ocr_outcome") != "textless_graphics"
                 or raw_row.get("page_errors") != []
@@ -3176,7 +3263,16 @@ def _validated_textless_graphics_pages(
                 or raw_row.get("accepted_by") != "mode_both_page_reconciliation"
                 or not _is_exact_zero(raw_row.get("alnum_line_count"))
                 or not _is_exact_zero(raw_row.get("alnum_chars"))
-                or (engine == "chandra" and raw_row.get("explicit_nontext") is not True)
+                or (
+                    engine == "chandra"
+                    and not allow_chandra_exhausted_zero
+                    and raw_row.get("explicit_nontext") is not True
+                )
+                or (
+                    engine == "chandra"
+                    and allow_chandra_exhausted_zero
+                    and not _chandra_exhausted_zero_row_is_valid(raw_row)
+                )
             ):
                 reject_claim(f"{engine} page {source_page} published evidence is inconsistent")
             geometry = _owned_exact_evidence_file(
@@ -3188,7 +3284,11 @@ def _validated_textless_graphics_pages(
                 reject_claim(f"{engine} page {source_page} owned evidence is incomplete")
             if page_text_value != "":
                 reject_claim(f"{engine} page {source_page} text artifact is not empty")
-            if not _textless_geometry_is_valid(geometry, engine=engine):
+            if not _textless_geometry_is_valid(
+                geometry,
+                engine=engine,
+                allow_chandra_exhausted_zero=allow_chandra_exhausted_zero,
+            ):
                 reject_claim(f"{engine} page {source_page} geometry evidence is invalid")
         if frozenset(engine_pages) != expected_pages:
             reject_claim(f"{engine} pages index is not contiguous")
@@ -3197,16 +3297,6 @@ def _validated_textless_graphics_pages(
         if result_chars[engine] != computed_text_chars:
             reject_claim(f"{engine} reconciliation text counter disagrees with page artifacts")
 
-    try:
-        import fitz
-
-        with fitz.open(str(resolved_source)) as source_document:
-            if source_document.page_count != len(expected_pages):
-                reject_claim("the source PDF page count disagrees with reconciliation")
-    except ValueError:
-        raise
-    except Exception as exc:
-        reject_claim(f"the source PDF is unreadable: {exc}")
     return accepted
 
 
@@ -3529,6 +3619,9 @@ def run_artifact_searchable_package(
                     native_page_texts, overlay_page_texts, strict=True
                 )
             ]
+            selected_artifact_pages = frozenset(
+                int(match.group(1)) for match in _PAGE_MARKER_RE.finditer(text)
+            )
             if expected_textless_pages:
                 _validate_textless_visual_retention(
                     source_pdf=source_pdf_for_build,
@@ -3538,6 +3631,7 @@ def run_artifact_searchable_package(
             _validate_searchable_text_retention(
                 source_page_texts=expected_output_page_texts,
                 extracted_page_texts=extracted_page_texts,
+                selected_pages=selected_artifact_pages,
                 expected_textless_pages=expected_textless_pages,
             )
             if expected_textless_pages:

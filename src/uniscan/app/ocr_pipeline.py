@@ -120,6 +120,8 @@ _CHANDRA_CONTENT_FILTERS = {
 _CHANDRA_ATTEMPT_EVIDENCE_SCHEMA = "uniscan.chandra-attempt.v2"
 _RETRY_TEXT_AGREEMENT_ALGORITHM = "nfkc-layout-whitespace-exact-v1"
 _CHUNK_EVIDENCE_MANIFEST_SCHEMA = "uniscan.chunk-evidence.v1"
+_SPARSE_SURYA_GRAPHICS_MAX_ALNUM_LINES = 2
+_SPARSE_SURYA_GRAPHICS_MAX_ALNUM_CHARS = 24
 _MAX_CHUNK_MANIFEST_BYTES = 16 * 1024 * 1024
 _MAX_OCR_TEXT_ARTIFACT_BYTES = 64 * 1024 * 1024
 _FILE_HASH_BLOCK_BYTES = 1024 * 1024
@@ -976,6 +978,8 @@ def _strict_chandra_attempt_history(
             )
         labels: list[str] = []
         texts: list[str] = []
+        alternative_texts: list[str] = []
+        excluded_header_footer_lines: list[str] = []
         lines: list[dict[str, object]] = []
         ignored_graphic_lines: list[str] = []
         prompt_type = str(attempt.get("prompt_type") or "")
@@ -1014,6 +1018,10 @@ def _strict_chandra_attempt_history(
             if not chunk_lines:
                 continue
             texts.extend(chunk_lines)
+            if label in {"page-header", "page-footer"}:
+                excluded_header_footer_lines.extend(chunk_lines)
+            else:
+                alternative_texts.extend(chunk_lines)
             parsed_bbox = _bbox_values(raw_chunk.get("bbox"))
             if parsed_bbox is None:
                 continue
@@ -1085,6 +1093,8 @@ def _strict_chandra_attempt_history(
             raw_result=raw_result,
             texts=texts,
             ignored_graphic_lines=ignored_graphic_lines,
+            alternative_texts=alternative_texts,
+            excluded_header_footer_lines=excluded_header_footer_lines,
         )
         if texts and alternative_text_evidence["accounting"] == "unaccounted":
             raise RuntimeError(
@@ -1434,7 +1444,13 @@ def _strict_chandra_attempt_metadata(
             }
             or alternative_text_evidence.get("policy") != _CHANDRA_ALTERNATIVE_TEXT_POLICY
             or alternative_text_evidence.get("accounting")
-            not in {"empty", "parsed", "ignored_graphic_description", "unaccounted"}
+            not in {
+                "empty",
+                "parsed",
+                "parsed_without_header_footer",
+                "ignored_graphic_description",
+                "unaccounted",
+            }
             or any(
                 not _valid_sha256(alternative_text_evidence.get(key))
                 for key in (
@@ -2957,6 +2973,32 @@ def _validate_final_mode_both_state(
                 reason = "both_text_retry_geometry_agreement"
         elif surya_outcome == "verified_blank" and chandra_outcome == "verified_blank":
             reason = "both_verified_blank"
+        elif surya_outcome == "text" and chandra_outcome == "zero_output":
+            surya_alnum_lines, surya_alnum_chars = _verified_surya_quiet_evidence(
+                row=surya,
+                engine_dir=engine_dirs["surya"],
+                source_page=source_page,
+                expected_outcome=surya_outcome,
+                text_payload_override=original_text["surya"],
+                geometry_payload_override=original_geometry["surya"],
+            )
+            sparse_surya = (
+                surya_attempt == 1
+                and surya_alnum_lines <= _SPARSE_SURYA_GRAPHICS_MAX_ALNUM_LINES
+                and surya_alnum_chars <= _SPARSE_SURYA_GRAPHICS_MAX_ALNUM_CHARS
+            )
+            exhausted_chandra = (
+                chandra_attempt == 3
+                and not surya_errors
+                and [item["code"] for item in chandra_errors] == ["zero_output"]
+            )
+            if not sparse_surya or not exhausted_chandra:
+                raise RuntimeError(f"Page {source_page} forged sparse-graphics acceptance")
+            reason = "exhausted_chandra_zero_with_sparse_surya"
+            is_graphics = True
+            recomputed_graphics.append(source_page)
+            reconciled_counts["surya"] += len(surya_errors)
+            reconciled_counts["chandra"] += len(chandra_errors)
         elif chandra_outcome == "explicit_nontext" and chandra.get("explicit_nontext") is True:
             surya_alnum_lines, surya_alnum_chars = _verified_surya_quiet_evidence(
                 row=surya,
@@ -3256,6 +3298,39 @@ def _reconcile_mode_both_pages(
         ):
             reason = "both_verified_blank"
             accepted = True
+        elif (
+            not reason
+            and surya_outcome == "text"
+            and chandra_outcome == "zero_output"
+            and surya_attempt == 1
+            and chandra_attempt == 3
+        ):
+            try:
+                surya_alnum_lines, surya_alnum_chars = _verified_surya_quiet_evidence(
+                    row=surya,
+                    engine_dir=surya_path.parent.resolve(),
+                    source_page=source_page,
+                    expected_outcome=surya_outcome,
+                )
+            except RuntimeError as exc:
+                reason = f"invalid_candidate_evidence: {exc}"
+            else:
+                expected_errors = (
+                    not surya_errors
+                    and [item["code"] for item in chandra_errors] == ["zero_output"]
+                )
+                sparse_surya = (
+                    surya_alnum_lines <= _SPARSE_SURYA_GRAPHICS_MAX_ALNUM_LINES
+                    and surya_alnum_chars <= _SPARSE_SURYA_GRAPHICS_MAX_ALNUM_CHARS
+                )
+                if expected_errors and sparse_surya:
+                    reason = "exhausted_chandra_zero_with_sparse_surya"
+                    accepted = True
+                    accepted_graphics.append(source_page)
+                elif not expected_errors:
+                    reason = "unrelated_page_error"
+                else:
+                    reason = "exhausted_chandra_zero_with_dense_surya"
         elif (
             not reason
             and chandra_outcome == "explicit_nontext"

@@ -627,6 +627,131 @@ def test_chandra_text_attempt_rejects_unaccounted_alternative_text(
     assert calls == (1 if prompt_mode == "layout" else 3)
 
 
+def test_chandra_layout_accepts_intentionally_omitted_header_footer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+    calls = 0
+
+    def generate(_batch):
+        nonlocal calls
+        calls += 1
+        return [
+            SimpleNamespace(
+                chunks=[
+                    {
+                        "label": "Page-Header",
+                        "content": "DOCUMENT HEADER",
+                        "bbox": [0, 0, 120, 20],
+                    },
+                    {
+                        "label": "Text",
+                        "content": "VISIBLE BODY",
+                        "bbox": [0, 20, 120, 60],
+                    },
+                    {
+                        "label": "Page-Footer",
+                        "content": "PAGE 3",
+                        "bbox": [0, 60, 120, 80],
+                    },
+                ],
+                html="<p>VISIBLE BODY</p>",
+                markdown="VISIBLE BODY",
+            )
+        ]
+
+    _install_fake_chandra(monkeypatch, generate=generate)
+
+    text, chars = benchmark._run_chandra_module(
+        [image_path],
+        lang="eng",
+        work_dir=tmp_path / "work",
+    )
+
+    assert text == "DOCUMENT HEADER\nVISIBLE BODY\nPAGE 3"
+    assert chars == len(text)
+    assert calls == 1
+    evidence = json.loads(
+        (tmp_path / "work" / "chandra_page_lines.json").read_text(encoding="utf-8")
+    )["images"][0]
+    assert evidence["attempts"][0]["alternative_text_evidence"]["accounting"] == (
+        "parsed_without_header_footer"
+    )
+
+
+def test_chandra_layout_accepts_markdown_list_marker_loss_after_header_omission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+    body = (
+        "1. This numbered paragraph is deliberately long enough for strict near-complete "
+        "coverage after Markdown removes its list marker."
+    )
+
+    def generate(_batch):
+        return [
+            SimpleNamespace(
+                chunks=[
+                    {"label": "Page-Header", "content": "PAGE 3", "bbox": [0, 0, 120, 20]},
+                    {"label": "Text", "content": body, "bbox": [0, 20, 120, 80]},
+                ],
+                html=f"<p>{body}</p>",
+                markdown=body,
+            )
+        ]
+
+    _install_fake_chandra(monkeypatch, generate=generate)
+
+    text, chars = benchmark._run_chandra_module(
+        [image_path],
+        lang="eng",
+        work_dir=tmp_path / "work",
+    )
+
+    assert text == f"PAGE 3\n{body}"
+    assert chars == len(text)
+    evidence = json.loads(
+        (tmp_path / "work" / "chandra_page_lines.json").read_text(encoding="utf-8")
+    )["images"][0]
+    assert evidence["attempts"][0]["alternative_text_evidence"]["accounting"] == (
+        "parsed_without_header_footer"
+    )
+
+
+def test_chandra_layout_rejects_conflicting_markdown_despite_matching_html(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "page.png"
+    _nonblank_image(image_path)
+    body = "VISIBLE BODY TEXT WITH COMPLETE GEOMETRY"
+
+    def generate(_batch):
+        return [
+            SimpleNamespace(
+                chunks=[
+                    {"label": "Page-Header", "content": "PAGE 3", "bbox": [0, 0, 120, 20]},
+                    {"label": "Text", "content": body, "bbox": [0, 20, 120, 80]},
+                ],
+                html=f"<p>{body}</p>",
+                markdown=f"{body}\nALIEN ALTERNATIVE TEXT",
+            )
+        ]
+
+    _install_fake_chandra(monkeypatch, generate=generate)
+
+    with pytest.raises(RuntimeError, match="unaccounted alternative text"):
+        benchmark._run_chandra_module(
+            [image_path],
+            lang="eng",
+            work_dir=tmp_path / "work",
+        )
+
+
 @pytest.mark.parametrize("defect", ["empty", "extra", "error"])
 def test_chandra_attempt_rejects_invalid_batch_cardinality_or_error(
     tmp_path: Path,

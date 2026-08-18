@@ -835,6 +835,107 @@ def test_reconcile_74_accepts_explicit_graphics_with_third_zero_surya(
     assert reconciliation["accepted_textless_graphics_pages"] == [1]
 
 
+def test_reconcile_accepts_sparse_surya_when_chandra_exhausts_with_zero_output(
+    tmp_path: Path,
+) -> None:
+    surya_text = "Profession of\nPhonester"
+    run_dir, results, result_files = _build_reconciliation_run(
+        tmp_path,
+        surya_rows=[
+            {
+                "source_page": 1,
+                "text": surya_text,
+                "ocr_outcome": "text",
+                "alnum_line_count": 2,
+                "alnum_chars": 21,
+            }
+        ],
+        chandra_rows=[
+            {
+                "source_page": 1,
+                "text": "",
+                "ocr_outcome": "zero_output",
+                "alnum_line_count": 0,
+                "alnum_chars": 0,
+                "page_errors": ["Chandra geometry sidecar has no text_lines"],
+            }
+        ],
+    )
+
+    adjusted, error = ocr_pipeline._reconcile_mode_both_pages(
+        run_dir=run_dir,
+        results=results,
+        result_files=result_files,
+    )
+
+    assert error is None
+    assert {result.engine: result.page_error_count for result in adjusted} == {
+        "surya": 0,
+        "chandra": 0,
+    }
+    for engine in ("surya", "chandra"):
+        engine_dir = run_dir / engine / engine
+        pages = json.loads((engine_dir / "pages.json").read_text(encoding="utf-8"))
+        assert pages["pages"][0]["ocr_outcome"] == "textless_graphics"
+        assert (engine_dir / f"page_0001.{engine}.json").is_file()
+        assert (engine_dir / "page_0001.txt").read_text(encoding="utf-8") == ""
+    reconciliation = json.loads((run_dir / "page_reconciliation.json").read_text(encoding="utf-8"))
+    assert reconciliation["pages"][0]["reason"] == (
+        "exhausted_chandra_zero_with_sparse_surya"
+    )
+    assert reconciliation["accepted_textless_graphics_pages"] == [1]
+
+
+@pytest.mark.parametrize(
+    ("surya_text", "alnum_lines", "alnum_chars"),
+    [
+        ("one\ntwo\nthree", 3, 11),
+        ("abcdefghijklmnopqrstuvwxy", 1, 25),
+    ],
+)
+def test_reconcile_rejects_dense_surya_when_chandra_exhausts_with_zero_output(
+    tmp_path: Path,
+    surya_text: str,
+    alnum_lines: int,
+    alnum_chars: int,
+) -> None:
+    run_dir, results, result_files = _build_reconciliation_run(
+        tmp_path,
+        surya_rows=[
+            {
+                "source_page": 1,
+                "text": surya_text,
+                "ocr_outcome": "text",
+                "alnum_line_count": alnum_lines,
+                "alnum_chars": alnum_chars,
+            }
+        ],
+        chandra_rows=[
+            {
+                "source_page": 1,
+                "text": "",
+                "ocr_outcome": "zero_output",
+                "alnum_line_count": 0,
+                "alnum_chars": 0,
+                "page_errors": ["Chandra geometry sidecar has no text_lines"],
+            }
+        ],
+    )
+
+    _adjusted, error = ocr_pipeline._reconcile_mode_both_pages(
+        run_dir=run_dir,
+        results=results,
+        result_files=result_files,
+    )
+
+    assert error == "unresolved pages: [1]"
+    reconciliation = json.loads((run_dir / "page_reconciliation.json").read_text(encoding="utf-8"))
+    assert reconciliation["pages"][0]["reason"] == (
+        "exhausted_chandra_zero_with_dense_surya"
+    )
+    assert reconciliation["accepted_textless_graphics_pages"] == []
+
+
 @pytest.mark.parametrize(
     "defect",
     [

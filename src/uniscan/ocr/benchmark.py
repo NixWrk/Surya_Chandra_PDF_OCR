@@ -70,7 +70,8 @@ _CHANDRA_ZERO_OUTPUT_RETRY_POLICY = (
 )
 _CHANDRA_LAYOUT_CONTENT_FILTER = "skip-graphic-labels-v1"
 _CHANDRA_PLAIN_CONTENT_FILTER = "visible-text-tags-exclude-media-description-v1"
-_CHANDRA_ALTERNATIVE_TEXT_POLICY = "account-visible-html-markdown-v1"
+_CHANDRA_ALTERNATIVE_TEXT_POLICY = "account-visible-html-markdown-near-subsequence-v3"
+_CHANDRA_ALTERNATIVE_TEXT_MIN_COVERAGE_PERCENT = 98
 _CHANDRA_ATTEMPT_EVIDENCE_SCHEMA = "uniscan.chandra-attempt.v2"
 _CHANDRA_MIN_IMAGE_DIM = 1536
 _MAX_CHANDRA_ATTEMPT_IMAGE_BYTES = 128 * 1024 * 1024
@@ -1732,6 +1733,7 @@ _CHANDRA_NON_TEXT_LABELS: set[str] = {
     "diagram",
 }
 _CHANDRA_GRAPHIC_LABELS: set[str] = {"image", "figure", "diagram"}
+_CHANDRA_HEADER_FOOTER_LABELS: set[str] = {"page-header", "page-footer"}
 _CHANDRA_VISIBLE_TEXT_TAGS: set[str] = {
     "blockquote",
     "caption",
@@ -1849,11 +1851,36 @@ def _chandra_normalized_text(lines: Sequence[str]) -> str:
     return unicodedata.normalize("NFKC", "\n".join(lines))
 
 
+def _chandra_alternative_text_matches(candidate: str, target: str) -> bool:
+    if candidate == target:
+        return True
+    candidate_canonical = _chandra_canonical_alnum([candidate])
+    target_canonical = _chandra_canonical_alnum([target])
+    if (
+        not candidate_canonical
+        or not target_canonical
+        or len(candidate_canonical) > len(target_canonical)
+        or len(candidate_canonical) * 100
+        < len(target_canonical) * _CHANDRA_ALTERNATIVE_TEXT_MIN_COVERAGE_PERCENT
+    ):
+        return False
+    target_index = 0
+    for char in candidate_canonical:
+        while target_index < len(target_canonical) and target_canonical[target_index] != char:
+            target_index += 1
+        if target_index == len(target_canonical):
+            return False
+        target_index += 1
+    return True
+
+
 def _chandra_alternative_text_evidence(
     *,
     raw_result: dict[str, Any],
     texts: Sequence[str],
     ignored_graphic_lines: Sequence[str],
+    alternative_texts: Sequence[str] | None = None,
+    excluded_header_footer_lines: Sequence[str] = (),
 ) -> dict[str, str]:
     html_lines = _chandra_chunk_lines(raw_result.get("html"))
     raw_markdown = str(raw_result.get("markdown") or "").strip()
@@ -1861,11 +1888,26 @@ def _chandra_alternative_text_evidence(
     html_text = _chandra_normalized_text(html_lines)
     markdown_text = _chandra_normalized_text(markdown_lines)
     parsed_text = _chandra_normalized_text(texts)
+    alternative_parsed_text = _chandra_normalized_text(
+        texts if alternative_texts is None else alternative_texts
+    )
+    excluded_header_footer_text = _chandra_normalized_text(excluded_header_footer_lines)
     ignored_text = _chandra_normalized_text(ignored_graphic_lines)
     alternatives = [value for value in (html_text, markdown_text) if value]
-    if not alternatives:
+    if excluded_header_footer_text and not alternatives and not alternative_parsed_text:
+        accounting = "parsed_without_header_footer"
+    elif not alternatives:
         accounting = "empty"
     elif parsed_text and all(value == parsed_text for value in alternatives):
+        accounting = "parsed"
+    elif excluded_header_footer_text and all(
+        _chandra_alternative_text_matches(value, alternative_parsed_text)
+        for value in alternatives
+    ):
+        accounting = "parsed_without_header_footer"
+    elif parsed_text and all(
+        _chandra_alternative_text_matches(value, parsed_text) for value in alternatives
+    ):
         accounting = "parsed"
     elif ignored_text and all(value == ignored_text for value in alternatives):
         accounting = "ignored_graphic_description"
@@ -2019,7 +2061,9 @@ def _persist_source_raster_artifact(
         source_page=source_page,
         require_rgb=True,
     )
-    if observed_artifact != raw_artifact or observed_identity != raw_identity:
+    expected_source_identity = dict(raw_identity)
+    expected_source_identity["name"] = source_raster.name
+    if observed_artifact != raw_artifact or observed_identity != expected_source_identity:
         raise RuntimeError(f"{engine} page {source_page} source raster seal changed.")
     durable_source = _copy_retry_evidence(
         source=source_raster,
@@ -2677,6 +2721,37 @@ def _collect_surya_batch_outputs(
         images=images,
         image_paths=image_paths,
     )
+    sidecar_changed = False
+    for image_payload in image_payloads:
+        for page in image_payload.get("pages", []):
+            if not isinstance(page, dict):
+                continue
+            raw_lines = page.get("text_lines")
+            if not isinstance(raw_lines, list):
+                continue
+            normalized_lines: list[object] = []
+            for raw_line in raw_lines:
+                if not isinstance(raw_line, dict):
+                    normalized_lines.append(raw_line)
+                    continue
+                raw_text = raw_line.get("text")
+                if not isinstance(raw_text, str):
+                    normalized_lines.append(raw_line)
+                    continue
+                text = _clean_overlay_line(raw_text)
+                if not text or not any(char.isalnum() for char in text):
+                    if attempt_count == 1:
+                        sidecar_changed = True
+                        continue
+                    normalized_lines.append(raw_line)
+                    continue
+                normalized_line = dict(raw_line)
+                normalized_line["text"] = text
+                normalized_lines.append(normalized_line)
+                sidecar_changed = sidecar_changed or normalized_line != raw_line
+            page["text_lines"] = normalized_lines
+    if sidecar_changed:
+        _write_json_atomic(sidecar_path, payload)
     execution_path = str(payload.get("execution_path") or "").strip()
     page_texts: list[str] = []
     total_chars = 0
@@ -4091,8 +4166,12 @@ def _run_chandra_module(
         width: int,
         height: int,
         allow_graphic_text: bool = False,
-    ) -> tuple[list[str], list[dict[str, Any]], list[str], list[str]]:
+    ) -> tuple[
+        list[str], list[dict[str, Any]], list[str], list[str], list[str], list[str]
+    ]:
         page_texts: list[str] = []
+        alternative_texts: list[str] = []
+        excluded_header_footer_lines: list[str] = []
         page_lines: list[dict[str, Any]] = []
         labels: list[str] = []
         ignored_graphic_lines: list[str] = []
@@ -4125,6 +4204,10 @@ def _run_chandra_module(
                     if not chunk_lines:
                         continue
                     page_texts.extend(chunk_lines)
+                    if label in _CHANDRA_HEADER_FOOTER_LABELS:
+                        excluded_header_footer_lines.extend(chunk_lines)
+                    else:
+                        alternative_texts.extend(chunk_lines)
                     bbox = _safe_bbox(chunk.get("bbox"), width, height)
                     if bbox is not None:
                         page_lines.extend(
@@ -4147,7 +4230,14 @@ def _run_chandra_module(
                 md = _strip_markdown(md.strip())
                 if md:
                     raise RuntimeError("Chandra OCR recovered text without complete geometry.")
-        return page_texts, page_lines, labels, ignored_graphic_lines
+        return (
+            page_texts,
+            page_lines,
+            labels,
+            ignored_graphic_lines,
+            alternative_texts,
+            excluded_header_footer_lines,
+        )
 
     def _explicit_nontext(labels: Sequence[str]) -> bool:
         normalized = {label.strip().lower() for label in labels if label.strip()}
@@ -4281,7 +4371,14 @@ def _run_chandra_module(
         if result_error is not False:
             raise RuntimeError("Chandra marked the one-image attempt as failed.")
         raw_result = _normalized_raw_result(results[0])
-        texts, lines, labels, ignored_graphic_lines = _parse_page_results(
+        (
+            texts,
+            lines,
+            labels,
+            ignored_graphic_lines,
+            alternative_texts,
+            excluded_header_footer_lines,
+        ) = _parse_page_results(
             [raw_result],
             width=width,
             height=height,
@@ -4311,6 +4408,8 @@ def _run_chandra_module(
             raw_result=raw_result,
             texts=texts,
             ignored_graphic_lines=ignored_graphic_lines,
+            alternative_texts=alternative_texts,
+            excluded_header_footer_lines=excluded_header_footer_lines,
         )
         if texts and alternative_text_evidence["accounting"] == "unaccounted":
             raise RuntimeError("Chandra OCR recovered text with unaccounted alternative text.")

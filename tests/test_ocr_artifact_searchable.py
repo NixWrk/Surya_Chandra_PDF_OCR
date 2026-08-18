@@ -181,6 +181,73 @@ def _write_textless_graphics_fixture(
     )
 
 
+def _write_sparse_surya_chandra_zero_fixture(
+    tmp_path: Path,
+    *,
+    source_page: int = 1,
+) -> SimpleNamespace:
+    fixture = _write_textless_graphics_fixture(
+        tmp_path, page_values=[50] * source_page, marker_pages=[source_page]
+    )
+    attempts = [
+        {
+            "attempt": attempt,
+            "ocr_outcome": "zero_output",
+            "explicit_nontext": False,
+            "labels": [],
+        }
+        for attempt in range(1, 4)
+    ]
+    chandra_dir = fixture.run_root / "chandra" / "chandra"
+    pages_path = chandra_dir / "pages.json"
+    pages_payload = json.loads(pages_path.read_text(encoding="utf-8"))
+    chandra_row = pages_payload["pages"][0]
+    chandra_row.update(
+        {
+            "explicit_nontext": False,
+            "chandra_non_text_labels": [],
+            "attempt_count": 3,
+            "terminal_attempt": 3,
+            "attempt_history": [{"attempt": attempt} for attempt in range(1, 4)],
+            "reconciled_page_errors": [
+                {
+                    "code": "zero_output",
+                    "message": "Chandra geometry sidecar has no text_lines",
+                }
+            ],
+        }
+    )
+    chandra_row.pop("chandra_non_text_labels", None)
+    pages_path.write_text(json.dumps(pages_payload), encoding="utf-8")
+    geometry_path = chandra_dir / f"page_{source_page:04d}.chandra.json"
+    geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+    geometry["images"][0].update(
+        {
+            "explicit_nontext": False,
+            "chandra_non_text_labels": [],
+            "attempt_count": 3,
+            "terminal_attempt": 3,
+            "attempts": attempts,
+        }
+    )
+    geometry_path.write_text(json.dumps(geometry), encoding="utf-8")
+    reconciliation = json.loads(fixture.reconciliation_path.read_text(encoding="utf-8"))
+    reconciliation["pages"][0].update(
+        {
+            "surya_outcome": "text",
+            "chandra_outcome": "zero_output",
+            "surya_alnum_line_count": 2,
+            "surya_alnum_chars": 21,
+            "surya_page_error_count": 0,
+            "chandra_page_error_count": 1,
+            "reason": "exhausted_chandra_zero_with_sparse_surya",
+        }
+    )
+    reconciliation["reconciled_page_error_counts"] = {"surya": 0, "chandra": 1}
+    fixture.reconciliation_path.write_text(json.dumps(reconciliation), encoding="utf-8")
+    return fixture
+
+
 def _write_mixed_textless_graphics_fixture(tmp_path: Path) -> SimpleNamespace:
     fixture = _write_textless_graphics_fixture(
         tmp_path,
@@ -363,6 +430,36 @@ def test_artifact_package_accepts_verified_image_only_pdf_without_placeholder_te
             matrix=matrix,
             alpha=False,
         ).samples
+
+
+def test_artifact_package_accepts_exhausted_chandra_zero_with_sparse_surya(
+    tmp_path: Path,
+) -> None:
+    fixture = _write_sparse_surya_chandra_zero_fixture(tmp_path, source_page=21)
+
+    evidence_pages = _validated_textless_graphics_pages(
+        reconciliation_root=fixture.run_root,
+        compare_dir=fixture.compare_dir,
+        artifact_path=fixture.artifact_path,
+        artifact_text=fixture.artifact_text,
+        document="document",
+        source_pdf=fixture.source_pdf,
+    )
+    assert evidence_pages == frozenset({21})
+
+    results = run_artifact_searchable_package(
+        compare_dir=fixture.compare_dir,
+        pdf_root=fixture.source_root,
+        output_dir=tmp_path / "output",
+        engines=("chandra",),
+        require_page_markers=True,
+        reconciliation_root=fixture.run_root,
+    )
+
+    assert results[0].status == "ok", results[0].error
+    assert results[0].text_chars == len(fixture.artifact_text)
+    assert results[0].page_count == 21
+    assert "verified textless-graphics page(s)" in " ".join(results[0].warnings)
 
 
 def test_artifact_package_still_rejects_marker_only_pdf_without_evidence(tmp_path: Path) -> None:

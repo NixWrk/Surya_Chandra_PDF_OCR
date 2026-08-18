@@ -57,6 +57,88 @@ def _write_fixture_png(path: Path) -> None:
     Image.new("RGB", (120, 80), color=(96, 96, 96)).save(path, format="PNG")
 
 
+def test_persist_source_raster_accepts_sealed_copy_name(tmp_path: Path) -> None:
+    original_path = tmp_path / "rendered-page-0001.png"
+    _write_fixture_png(original_path)
+    original_identity = ocr_benchmark_mod._source_raster_identity(
+        original_path,
+        source_page=1,
+    )
+
+    sealed_path = tmp_path / "attempt_evidence" / "source.png"
+    sealed_path.parent.mkdir(parents=True)
+    with Image.open(original_path) as image:
+        image.convert("RGB").save(sealed_path, format="PNG")
+    sealed_artifact = ocr_benchmark_mod._source_raster_artifact(sealed_path)
+    page_meta: dict[str, object] = {
+        "source_raster_identity": original_identity,
+        "source_raster_artifact": sealed_artifact,
+    }
+
+    durable_artifact = ocr_benchmark_mod._persist_source_raster_artifact(
+        engine_dir=tmp_path / "output",
+        page_meta=page_meta,
+        source_page=1,
+        engine="Chandra",
+        directory_suffix="chandra-source",
+    )
+
+    durable_path = Path(str(durable_artifact["path"]))
+    assert durable_path.name == "source.png"
+    assert durable_artifact["sha256"] == sealed_artifact["sha256"]
+    assert durable_artifact["bytes"] == sealed_artifact["bytes"]
+    assert page_meta["source_raster_identity"] == original_identity
+
+
+def test_collect_surya_batch_removes_punctuation_only_geometry(tmp_path: Path) -> None:
+    image_path = tmp_path / "page.png"
+    _write_fixture_png(image_path)
+    sidecar_path = tmp_path / "surya_page_lines.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "execution_path": "module",
+                "images": [
+                    {
+                        "image_name": image_path.name,
+                        "pages": [
+                            {
+                                "image_bbox": [0, 0, 120, 80],
+                                "text_lines": [
+                                    {"text": " useful text ", "bbox": [1, 1, 80, 20]},
+                                    {"text": ".", "bbox": [5, 30, 10, 35]},
+                                    {"text": "~", "bbox": [15, 30, 20, 35]},
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    texts, chars, errors, metadata = ocr_benchmark_mod._collect_surya_batch_outputs(
+        sidecar_path=sidecar_path,
+        image_paths=[image_path],
+        source_pages_1based=[1],
+        work_dir=tmp_path / "work",
+    )
+
+    assert texts == ["useful text"]
+    assert chars == len("useful text")
+    assert errors == []
+    assert metadata[0]["ocr_outcome"] == "text"
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["images"][0]["pages"][0]["text_lines"] == [
+        {"text": "useful text", "bbox": [1, 1, 80, 20]}
+    ]
+    selected = json.loads(Path(metadata[0]["surya_page_lines_path"]).read_text("utf-8"))
+    assert selected["images"][0]["pages"][0]["text_lines"] == [
+        {"text": "useful text", "bbox": [1, 1, 80, 20]}
+    ]
+
+
 def _set_exact_gpu0_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("UNISCAN_GPU_DEVICE_ID", ocr_benchmark_mod._EXPECTED_GPU0_UUID)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
