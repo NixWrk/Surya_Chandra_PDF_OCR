@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import stat
 import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -17,6 +18,8 @@ from io import BytesIO
 from pathlib import Path
 from time import perf_counter
 from typing import Any, NoReturn, Sequence
+
+from PIL import Image
 
 from uniscan.io.loaders import _safe_render_dpi
 
@@ -62,6 +65,10 @@ class _PlacementCandidate:
 
 _PAGE_MARKER_RE = re.compile(r"^\s*\[SOURCE PAGE\s+(\d+)\]\s*$", re.IGNORECASE | re.MULTILINE)
 _TOKEN_RE = re.compile(r"\S+")
+_SOURCE_RASTER_MAX_BYTES = 128 * 1024 * 1024
+_SOURCE_RASTER_MAX_PIXELS = 50_000_000
+_SOURCE_RASTER_MAX_DIMENSION = 32_768
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _finite_float(value: object) -> float | None:
@@ -2998,6 +3005,167 @@ def _textless_geometry_is_valid(
     )
 
 
+def _stable_stat_signature(value: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+    )
+
+
+def _is_reparse_point(value: os.stat_result) -> bool:
+    attributes = int(getattr(value, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & reparse_flag)
+
+
+def _is_effectively_blank_rgb_image(image: Image.Image) -> bool:
+    grayscale = image.convert("L")
+    grayscale.thumbnail((1024, 1024))
+    histogram = grayscale.histogram()
+    pixels = int(sum(histogram))
+    if pixels <= 0:
+        return False
+    nonwhite = int(sum(histogram[:245]))
+    dark = int(sum(histogram[:200]))
+    return bool(
+        nonwhite <= max(8, int(pixels * 0.0005))
+        and dark <= max(2, int(pixels * 0.00005))
+    )
+
+
+def _validated_verified_blank_raster(
+    *,
+    row: dict[str, object],
+    geometry_path: Path,
+    engine_dir: Path,
+    engine: str,
+    source_page: int,
+) -> dict[str, object]:
+    geometry = _json_object_or_none(geometry_path)
+    images = geometry.get("images") if geometry is not None else None
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise RuntimeError(f"{engine} page {source_page} blank geometry is invalid")
+    image = images[0]
+    pages = image.get("pages")
+    if (
+        image.get("ocr_outcome") != "verified_blank"
+        or not isinstance(pages, list)
+        or not pages
+        or any(not isinstance(page, dict) or page.get("text_lines") != [] for page in pages)
+    ):
+        raise RuntimeError(f"{engine} page {source_page} blank geometry is inconsistent")
+
+    identity = row.get("source_raster_identity")
+    exact_identity_fields = {
+        "pixel_sha256",
+        "width",
+        "height",
+        "name",
+        "source_page",
+        "verified_blank",
+    }
+    if (
+        not isinstance(identity, dict)
+        or identity != image.get("source_raster_identity")
+        or set(identity) != exact_identity_fields
+        or not isinstance(identity.get("pixel_sha256"), str)
+        or _SHA256_RE.fullmatch(str(identity["pixel_sha256"])) is None
+        or type(identity.get("width")) is not int
+        or type(identity.get("height")) is not int
+        or not 0 < int(identity["width"]) <= _SOURCE_RASTER_MAX_DIMENSION
+        or not 0 < int(identity["height"]) <= _SOURCE_RASTER_MAX_DIMENSION
+        or int(identity["width"]) * int(identity["height"]) > _SOURCE_RASTER_MAX_PIXELS
+        or not isinstance(identity.get("name"), str)
+        or not str(identity["name"])
+        or Path(str(identity["name"])).name != identity["name"]
+        or identity.get("source_page") != source_page
+        or isinstance(identity.get("source_page"), bool)
+        or identity.get("verified_blank") is not True
+        or image.get("image_name") != identity["name"]
+    ):
+        raise RuntimeError(f"{engine} page {source_page} source raster identity is invalid")
+
+    artifact = row.get("source_raster_artifact")
+    if (
+        not isinstance(artifact, dict)
+        or artifact != image.get("source_raster_artifact")
+        or set(artifact) != {"path", "sha256", "bytes"}
+        or not isinstance(artifact.get("path"), str)
+        or not isinstance(artifact.get("sha256"), str)
+        or _SHA256_RE.fullmatch(str(artifact["sha256"])) is None
+        or type(artifact.get("bytes")) is not int
+        or not 0 < int(artifact["bytes"]) <= _SOURCE_RASTER_MAX_BYTES
+    ):
+        raise RuntimeError(f"{engine} page {source_page} source raster artifact is invalid")
+
+    expected_path = (
+        engine_dir / f"page_{source_page:04d}.{engine}-source" / "source.png"
+    )
+    if Path(str(artifact["path"])) != expected_path:
+        raise RuntimeError(f"{engine} page {source_page} source raster path is invalid")
+    current = engine_dir
+    for component in expected_path.relative_to(engine_dir).parts:
+        current = current / component
+        try:
+            component_stat = current.lstat()
+        except OSError as exc:
+            raise RuntimeError(
+                f"{engine} page {source_page} source raster is unavailable: {exc}"
+            ) from exc
+        if stat.S_ISLNK(component_stat.st_mode) or _is_reparse_point(component_stat):
+            raise RuntimeError(
+                f"{engine} page {source_page} source raster path traverses a link"
+            )
+    if not stat.S_ISREG(component_stat.st_mode) or int(component_stat.st_nlink) != 1:
+        raise RuntimeError(f"{engine} page {source_page} source raster is not owned")
+
+    try:
+        with expected_path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            if before.st_size <= 0 or before.st_size > _SOURCE_RASTER_MAX_BYTES:
+                raise RuntimeError("source raster size is outside the bounded policy")
+            payload = stream.read()
+            after = os.fstat(stream.fileno())
+        current_stat = expected_path.stat()
+        if not (
+            _stable_stat_signature(before)
+            == _stable_stat_signature(after)
+            == _stable_stat_signature(current_stat)
+        ):
+            raise RuntimeError("source raster changed while it was being read")
+        if len(payload) != int(after.st_size):
+            raise RuntimeError("source raster read was incomplete")
+        with Image.open(BytesIO(payload)) as opened:
+            if opened.format != "PNG" or int(getattr(opened, "n_frames", 1)) != 1:
+                raise RuntimeError("source raster is not a single-frame PNG")
+            if (
+                opened.width > _SOURCE_RASTER_MAX_DIMENSION
+                or opened.height > _SOURCE_RASTER_MAX_DIMENSION
+                or opened.width * opened.height > _SOURCE_RASTER_MAX_PIXELS
+            ):
+                raise RuntimeError("source raster exceeds the bounded pixel policy")
+            opened.load()
+            if opened.mode != "RGB":
+                raise RuntimeError("source raster is not canonical RGB")
+            source_image = opened.copy()
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"source raster is unreadable: {exc}") from exc
+
+    if (
+        hashlib.sha256(payload).hexdigest() != artifact["sha256"]
+        or len(payload) != artifact["bytes"]
+        or source_image.size != (identity["width"], identity["height"])
+        or hashlib.sha256(source_image.tobytes()).hexdigest() != identity["pixel_sha256"]
+        or not _is_effectively_blank_rgb_image(source_image)
+    ):
+        raise RuntimeError(f"{engine} page {source_page} source raster pixels disagree")
+    return dict(identity)
+
+
 def _validated_textless_graphics_pages(
     *,
     reconciliation_root: Path | None,
@@ -3024,7 +3192,7 @@ def _validated_textless_graphics_pages(
 
     accepted_raw = reconciliation.get("accepted_textless_graphics_pages")
     rows_raw = reconciliation.get("pages")
-    if not isinstance(accepted_raw, list) or not accepted_raw:
+    if not isinstance(accepted_raw, list):
         return frozenset()
     if not isinstance(rows_raw, list) or not rows_raw:
         return frozenset()
@@ -3053,6 +3221,34 @@ def _validated_textless_graphics_pages(
 
     def reject_claim(reason: str) -> NoReturn:
         raise ValueError(f"Verified textless-graphics evidence is invalid: {reason}")
+
+    verified_blank: set[int] = set()
+    for source_page, raw_row in rows.items():
+        claims_blank = bool(
+            raw_row.get("reason") == "both_verified_blank"
+            or raw_row.get("surya_outcome") == "verified_blank"
+            or raw_row.get("chandra_outcome") == "verified_blank"
+        )
+        if not claims_blank:
+            continue
+        if not (
+            raw_row.get("accepted") is True
+            and raw_row.get("reason") == "both_verified_blank"
+            and raw_row.get("surya_outcome") == "verified_blank"
+            and raw_row.get("chandra_outcome") == "verified_blank"
+            and _is_exact_zero(raw_row.get("surya_alnum_line_count"))
+            and _is_exact_zero(raw_row.get("surya_alnum_chars"))
+            and _is_exact_zero(raw_row.get("surya_page_error_count"))
+            and _is_exact_zero(raw_row.get("chandra_page_error_count"))
+        ):
+            reject_claim(f"page {source_page} verified-blank reconciliation is inconsistent")
+        verified_blank.add(source_page)
+    verified_blank_pages = frozenset(verified_blank)
+    if verified_blank_pages & accepted:
+        reject_claim("verified-blank and textless-graphics page claims overlap")
+    authorized_textless_pages = accepted | verified_blank_pages
+    if not authorized_textless_pages:
+        return frozenset()
 
     identity_payloads: dict[str, dict[str, object]] = {}
     identity_stems: set[str] = set()
@@ -3115,6 +3311,8 @@ def _validated_textless_graphics_pages(
             reject_claim(f"page {source_page} error counters are invalid")
         computed_errors["surya"] += surya_errors
         computed_errors["chandra"] += chandra_errors
+        if source_page in verified_blank_pages:
+            continue
         if source_page not in accepted:
             continue
         reason = raw_row.get("reason")
@@ -3169,7 +3367,7 @@ def _validated_textless_graphics_pages(
     artifact_page_texts = _split_text_to_pages(artifact_text, source_page_count)
     if any(
         _canonical_exact_page_text(artifact_page_texts[page_number - 1])
-        for page_number in accepted
+        for page_number in authorized_textless_pages
     ):
         reject_claim("an accepted textless-graphics page has selected artifact text")
     try:
@@ -3178,6 +3376,7 @@ def _validated_textless_graphics_pages(
         reject_claim("the selected artifact is unreadable")
 
     engine_pdf_path: str | None = None
+    verified_blank_identities: dict[int, dict[str, object]] = {}
     for engine in ("surya", "chandra"):
         engine_dir = (resolved_root / engine / engine).resolve()
         try:
@@ -3256,7 +3455,46 @@ def _validated_textless_graphics_pages(
             ):
                 reject_claim(f"{engine} page {source_page} text counter changed")
             computed_text_chars += row_text_chars
-            if source_page not in accepted:
+            if source_page not in authorized_textless_pages:
+                continue
+            if source_page in verified_blank_pages:
+                if (
+                    raw_row.get("ocr_outcome") != "verified_blank"
+                    or raw_row.get("blank_page") is not True
+                    or raw_row.get("page_errors", []) != []
+                    or not _is_exact_zero(raw_row.get("alnum_line_count"))
+                    or not _is_exact_zero(raw_row.get("alnum_chars"))
+                    or page_text_value != ""
+                ):
+                    reject_claim(
+                        f"{engine} page {source_page} verified-blank row is inconsistent"
+                    )
+                blank_geometry = _owned_exact_evidence_file(
+                    engine_dir,
+                    raw_row.get("geometry_file"),
+                    f"page_{source_page:04d}.{engine}.json",
+                )
+                if blank_geometry is None:
+                    reject_claim(
+                        f"{engine} page {source_page} blank geometry is incomplete"
+                    )
+                try:
+                    blank_identity = _validated_verified_blank_raster(
+                        row=raw_row,
+                        geometry_path=blank_geometry,
+                        engine_dir=engine_dir,
+                        engine=engine,
+                        source_page=source_page,
+                    )
+                except RuntimeError as exc:
+                    reject_claim(str(exc))
+                previous_identity = verified_blank_identities.setdefault(
+                    source_page, blank_identity
+                )
+                if previous_identity != blank_identity:
+                    reject_claim(
+                        f"page {source_page} engine source raster identities disagree"
+                    )
                 continue
             allow_chandra_exhausted_zero = rows[source_page].get("reason") == "exhausted_chandra_zero_with_sparse_surya"
             if (
@@ -3300,7 +3538,7 @@ def _validated_textless_graphics_pages(
         if result_chars[engine] != computed_text_chars:
             reject_claim(f"{engine} reconciliation text counter disagrees with page artifacts")
 
-    return accepted
+    return authorized_textless_pages
 
 
 _validated_all_textless_graphics_pages = _validated_textless_graphics_pages
