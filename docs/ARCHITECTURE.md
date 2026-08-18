@@ -77,8 +77,10 @@ processes have a proven cooperative stop boundary.
 
 Publication is fenced by job ownership: a stale or reclaimed worker cannot copy
 its result or mark a newer attempt done. Recovery and result serving accept only
-root-contained regular non-link files. Result seals and complete runtime
-identity remain incremental hardening work where noted in the audit backlog.
+root-contained regular non-link files whose persisted size, SHA-256 and page-count
+seal revalidates. Richer executable/package/model/CUDA provenance for an explicitly
+retained resumable cache remains incremental hardening work; it does not require a
+global document registry.
 
 ## Validation boundaries
 
@@ -98,8 +100,10 @@ Failures preserve evidence and never publish a partially validated candidate.
 - The caller owns original source documents.
 - A run owns only artifacts beneath its run root.
 - An HTTP job owns only its service-created job directory and metadata.
-- Shared chunk caches are application-owned but are not disposable until
-  identity, retention, and recovery contracts prove that deletion is safe.
+- Chunk caches are scoped to a particular run key, not a global document catalog.
+  Active, failed, incident-retained, or explicitly resumable caches are not
+  disposable until identity, retention, and recovery contracts prove deletion
+  safe; successful HTTP working data is removed by default.
 - Model caches are deployment assets and must not be removed by diagnostics.
 
 ## Deployment topology

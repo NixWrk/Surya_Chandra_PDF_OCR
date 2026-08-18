@@ -15,7 +15,8 @@ The original ranked matrix below remains the audit trail. Current disposition:
   (12), standalone Compose networking (15), trusted-network decision (16), CPU CI
   (24), `AGENTS.md`/runbooks/repo skill (25–27), MCP assessment (28), and test
   signal classification (30).
-- Partially complete: immutable runtime/cache identity (9–10), dependency/runtime
+- Completed: immutable resolved environment snapshot and drift fencing for item
+  9. Partially complete: richer runtime/cache provenance (10), dependency/runtime
   alignment (13–14), resource limits (18), and stale documentation (29).
 - Deferred by evidence: thin MCP remains unnecessary without a consumer;
   running cancellation (19) still depends on cooperative engine termination.
@@ -24,9 +25,10 @@ The current open order, which supersedes the numerical order for future work, is
 
 1. Clean dependency-resolution evidence for Docker and Windows without changing
    OCR versions; the offline source-layer build is not a clean dependency build.
-2. Complete per-run identity and propagation across recursive chunks using
-   executable/package/model/CUDA provenance. Do not create a global document
-   registry or permanent history.
+2. Decide the minimal executable/package/model/CUDA provenance needed for an
+   explicitly retained resumable cache. Environment drift is already fenced;
+   do not create a global document registry, permanent history, or full model-file
+   hash inventory without evidence that it is needed.
 3. Repeat the real-engine benchmark for median/tail latency and peak RAM/VRAM;
    extend fixtures for rotated, skewed, noisy, low-resolution, and existing-text
    inputs.

@@ -39,14 +39,17 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
   boundary is documented and MCP is deferred until a real consumer needs it.
 - Docker dependency snapshots are preserved as observations only. They are not
   wired into installation and are not described as cross-platform locks.
+- Chunked OCR now resolves one runtime-configuration snapshot for a run and
+  fails closed before publishing if tracked settings drift. The snapshot stays
+  inside that run's resumable cache; it is not a document-history registry.
 
 ## Current verification
 
-On local `main`, through `253bca0`:
+On local `main`, through `c89b593`:
 
 ```text
 python -m pytest -q
-676 passed, 9 skipped, 5 warnings in 243.44s
+678 passed, 9 skipped, 5 warnings in 259.49s
 ```
 
 There are no expected failures. The former malformed/encrypted admission xfails
@@ -66,9 +69,10 @@ Current order after the synthetic baseline and blank-page fix:
 
 1. Validate clean dependency resolutions separately for Docker/Windows and
    `cu126`/`cu128`; the offline source-layer build is only partial evidence.
-2. Complete per-run cache identity with actual executable, package, model, and
-   CUDA/runtime provenance and propagate one resolved snapshot through recursive
-   chunks. Do not add a global document registry.
+2. Decide the smallest useful executable/package/model/CUDA provenance for an
+   explicitly retained resumable cache. One resolved environment snapshot is
+   already enforced across chunk publication. Do not add a global document
+   registry or hash every historical document/model file.
 3. Extend the real-engine baseline with median/tail timing, peak RAM/VRAM,
    rotated/noisy/skewed fixtures, and controlled `mixed-layout` experiments. Its
    current CER/WER are `0.287293`/`0.366667`.

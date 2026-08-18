@@ -1,10 +1,13 @@
 # Test signal classification
 
-Evidence date: 2026-08-18. The complete local CPU suite reported:
+Evidence date: 2026-08-18. The complete local CPU suite through `c89b593`
+reported:
 
 ```text
-676 passed, 9 skipped, 5 warnings in 243.44s
+678 passed, 9 skipped, 5 warnings in 259.49s
 ```
+The earlier `676 passed` result remains the verified-blank checkpoint recorded
+in the synthetic-baseline document.
 
 ## Expected failures
 

@@ -6,12 +6,19 @@ Checkpoint reference:
 
 `checkpoint/dual-venv-stable-20260420` (base commit `158698e`)
 
+Status: historical cleanup record, not an active deletion checklist. The current
+evidence-backed inventory is `docs/audit/REPOSITORY_INVENTORY.md`. Never delete
+`outputs/`, `PDFs/`, model caches, retained incidents, resumable caches, or user
+artifacts from this document alone; verify ownership and the current retention
+policy first.
+
 ## Scope target
 
 Target repository shape:
 
 1. OCR pipeline only.
-2. Three modes only: `surya`, `chandra`, `chandra+surya`.
+2. One production searchable-PDF mode: `chandra+surya`; single-engine modes are
+   diagnostic/benchmark commands only.
 3. Minimal GUI + CLI + optional HTTP entrypoint.
 
 ## Keep (required)
@@ -51,10 +58,11 @@ Target repository shape:
 
 ### Local runtime artifacts and caches
 
-1. `.tmp*`, `pytest-cache-files-*`, `.ruff_cache`, `.uv_cache`
-2. `.venv*`, `.hf_cache*`, `.surya_cache`, `.modelscope_cache`
-3. `outputs/`, `PDFs/`, `_run_exec/`
-4. all `__pycache__/` directories and `*.pyc`
+Only confirmed process-owned temporary files and regenerable tool caches may be
+removed. Virtual environments, model caches, `outputs/`, `PDFs/`, `_run_exec/`,
+retained failures, and resumable run data are not blanket cleanup targets. Use
+the current runbooks and retention policy, never this historical list, before
+deleting local data.
 
 ### Legacy metadata and local tool state
 
@@ -87,7 +95,6 @@ Target repository shape:
 1. `run_gui.bat`
 2. `run_gui_app.bat`
 3. `run_gui_detailed.bat`
-4. `scripts/install_local_ocrmypdf_plugins.ps1`
 
 ## Verification checklist before physical deletion commit
 
@@ -97,5 +104,5 @@ Target repository shape:
    - `prepare-compare-txt`
    - `build-searchable-from-artifacts`
    - `searchable-pdf`
-3. GUI works in all three modes after cleanup.
+3. GUI works in the production `chandra+surya` mode after cleanup.
 4. Hybrid output still uses Chandra text + Surya geometry.
