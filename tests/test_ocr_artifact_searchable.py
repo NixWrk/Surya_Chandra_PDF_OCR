@@ -17,8 +17,10 @@ from uniscan.ocr.artifact_searchable import (
     _bbox_reading_order_details,
     _bbox_reading_order_indices,
     _blend_placements_vertical,
+    _build_overlay_page,
     _build_searchable_pdf_from_text,
     _build_geometry_candidates,
+    _canonical_exact_page_text,
     _choose_auto_candidate,
     _clean_overlay_line,
     _coalesce_text_layer_placements,
@@ -1279,6 +1281,23 @@ def test_coalesce_does_not_join_fragments_across_column_gutter() -> None:
         split_positions=split_positions,
     )
     assert [text for _bbox, text in coalesced] == ["LEFT COLUMN", "RIGHT COLUMN"]
+
+
+def test_overlay_preserves_source_order_for_overlapping_lines() -> None:
+    drawn_lines: list[str] = []
+    page = _build_overlay_page(
+        page_width=500.0,
+        page_height=700.0,
+        placements=[
+            ((200.0, 50.0, 300.0, 75.0), "HEADING"),
+            ((20.0, 50.0, 450.0, 95.0), "BODY TEXT"),
+        ],
+        font_name="Helvetica",
+        drawn_text_out=drawn_lines,
+    )
+
+    assert drawn_lines == ["HEADING", "BODY TEXT"]
+    assert _canonical_exact_page_text(page.extract_text() or "") == "HEADING BODY TEXT"
 
 
 def test_should_center_overlay_line_only_for_centered_heading_like_text() -> None:

@@ -726,7 +726,10 @@ def _bbox_reading_order_details(
 ) -> tuple[list[int], list[float]]:
     if not boxes:
         return [], []
-    default_order = sorted(range(len(boxes)), key=lambda idx: (boxes[idx][1], boxes[idx][0]))
+    # Preserve OCR source order when boxes share a vertical origin. Nested
+    # heading/body boxes can start at the same Y, and sorting those by X
+    # changes the searchable text even though no column gutter exists.
+    default_order = sorted(range(len(boxes)), key=lambda idx: boxes[idx][1])
     if len(boxes) < 4:
         return default_order, []
 
