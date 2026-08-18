@@ -384,6 +384,88 @@ def test_job_store_marks_active_jobs_interrupted_after_restart(tmp_path: Path) -
     assert metadata["finished_at"]
 
 
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b"not a PDF",
+        b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\n",
+    ),
+)
+def test_job_store_does_not_promote_invalid_result_to_done_during_startup_recovery(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    store.create(
+        _JobState(
+            job_id="BROKEN",
+            status="running",
+            progress=42,
+            message="OCR is running",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+        )
+    )
+
+    (root / "BROKEN" / "result.pdf").write_bytes(payload)
+
+    recovered = _JobStore(root)
+    metadata = recovered.metadata("BROKEN")
+
+    assert metadata is not None
+    assert metadata["status"] == "interrupted"
+    assert metadata.get("result_path") is None
+    assert metadata.get("result_url") is None
+    assert metadata.get("error")
+
+
+def test_job_store_does_not_promote_unsealed_stale_result_to_done_during_startup_recovery(
+    tmp_path: Path,
+) -> None:
+    from io import BytesIO
+
+    from pypdf import PdfWriter
+
+    root = tmp_path / "jobs"
+    store = _JobStore(root)
+    store.create(
+        _JobState(
+            job_id="STALE",
+            status="running",
+            progress=42,
+            message="OCR is running",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+        )
+    )
+
+    buffer = BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(buffer)
+    (root / "STALE" / "result.pdf").write_bytes(buffer.getvalue())
+
+    # A valid PDF without a completion seal/manifest for this run is stale.
+    recovered = _JobStore(root)
+    metadata = recovered.metadata("STALE")
+
+    assert metadata is not None
+    assert metadata["status"] == "interrupted"
+    assert metadata.get("result_path") is None
+    assert metadata.get("result_url") is None
+    assert metadata.get("error")
+
 def test_job_store_recovers_corrupt_primary_metadata_from_sqlite(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1603,6 +1685,222 @@ def test_http_job_idempotency_rejects_conflicting_request(tmp_path: Path, monkey
         assert second_response.status == HTTPStatus.CONFLICT
         assert "different OCR request" in second_payload["error"]
     finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+def test_http_job_result_rejects_result_symlink_escape_during_startup_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OCR_WORKER_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("UNISCAN_JOB_CLEANUP_INTERVAL_SECONDS", "0")
+
+    work_root = tmp_path / "work"
+    jobs_root = work_root / "jobs"
+    store = _JobStore(jobs_root)
+    store.create(
+        _JobState(
+            job_id="ESCAPE",
+            status="running",
+            progress=42,
+            message="OCR is running",
+            mode="chandra+surya",
+            pages="",
+            lang="rus+eng",
+            strict=True,
+            delete_original_text_layer=True,
+            filename="input.pdf",
+            input_bytes=10,
+        )
+    )
+
+    outside_result = tmp_path / "outside-result.pdf"
+    outside_payload = b"%PDF outside-secret"
+    outside_result.write_bytes(outside_payload)
+
+    result_link = jobs_root / "ESCAPE" / "result.pdf"
+    try:
+        result_link.symlink_to(outside_result)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    if not result_link.is_symlink():
+        pytest.skip("filesystem did not create a symlink")
+
+    handler = _build_handler(work_root=work_root, default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        conn.request("GET", "/api/jobs/ESCAPE/result")
+        response = conn.getresponse()
+        body = response.read()
+        conn.close()
+
+        assert response.status == HTTPStatus.CONFLICT
+        assert outside_payload not in body
+
+        metadata_conn = http.client.HTTPConnection(
+            "127.0.0.1",
+            server.server_address[1],
+        )
+        metadata_conn.request("GET", "/api/jobs/ESCAPE")
+        metadata_response = metadata_conn.getresponse()
+        metadata = json.loads(metadata_response.read().decode("utf-8"))
+        metadata_conn.close()
+
+        assert metadata_response.status == HTTPStatus.OK
+        assert metadata["status"] == "interrupted"
+        assert metadata.get("result_path") is None
+        assert outside_result.read_bytes() == outside_payload
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_watchdog_does_not_publish_result_from_reclaimed_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OCR_WORKER_TIMEOUT_SECONDS", "60")
+    monkeypatch.setenv("OCR_WORKER_WATCHDOG_INTERVAL_SECONDS", "1")
+    monkeypatch.setenv("UNISCAN_JOB_CLEANUP_INTERVAL_SECONDS", "0")
+
+    build_started = threading.Event()
+    release_build = threading.Event()
+    watchdog_sleeping = threading.Event()
+    release_watchdog = threading.Event()
+    reclaimed = threading.Event()
+    worker_finished = threading.Event()
+    job_id_holder: dict[str, str] = {}
+
+    original_sleep = web_service.time.sleep
+    original_reclaim = web_service._JobStore.reclaim_stale_running_jobs
+    original_cleanup = web_service._cleanup_generated_dir
+
+    def controlled_sleep(seconds: float) -> None:
+        if threading.current_thread().name == "uniscan-ocr-job-watchdog":
+            watchdog_sleeping.set()
+            if not release_watchdog.wait(timeout=5):
+                raise RuntimeError("watchdog release barrier timed out")
+            release_watchdog.clear()
+            return
+        original_sleep(seconds)
+
+    def force_reclaim(
+        self: _JobStore,
+        *,
+        timeout_seconds: int,
+        now: datetime | None = None,
+    ) -> list[str]:
+        job_id = job_id_holder.get("job_id")
+        if job_id and not reclaimed.is_set():
+            result = original_reclaim(
+                self,
+                timeout_seconds=timeout_seconds,
+                now=datetime.now(timezone.utc) + timedelta(days=1),
+            )
+            if job_id in result:
+                reclaimed.set()
+            return result
+        return original_reclaim(
+            self,
+            timeout_seconds=timeout_seconds,
+            now=now,
+        )
+
+    def observe_cleanup(*, root: Path, target: Path, label: str) -> bool:
+        result = original_cleanup(root=root, target=target, label=label)
+        if (
+            job_id_holder.get("job_id")
+            and target.name == "work"
+            and target.parent.name == job_id_holder["job_id"]
+        ):
+            worker_finished.set()
+        return result
+
+    def fake_build_searchable_pdf(**kwargs):
+        build_started.set()
+        if not release_build.wait(timeout=5):
+            raise RuntimeError("build release barrier timed out")
+
+        work_root = Path(kwargs["work_root"])
+        output_pdf = work_root / "stale-worker-result.pdf"
+        output_pdf.parent.mkdir(parents=True, exist_ok=True)
+        output_pdf.write_bytes(b"%PDF stale-worker-result")
+        run_dir = work_root / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(
+            output_pdf_path=output_pdf,
+            run_dir=run_dir,
+            partial_page_failures=0,
+        )
+
+    monkeypatch.setattr(web_service.time, "sleep", controlled_sleep)
+    monkeypatch.setattr(
+        web_service._JobStore,
+        "reclaim_stale_running_jobs",
+        force_reclaim,
+    )
+    monkeypatch.setattr(web_service, "_cleanup_generated_dir", observe_cleanup)
+    monkeypatch.setattr(
+        "uniscan.web.service.build_searchable_pdf",
+        fake_build_searchable_pdf,
+    )
+
+    work_root = tmp_path / "work"
+    handler = _build_handler(work_root=work_root, default_lang="rus+eng")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        assert watchdog_sleeping.wait(timeout=2)
+
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        conn.request(
+            "POST",
+            "/api/jobs?filename=race.pdf",
+            body=b"%PDF race",
+            headers={"Content-Type": "application/pdf"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+        assert response.status == HTTPStatus.ACCEPTED
+        job_id_holder["job_id"] = str(payload["job_id"])
+        assert build_started.wait(timeout=2)
+
+        release_watchdog.set()
+        assert reclaimed.wait(timeout=2)
+
+        # The old build is now allowed to return after watchdog reclamation.
+        release_build.set()
+        assert worker_finished.wait(timeout=5)
+
+        result_path = work_root / "jobs" / job_id_holder["job_id"] / "result.pdf"
+        assert not result_path.exists()
+
+        status_conn = http.client.HTTPConnection(
+            "127.0.0.1",
+            server.server_address[1],
+        )
+        status_conn.request("GET", f"/api/jobs/{job_id_holder['job_id']}")
+        status_response = status_conn.getresponse()
+        status_payload = json.loads(status_response.read().decode("utf-8"))
+        status_conn.close()
+
+        assert status_response.status == HTTPStatus.OK
+        assert status_payload["status"] == "interrupted"
+        assert status_payload.get("result_path") is None
+    finally:
+        release_build.set()
+        release_watchdog.set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
