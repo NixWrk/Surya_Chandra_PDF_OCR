@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -180,6 +181,122 @@ def _write_textless_graphics_fixture(
         artifact_path=artifact_path,
         artifact_text=artifact_text,
         reconciliation_path=reconciliation_path,
+    )
+
+
+def _seal_verified_blank_page_fixture(
+    fixture: SimpleNamespace,
+    *,
+    source_page: int = 1,
+    nonblank_pixels: bool = False,
+) -> None:
+    from PIL import Image
+
+    source_image = Image.new(
+        "RGB",
+        (300, 200),
+        color=(80, 80, 80) if nonblank_pixels else (255, 255, 255),
+    )
+    identity = {
+        "pixel_sha256": hashlib.sha256(source_image.tobytes()).hexdigest(),
+        "width": 300,
+        "height": 200,
+        "name": f"page_{source_page:04d}.png",
+        "source_page": source_page,
+        "verified_blank": not nonblank_pixels,
+    }
+    try:
+        for engine in ("surya", "chandra"):
+            engine_dir = fixture.run_root / engine / engine
+            source_path = (
+                engine_dir
+                / f"page_{source_page:04d}.{engine}-source"
+                / "source.png"
+            )
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_image.save(source_path, format="PNG")
+            payload = source_path.read_bytes()
+            artifact = {
+                "path": str(source_path.resolve()),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "bytes": len(payload),
+            }
+
+            pages_path = engine_dir / "pages.json"
+            pages = json.loads(pages_path.read_text(encoding="utf-8"))
+            row = pages["pages"][source_page - 1]
+            row.update(
+                {
+                    "ocr_outcome": "verified_blank",
+                    "blank_page": True,
+                    "text_chars": 0,
+                    "alnum_line_count": 0,
+                    "alnum_chars": 0,
+                    "page_errors": [],
+                    "source_raster_identity": dict(identity),
+                    "source_raster_artifact": dict(artifact),
+                }
+            )
+            for key in (
+                "textless_graphics",
+                "accepted_by",
+                "explicit_nontext",
+                "chandra_non_text_labels",
+            ):
+                row.pop(key, None)
+            pages_path.write_text(json.dumps(pages), encoding="utf-8")
+
+            geometry_path = engine_dir / f"page_{source_page:04d}.{engine}.json"
+            geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+            image = geometry["images"][0]
+            image.update(
+                {
+                    "ocr_outcome": "verified_blank",
+                    "source_raster_identity": dict(identity),
+                    "source_raster_artifact": dict(artifact),
+                }
+            )
+            image["pages"][0].update(
+                {"ocr_outcome": "verified_blank", "text_lines": []}
+            )
+            for key in (
+                "textless_graphics",
+                "explicit_nontext",
+                "chandra_non_text_labels",
+            ):
+                image.pop(key, None)
+            geometry_path.write_text(json.dumps(geometry), encoding="utf-8")
+    finally:
+        source_image.close()
+
+    reconciliation = json.loads(
+        fixture.reconciliation_path.read_text(encoding="utf-8")
+    )
+    blank_row = reconciliation["pages"][source_page - 1]
+    blank_row.update(
+        {
+            "surya_outcome": "verified_blank",
+            "chandra_outcome": "verified_blank",
+            "surya_alnum_line_count": 0,
+            "surya_alnum_chars": 0,
+            "surya_page_error_count": 0,
+            "chandra_page_error_count": 0,
+            "accepted": True,
+            "reason": "both_verified_blank",
+        }
+    )
+    remaining_graphics = [
+        page
+        for page in reconciliation["accepted_textless_graphics_pages"]
+        if page != source_page
+    ]
+    reconciliation["accepted_textless_graphics_pages"] = remaining_graphics
+    reconciliation["reconciled_page_error_counts"] = {
+        "surya": len(remaining_graphics),
+        "chandra": len(remaining_graphics),
+    }
+    fixture.reconciliation_path.write_text(
+        json.dumps(reconciliation), encoding="utf-8"
     )
 
 
@@ -432,6 +549,85 @@ def test_artifact_package_accepts_verified_image_only_pdf_without_placeholder_te
             matrix=matrix,
             alpha=False,
         ).samples
+
+
+def test_artifact_package_accepts_verified_blank_and_graphics_pages(
+    tmp_path: Path,
+) -> None:
+    fixture = _write_textless_graphics_fixture(
+        tmp_path,
+        page_values=[255, 50],
+    )
+    _seal_verified_blank_page_fixture(fixture)
+
+    evidence = _validated_textless_graphics_pages(
+        reconciliation_root=fixture.run_root,
+        compare_dir=fixture.compare_dir,
+        artifact_path=fixture.artifact_path,
+        artifact_text=fixture.artifact_text,
+        document="document",
+        source_pdf=fixture.source_pdf,
+    )
+    assert evidence == frozenset({1, 2})
+
+    results = run_artifact_searchable_package(
+        compare_dir=fixture.compare_dir,
+        pdf_root=fixture.source_root,
+        output_dir=tmp_path / "output",
+        engines=("chandra",),
+        require_page_markers=True,
+        reconciliation_root=fixture.run_root,
+    )
+    assert results[0].status == "ok", results[0].error
+    assert results[0].page_count == 2
+
+
+def test_artifact_package_accepts_all_verified_blank_pages_without_graphics_claim(
+    tmp_path: Path,
+) -> None:
+    fixture = _write_textless_graphics_fixture(tmp_path, page_values=[255])
+    _seal_verified_blank_page_fixture(fixture)
+
+    evidence = _validated_textless_graphics_pages(
+        reconciliation_root=fixture.run_root,
+        compare_dir=fixture.compare_dir,
+        artifact_path=fixture.artifact_path,
+        artifact_text=fixture.artifact_text,
+        document="document",
+        source_pdf=fixture.source_pdf,
+    )
+    assert evidence == frozenset({1})
+
+
+def test_artifact_blank_page_rejects_nonblank_pixels_forged_as_blank(
+    tmp_path: Path,
+) -> None:
+    fixture = _write_textless_graphics_fixture(tmp_path, page_values=[255, 50])
+    _seal_verified_blank_page_fixture(fixture, nonblank_pixels=True)
+
+    for engine in ("surya", "chandra"):
+        engine_dir = fixture.run_root / engine / engine
+        pages_path = engine_dir / "pages.json"
+        geometry_path = engine_dir / "page_0001.{}.json".format(engine)
+        pages = json.loads(pages_path.read_text(encoding="utf-8"))
+        geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+        pages["pages"][0]["source_raster_identity"]["verified_blank"] = True
+        geometry["images"][0]["source_raster_identity"]["verified_blank"] = True
+        pages_path.write_text(json.dumps(pages), encoding="utf-8")
+        geometry_path.write_text(json.dumps(geometry), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=r"Verified textless-graphics evidence is invalid: .*source raster",
+    ):
+        _validated_textless_graphics_pages(
+            reconciliation_root=fixture.run_root,
+            compare_dir=fixture.compare_dir,
+            artifact_path=fixture.artifact_path,
+            artifact_text=fixture.artifact_text,
+            document="document",
+            source_pdf=fixture.source_pdf,
+        )
 
 
 def test_artifact_package_accepts_exhausted_chandra_zero_with_sparse_surya(
