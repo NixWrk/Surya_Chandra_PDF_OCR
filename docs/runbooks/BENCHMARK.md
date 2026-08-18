@@ -18,7 +18,7 @@ raster scan, so it cannot establish real scanned-document accuracy.
 
 ## Accepted real baseline
 
-A real corpus must have explicit provenance, privacy/license status, immutable
+A real corpus must have explicit provenance, privacy/source-use status, immutable
 source hashes, page ranges, Ground Truth version, language/layout groups, and
 historical failure fixtures. Do not commit private source documents.
 

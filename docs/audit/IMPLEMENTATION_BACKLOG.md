@@ -149,7 +149,7 @@ Verification: targeted concurrency test repeated, then full suite.
 
 ### 6. Create a versioned benchmark manifest
 
-Record fixture hashes, page ranges, Ground Truth versions, privacy/license status,
+Record fixture hashes, page ranges, Ground Truth versions, privacy/source-use status,
 expected structural outcomes and benchmark groups.
 
 ### 7. Add benchmark metrics

@@ -309,7 +309,6 @@ def generate_corpus(output: Path) -> dict[str, Any]:
         "schema": SCHEMA,
         "corpus_id": "uniscan-synthetic-offline",
         "revision": "1.0.0",
-        "license": "CC0-1.0",
         "provenance": {"source_kind": "procedural-original", "contains_private_data": False, "external_assets": [], "generated_pdf_policy": "caller-output-only"},
         "generator": {"name": "generate.py", "version": GENERATOR_VERSION, "seed": SEED, "python": platform.python_version(), "pymupdf": str(getattr(fitz, "VersionBind", "unknown"))},
         "metrics": {"model_status": "not_run", "text": {"cer": "levenshtein-codepoint-v1", "wer": "whitespace-token-v1"}, "searchability": {"exact_text": "nfkc-collapse-whitespace-v1", "page_bijection": "exact-page-set-v1"}, "geometry": {"bbox_iou": "axis-aligned-iou-v1", "reading_order": "exact-order-v1"}, "unavailable_without_models": ["engine CER/WER", "VRAM", "cold/warm model latency", "model cache-hit latency"]},

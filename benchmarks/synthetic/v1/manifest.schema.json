@@ -8,7 +8,6 @@
     "schema": {"const": "uniscan.synthetic-benchmark.v1"},
     "corpus_id": {"type": "string", "minLength": 1},
     "revision": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
-    "license": {"type": "string"},
     "provenance": {
       "type": "object",
       "required": ["source_kind", "contains_private_data", "external_assets"],
