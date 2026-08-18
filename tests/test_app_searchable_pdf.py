@@ -2115,6 +2115,48 @@ def test_merge_candidate_validator_runs_before_publish() -> None:
     assert not output_pdf.exists()
 
 
+
+
+def test_merge_reproduces_page_three_exact_text_retention_failure() -> None:
+    import fitz
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    chunk_pdf = tmp_path / "chunk.pdf"
+    output_pdf = tmp_path / "merged.pdf"
+    source = fitz.open()
+    chunk = fitz.open()
+    try:
+        for page_number in range(1, 4):
+            source.new_page(width=200, height=200)
+            page = chunk.new_page(width=200, height=200)
+            text = "WRONG PAGE THREE" if page_number == 3 else f"EXPECTED PAGE {page_number}"
+            page.insert_text((20, 20), text, fontsize=6, render_mode=3)
+        source.save(str(source_pdf), garbage=4, deflate=True)
+        chunk.save(str(chunk_pdf), garbage=4, deflate=True)
+    finally:
+        source.close()
+        chunk.close()
+
+    expected_page_texts = ("EXPECTED PAGE 1", "EXPECTED PAGE 2", "EXPECTED PAGE THREE")
+    pdf_chunk = ocr_pipeline._PdfChunk(1, 1, 3, chunk_pdf)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Output PDF page 3 failed exact searchable text retention",
+    ):
+        ocr_pipeline._merge_pdf_chunks(
+            source_pdf=source_pdf,
+            chunks=[(pdf_chunk, chunk_pdf)],
+            output_pdf=output_pdf,
+            validate_candidate=lambda candidate: ocr_pipeline._validate_merged_candidate(
+                candidate_pdf=candidate,
+                expected_page_texts=expected_page_texts,
+                textless_visual_seals={},
+            ),
+        )
+
+    assert not output_pdf.exists()
 def test_private_chunk_snapshot_rejects_record_fingerprint_mismatch() -> None:
     tmp_path = _new_test_dir()
     source_pdf = tmp_path / "source.pdf"
