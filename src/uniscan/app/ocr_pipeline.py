@@ -1144,6 +1144,7 @@ def _strict_chandra_attempt_history(
                 label=f"Chandra attempt {expected_attempt}",
                 reading_order=False,
                 require_text=bool(texts),
+                allow_punctuation_only_lines=True,
             )
         )
 
@@ -1818,6 +1819,7 @@ def _sealed_page_geometry(
     label: str,
     reading_order: bool,
     require_text: bool,
+    allow_punctuation_only_lines: bool = False,
 ) -> _SealedPageGeometry:
     image_name = image.get("image_name")
     if not isinstance(image_name, str) or not image_name or Path(image_name).name != image_name:
@@ -1837,7 +1839,11 @@ def _sealed_page_geometry(
             raise RuntimeError(f"{label} has a non-object text line")
         text = raw_line.get("text")
         cleaned_text = _clean_overlay_line(text) if isinstance(text, str) else ""
-        if not isinstance(text, str) or not _canonical_retry_text(cleaned_text):
+        if (
+            not isinstance(text, str)
+            or not cleaned_text
+            or (not allow_punctuation_only_lines and not _canonical_retry_text(cleaned_text))
+        ):
             raise RuntimeError(f"{label} has invalid line text")
         bbox = _strict_geometry_bbox(raw_line.get("bbox"), label=f"{label} text line")
         if (
@@ -1938,6 +1944,7 @@ def _strict_durable_text_evidence(
         label=f"{engine} page {source_page}",
         reading_order=engine == "chandra",
         require_text=True,
+        allow_punctuation_only_lines=engine == "chandra",
     )
     expected_artifact_text = _deterministic_geometry_page_text(
         geometry,
@@ -1964,7 +1971,12 @@ def _strict_durable_text_evidence(
         if not isinstance(raw_line, dict):
             raise RuntimeError(f"{engine} page {source_page} has a non-object text line")
         text = raw_line.get("text")
-        if not isinstance(text, str) or not _canonical_retry_text(text):
+        cleaned_text = _clean_overlay_line(text) if isinstance(text, str) else ""
+        if (
+            not isinstance(text, str)
+            or not cleaned_text
+            or (engine != "chandra" and not _canonical_retry_text(cleaned_text))
+        ):
             raise RuntimeError(f"{engine} page {source_page} has invalid line text")
         bbox = _strict_geometry_bbox(
             raw_line.get("bbox"),
