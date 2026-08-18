@@ -1,0 +1,211 @@
+# Repository Audit Report
+
+Audit code baseline: `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
+
+## Executive conclusion
+
+The repository has unusually strong defensive coverage around OCR evidence,
+retry lineage, chunk reuse and PDF validation. The complete suite is green:
+617 passed, 7 skipped, 5 warnings; Ruff and mypy are clean; branch coverage is
+74%. The inspected container has exact SHA-256 content parity for all 23 tracked
+Python source files (`MismatchCount=0`).
+
+The immediate risk is not a source/container mismatch or a generally broken test
+suite. It is three untested durable-job integrity boundaries, followed by missing
+reproducible OCR quality/performance and deployment baselines.
+
+Required immediate order:
+
+1. reproduce corrupt/tampered recovery-result behavior;
+2. reproduce result symlink escape;
+3. reproduce stale-worker publication after watchdog reclamation;
+4. implement the smallest fixes proven by those tests.
+
+No large refactor or engine/model upgrade is justified before these tests and an
+accuracy/performance baseline exist.
+
+## Evidence summary
+
+| Evidence | Result |
+|---|---|
+| Tracked baseline | 60 files, 41,459 physical lines |
+| Production source | 23 files, 20,708 lines |
+| Tests | 12 files, 16,377 lines |
+| Operations | 10 files, 2,374 lines |
+| Full pytest | 617 passed, 7 skipped, 5 warnings, 248.78 s; 250.966 s wall |
+| Coverage pytest | Same suite, 261.91 s, 74% total branch coverage |
+| Ruff | Clean |
+| mypy | Clean across 24 files |
+| Container source parity | 23/23 SHA-256 matches; zero mismatches |
+
+Evidence commands and limitations are recorded in `BASELINE.md`.
+
+## Immediate findings
+
+### P1 — Recovery trusts an existing result without an integrity seal
+
+Status: confirmed code behavior; corrupt/tampered-file outcome needs a reproducer.
+
+Evidence:
+
+- recovery is implemented at `src/uniscan/web/service.py:374-445`;
+- `result_candidate` is accepted based on `is_file()` and resolved at `409-412`;
+- size is read and an active job is promoted to `done` at `413-420`;
+- the result endpoint serves a `done` job when the path exists at `2008-2019`.
+
+No restart-time PDF parse, stored SHA-256 comparison, expected page-count check or
+publication-completion seal is required. The full suite does not currently prove
+behavior for a corrupt, truncated or replaced `result.pdf`.
+
+Required next action: add a focused recovery test with a tampered/corrupt result,
+then make the smallest recovery-validation change needed for the test.
+
+### P1 — Recovery follows a result symlink outside the job root
+
+Status: confirmed path behavior; external-file serving must be demonstrated by a
+safe temporary-directory test.
+
+Evidence:
+
+- `input_candidate.is_file()` and `result_candidate.is_file()` follow links;
+- both are assigned using `.resolve()` at `src/uniscan/web/service.py:411-412`;
+- no post-resolution containment or non-link check is present there;
+- the resolved result is served at `src/uniscan/web/service.py:2008-2019`.
+
+The existing persisted-external-path coverage is not equivalent to a local
+`jobs/<id>/result.pdf` symlink or Windows reparse-point test.
+
+Required next action: add a root-containment/symlink recovery test before changing
+path handling.
+
+### P1 — A watchdog-reclaimed worker can reach publication code
+
+Status: confirmed control-flow possibility; interleaving and resulting state need
+a deterministic concurrency test.
+
+Evidence:
+
+- stale running jobs are reclaimed at `src/uniscan/web/service.py:215-258`;
+- the watchdog invokes reclamation at `1707-1720`;
+- the worker's successful result copy/publication and done update occur at
+  `1577-1611`;
+- the old worker is not terminated when the state is changed to `interrupted`.
+
+Terminal-transition protection can reject a late state update, but it does not by
+itself prove that the stale worker cannot copy a result or clean artifacts.
+
+Required next action: create a barrier-controlled test that reclaims a running
+attempt, lets it resume and asserts that it cannot publish.
+
+## Other confirmed findings
+
+### P1 — Runtime reproducibility is split
+
+`pyproject.toml`, `Dockerfile`, `setup_dual_venv.cmd` and
+`scripts/benchmark_ocr_matrix.ps1` contain overlapping but different dependency
+truth. There is no tracked lock/checksum set. Model revision/digest is not part of
+the run identity.
+
+### P1 — Deployment is machine-specific
+
+One GPU UUID is tracked across `.env.example`, Compose, Windows setup/launcher,
+the GPU contract script and `src/uniscan/ocr/benchmark.py:82`. Compose also assumes
+a pre-created external network. Evaluation scripts default to `.venv` although
+setup creates `.venv_surya` and `.venv_chandra`.
+
+### P1/P2 — HTTP trust is external
+
+The HTTP service has no built-in authentication/authorization/rate limiting and
+the container binds to `0.0.0.0`. Absolute host paths are included in serialized
+job data (`src/uniscan/web/service.py:576-635`). Severity depends on the intended
+network trust boundary, which is not yet explicit.
+
+### P2 — Chunk identity is incomplete across runtime upgrades
+
+`_hybrid_run_identity` at `src/uniscan/app/ocr_pipeline.py:3716-3744` includes
+source/configuration and a manual pipeline revision but omits package, executable,
+model and CUDA-runtime digests. Reuse across an environment change is therefore
+not fully attributable.
+
+### P2 — Compare-text discovery may mix runs
+
+When no summary is supplied, `build_compare_txt_from_benchmark` at
+`src/uniscan/ocr/artifact_searchable.py:3812` discovers reports by modification
+time independently per engine. A common run identity is not enforced.
+
+### P2 — Running jobs are not cancellable
+
+`src/uniscan/web/service.py:259-283` explicitly rejects running cancellation.
+The protocol documents the limitation. The GUI likewise has no running stop.
+
+### P2 — Accuracy/performance baseline is absent
+
+There is no tracked representative corpus, Ground Truth, CER/WER or accepted
+layout/runtime/VRAM baseline. The two production incidents are evidence, but
+neither is a complete benchmark.
+
+### P2 — Documentation and packaging drift
+
+- `docs/REPO_INVENTORY_KEEP_REMOVE.md:14,100` claims three GUI modes; current
+  production exposes only hybrid mode.
+- It references absent `scripts/install_local_ocrmypdf_plugins.ps1` at line 90.
+- `pyproject.toml:11` declares MIT text, but no `LICENSE` is tracked.
+- No CI workflow, `AGENTS.md`, repo-local skill or MCP exists.
+
+## OCR incident evidence
+
+`docs/audit/OBSERVED_OCR_FAILURES.md` records two distinct failures:
+
+1. punctuation-only Chandra geometry rejected during strict page reconciliation;
+2. exact searchable-text retention failure during PDF validation.
+
+They differ by source document, chunk, stage and signature. Their ignored local
+artifacts must be preserved until privacy-safe minimal fixtures reproduce each
+failure independently.
+
+## Confirmed facts versus hypotheses
+
+Confirmed:
+
+- exact recovery/path/publication control flow cited above;
+- complete green suite and static checks;
+- container source parity;
+- absence of tracked corpus/locks/CI/agent tooling;
+- dependency and deployment configuration split;
+- the two observed production failure signatures.
+
+Hypotheses requiring reproducing tests:
+
+- exact corrupt/tampered result accepted and served after restart;
+- exact external target reachable through a result symlink/reparse point;
+- exact stale-worker publication/cleanup interleaving;
+- measurable stale-cache reuse after package/model changes;
+- accuracy benefit of any punctuation-only policy change.
+
+## Decision gates
+
+- Do not fix the top three risks until a focused test fails for the expected reason.
+- Do not update Surya/Chandra or tune OCR without Ground Truth and runtime metrics.
+- Do not delete ignored artifacts until fixture derivation and ownership review.
+- Do not split large modules unless a tested boundary enables a small reversible
+  change or removes measured duplicate work.
+- Do not add MCP until the HTTP contract, authentication decision and result
+  integrity are stable.
+
+## Recommended sequence
+
+1. Add the three required reproducing tests in the stated order.
+2. Apply one minimal job-integrity fix per proven failure.
+3. Derive minimal fixtures for both OCR incidents.
+4. Record representative OCR accuracy/performance baseline.
+5. Complete dependency/model/runtime provenance and cache identity.
+6. Remove machine-specific deployment assumptions and validate a new-PC runbook.
+7. Add CI, `AGENTS.md`, runbooks and a repo-local audit/operations skill.
+8. Reassess a thin HTTP-backed MCP only after the service boundary is stable.
+
+## Assumptions
+
+- Strict `chandra+surya` remains the only production OCR mode.
+- Single-GPU serialized execution remains intended.
+- HTTP may currently rely on a trusted network; this must be decided explicitly.
+- User documents and ignored run artifacts are private data and must be preserved.
