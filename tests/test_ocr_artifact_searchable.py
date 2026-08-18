@@ -2541,7 +2541,8 @@ def test_build_compare_txt_from_benchmark(tmp_path: Path) -> None:
     benchmark_root.mkdir()
 
     src_txt = benchmark_root / "fixture_doc_chandra.txt"
-    src_txt.write_text("[SOURCE PAGE 0001]\nHello\n", encoding="utf-8")
+    source_bytes = b"[SOURCE PAGE 0001]\nHello\n"
+    src_txt.write_bytes(source_bytes)
     payload = [
         {
             "engine": "chandra",
@@ -2569,6 +2570,7 @@ def test_build_compare_txt_from_benchmark(tmp_path: Path) -> None:
     assert len(err_rows) == 1
     assert err_rows[0].error == "engine status is 'error': Surya cache/weights preflight failed"
     assert (output_dir / "fixture_doc__chandra.txt").exists()
+    assert (output_dir / "fixture_doc__chandra.txt").read_bytes() == source_bytes
     assert (output_dir / "sources_map.txt").exists()
 
 

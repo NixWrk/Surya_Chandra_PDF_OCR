@@ -3912,10 +3912,10 @@ def build_compare_txt_from_benchmark(
             continue
 
         compare_path = resolved_output / f"{document}__{engine}.txt"
-        compare_path.write_text(
-            source_path.read_text(encoding="utf-8-sig"),
-            encoding="utf-8",
-        )
+        source_bytes = source_path.read_bytes()
+        if source_bytes.startswith(b"\xef\xbb\xbf"):
+            source_bytes = source_bytes[3:]
+        compare_path.write_bytes(source_bytes)
         source_map_lines.append(str(source_path))
         results.append(
             CompareTxtBuildResult(
