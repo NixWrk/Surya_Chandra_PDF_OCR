@@ -164,6 +164,8 @@ def test_model_free_evaluator_is_deterministic_and_exact(tmp_path: Path) -> None
     assert first["evaluator"]["output_metadata"] == "externally_attested_not_verified"
     assert first["fixtures"][0]["metrics"]["cer"]["value"] == 0.0
     assert first["fixtures"][0]["metrics"]["wer"]["value"] == 0.0
+    assert first["summary"]["searchability"]["exact_text_retention"]["status"] == "pass"
+    assert first["summary"]["page_mapping"]["status"] == "pass"
 
 def test_accepted_zero_output_is_a_valid_page_outcome(tmp_path: Path) -> None:
     root = tmp_path / "corpus"
@@ -176,8 +178,6 @@ def test_accepted_zero_output_is_a_valid_page_outcome(tmp_path: Path) -> None:
     assert report["fixtures"][0]["page_outcomes"]["observed"] == {"accepted_zero_output": 1}
     assert report["fixtures"][0]["metrics"]["cer"]["value"] == 0.0
 
-    assert first["summary"]["searchability"]["exact_text_retention"]["status"] == "pass"
-    assert first["summary"]["page_mapping"]["status"] == "pass"
 
 
 def test_evaluator_reports_text_and_page_mapping_failures(tmp_path: Path) -> None:
