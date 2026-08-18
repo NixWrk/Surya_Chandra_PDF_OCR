@@ -23,6 +23,10 @@ and limitations, but no external private source path or extracted document text.
 - Application/engine processes: new container and subprocesses per case. The
   repeated punctuation run reused model caches but did not reuse a live process.
 
+The full exact-retention runs loaded OCR source commit
+`14e81878f02331e3a05c8dc5a1841e8856ae765e`. Later HTTP-only admission commits
+`d0085fb` and `51ca830` did not affect that loaded OCR pipeline.
+
 The first attempted run stopped before engine execution because the benchmark
 helper tried to create `/app/.tmp_runtime` under the read-only source mount. Both
 accepted runs used a dedicated ignored writable mount at that path. This exposes
@@ -45,8 +49,46 @@ a runtime-temp/repository coupling risk; it did not alter OCR policy.
 - Result SHA-256: `f0dc9b55d0d777c26cc5268a2d7d495ab7f388c61901b279cc68fa85dea2d7a8`.
 
 The selected-page run did not reproduce the historical exact-retention error.
-This does not close the incident: its failure occurred while assembling the full
-11–20 chunk, so that context remains required for the exact regression run.
+It did not by itself close the incident because the historical failure occurred
+while assembling the full pages 11–20 chunk. The full-context result follows.
+
+### Full 21-page chunked regression
+
+The same logical source was processed end-to-end in three chunks: pages 1–10,
+pages 11–20, and page 21. The final manifest reported `done`, output page count
+`21`, and `0` partial-page failures. Every chunk passed strict page
+reconciliation:
+
+- Chunk 1: Surya `49.880837014` seconds; Chandra `535.800193873` seconds;
+  searchable-PDF assembly `5.696970019` seconds.
+- Chunk 2 (source pages 11–20): input SHA-256
+  `c7859d320bfcd9bf50a2927306e5759327279686822c4154d5c95276add3f66e`;
+  Surya `45.244601126` seconds; Chandra `588.082708783` seconds;
+  searchable-PDF assembly `5.218301469` seconds. The historical
+  `Output PDF page 3 failed exact searchable text retention` error did not recur.
+- Chunk 3 (source page 21): Surya `13.447052580` seconds; Chandra
+  `58.989545369` seconds; searchable-PDF assembly `0.966234060` seconds. Its
+  blank/textless warning was expected.
+
+The cold final PDF was `14,386,082` bytes and `21` pages, with SHA-256
+`1fb841d00428dbcd33ecff3158f768e49ebdf68a094751d47d58ae6d32da57f1`.
+End-to-end elapsed time was approximately `1,881` seconds; recorded engine and
+assembly stages sum to `1,303.326444293` seconds. This is a successful
+full-context regression and timing observation, not proof of the original root
+cause: the failed candidate was not preserved.
+
+### Full-context chunk-cache hit
+
+A repeat with the same durable work/cache identity reused all three chunks. Its
+manifest reported `done`, output page count `21`, and `0` partial-page failures.
+End-to-end wall time was `328.924` seconds, about `5.72x` faster than the cold
+run, but still shows approximately five and a half minutes of non-engine work.
+
+The cache-hit PDF was `14,386,082` bytes, with SHA-256
+`1e6d7d860e9f40e15f9cc7dddab4f3b42501220c63814e26c0132efc11cafefd`.
+Extracted text on every page, all 21 page renders at 72 DPI, and PDF metadata
+were exactly equal to the cold result; serialized PDF bytes differed. This
+measures durable chunk reuse, not in-process engine warm latency.
 
 ## Case 2 — punctuation-only Chandra geometry page
 
@@ -95,9 +137,10 @@ warm path.
   no memory value.
 - In-process warm-run median/tail latency: not measured; the repeat used a new
   container and new engine processes.
-- Chunk reuse and rerun counts: selected-page direct runs do not exercise the
-  durable ten-page chunk cache.
-- Exact-retention full-context result: pages 11–20 not rerun in this checkpoint.
+- General chunk-reuse latency distribution and invalidation reasons: only one
+  three-chunk cache-hit repeat was measured.
+- Exact-retention root cause: the full 21-page run passed and the historical
+  failure did not recur; its original failed candidate is unavailable.
 
 No accuracy, model, preprocessing, prompt, retry, or performance change may use
 this checkpoint as a CER/WER improvement claim. It is suitable for detecting
@@ -113,7 +156,17 @@ venv; it did not fail. Existing image dependencies and local model caches were
 reused for the accepted runs instead.
 
 Docker image cleanup removed 15 obsolete unreferenced OCR tags plus two dangling
-images. Reported image usage fell from `329.5 GB` to `244.5 GB` (about `85 GB`).
-Current, immediate rollback, and every container-referenced image were preserved.
-Volumes and model caches were not removed. Build cache was retained to avoid
-future dependency downloads.
+images in the first conservative pass. The second pass removed 11 independently
+verified exited/status-0 bind-only containers and three obsolete image tags:
+`surya-chandra-ocr:037c339efc50`, `surya-chandra-ocr:08d2cceb2daa`, and
+`surya-chandra-ocr:f7a6c218f49a`. Reported image usage fell from `329.5 GB` to
+`211.6 GB`, releasing about `117.9 GB`.
+
+The final `docker system df` snapshot reported Images `25`, active `12`,
+`211.6 GB`, reclaimable `129 GB`; Containers `22`, active `4`, `65.65 MB`;
+Volumes `46`, active `7`, `44.57 GB`; and Build Cache `174`, `34.43 GB`,
+reclaimable `20.69 GB`. The current image digest `sha256:f470cf1520e4...`,
+immediate rollback tag `surya-chandra-ocr:00d0499`, all Exited137 incident
+candidates, volumes, model caches, and build cache were preserved to avoid
+future downloads. No source PDFs, OCR outputs, or user-generated artifacts were
+deleted.
