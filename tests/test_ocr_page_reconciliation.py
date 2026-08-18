@@ -1182,6 +1182,37 @@ def test_reconcile_rejects_tampered_chandra_v8_attempt_lineage(
     assert reconciliation["pages"][0]["reason"] == "invalid_chandra_attempt_evidence"
 
 
+def test_reconcile_accepts_nonempty_punctuation_only_chandra_geometry_line(
+    tmp_path: Path,
+) -> None:
+    text = "ALARM\n\u2014"
+    run_dir, results, result_files = _build_reconciliation_run(
+        tmp_path,
+        surya_rows=[
+            {
+                "source_page": 1,
+                "text": "ALARM",
+                "ocr_outcome": "text",
+                "alnum_line_count": 1,
+                "alnum_chars": 5,
+            }
+        ],
+        chandra_rows=[{"source_page": 1, "text": text, "ocr_outcome": "text"}],
+    )
+
+    adjusted, error = ocr_pipeline._reconcile_mode_both_pages(
+        run_dir=run_dir,
+        results=results,
+        result_files=result_files,
+    )
+
+    assert error is None
+    assert all(result.status == "ok" for result in adjusted)
+    reconciliation = json.loads((run_dir / "page_reconciliation.json").read_text("utf-8"))
+    assert reconciliation["pages"][0]["accepted"] is True
+    assert reconciliation["pages"][0]["reason"] != "invalid_chandra_attempt_evidence"
+
+
 def test_reconcile_rejects_chandra_text_with_surya_zero(tmp_path: Path) -> None:
     run_dir, results, result_files = _build_reconciliation_run(
         tmp_path,
