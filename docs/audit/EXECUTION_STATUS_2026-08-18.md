@@ -18,6 +18,9 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 - A private real-engine incident/timing baseline now covers one page from each
   observed failure class. Both pass strict reconciliation; CER/WER and full
   exact-retention chunk context remain unmeasured.
+- A repeat of the punctuation case with warm model caches produced a
+  byte-identical PDF. It used fresh processes, so it is not an in-process warm
+  latency measurement.
 - GPU selection is host-configured, Compose starts standalone by default, and a
   read-only new-PC preflight plus deployment/incident/benchmark runbooks exist.
 - CI, `AGENTS.md`, and the repo-local operator skill are present. The HTTP trust

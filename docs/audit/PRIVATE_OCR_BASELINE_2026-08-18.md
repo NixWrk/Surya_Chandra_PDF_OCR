@@ -20,7 +20,8 @@ and limitations, but no external private source path or extracted document text.
 - Engines: `surya-ocr==0.17.1`, `chandra-ocr==0.2.0`.
 - Mode: `chandra+surya`; language: `rus+eng`; strict: enabled.
 - Model caches: warm and pre-existing; network/model downloads: none.
-- Application/engine processes: new container and subprocesses per case.
+- Application/engine processes: new container and subprocesses per case. The
+  repeated punctuation run reused model caches but did not reuse a live process.
 
 The first attempted run stopped before engine execution because the benchmark
 helper tried to create `/app/.tmp_runtime` under the read-only source mount. Both
@@ -66,13 +67,34 @@ This case confirms that the fixed punctuation-only page completes through strict
 reconciliation on a real engine run. Visual/table fidelity still requires human
 review or approved Ground Truth.
 
+### Process-warm-cache repeat
+
+The same source page was repeated in a new container with the same pre-existing
+model caches and identical runtime identity:
+
+- Chandra: `ok`, `118.282162525` seconds, `1,701` report-level text
+  characters, `1,854.547` MB memory delta, one attempt.
+- Surya: `ok`, `17.920884581` seconds, `2,144` reported text characters,
+  memory delta unavailable, one attempt.
+- Searchable-PDF assembly: `ok`, `2.585374948` seconds.
+- Strict page reconciliation: `ok`.
+- Result bytes/pages: `13,014,129` / `10`.
+- Result SHA-256: `02109585c63a207e78fa144e6421ee3bc4b803048f3b6a7ae3fe3538539b63d2`.
+
+The result is byte-for-byte identical to the first run. Stage timing differences
+were Chandra `+5.1%`, Surya `-1.1%`, and assembly `+15.9%`; one repeat is not
+enough for a latency distribution. Because each run started fresh processes,
+this measures process-cold execution with warm model caches, not an in-process
+warm path.
+
 ## Metrics not measured
 
 - CER and WER: no reviewed Ground Truth.
 - Peak VRAM: not captured; GPU identity and successful CUDA allocation only.
 - Peak RAM: not captured; Chandra reports process memory delta and Surya reports
   no memory value.
-- Warm-run median/tail latency: only one new-process run per case.
+- In-process warm-run median/tail latency: not measured; the repeat used a new
+  container and new engine processes.
 - Chunk reuse and rerun counts: selected-page direct runs do not exercise the
   durable ten-page chunk cache.
 - Exact-retention full-context result: pages 11–20 not rerun in this checkpoint.
