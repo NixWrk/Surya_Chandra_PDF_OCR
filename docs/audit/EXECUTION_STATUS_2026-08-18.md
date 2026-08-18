@@ -20,8 +20,13 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 - The repository has a deterministic model-free benchmark corpus and evaluator,
   plus an offline real-engine synthetic checkpoint with valid English, Russian,
   mixed-layout, blank/graphics, and three-page retention Ground Truth.
-  No OCR accuracy or performance tuning has been accepted without a real engine
-  baseline.
+  A second immutable checkpoint exercises the remaining degraded, rotated,
+  native-text, and 23-page fixtures. Across both checkpoints, all nine corpus
+  fixtures have been exercised at least once. No OCR accuracy or performance
+  tuning has been accepted without real-engine evidence.
+- The 23-page checkpoint passed text, retention, and page mapping, but exposed
+  about 549 seconds of uninstrumented/non-engine wall time. This is a profiling
+  target, not yet a diagnosed cause or accepted optimization.
 - The synthetic run exposed a second OCR publication failure on `blank-graphics`.
   It was reproduced test-first and fixed by requiring sealed, recomputed blank
   raster evidence. The preserved run now rebuilds artifact-only as a valid
@@ -45,7 +50,8 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 
 ## Current verification
 
-On local `main`, through `c89b593`:
+The latest complete software suite was run on local `main` through production
+commit `c89b593`:
 
 ```text
 python -m pytest -q
@@ -63,6 +69,13 @@ successfully. This is not a clean dependency build. Windows preflight still
 reports that the existing Surya venv lacks the local `uniscan` install; it was
 not mutated.
 
+The extended real-engine checkpoint ran from clean source commit `3acda85` with
+image `sha256:f470cf1520e43ae67b70bf63e5dded12235ebde07e5139c68307cb867b06bdc0`,
+`--pull never`, `--network none`, offline settings, and read-only model caches.
+All four added fixtures completed; their source hashes match the corpus manifest,
+CER/WER were zero, exact retention passed, and page mapping passed. Peak RAM/VRAM
+and repeat-run latency were not measured.
+
 ## Open high-value work
 
 Current order after the synthetic baseline and blank-page fix:
@@ -75,8 +88,9 @@ no global document registry or historical model-tree hashing.
 1. Validate clean dependency resolutions separately for Docker/Windows and
    `cu126`/`cu128`; the offline source-layer build is only partial evidence.
 2. Extend the real-engine baseline with median/tail timing, peak RAM/VRAM,
-   rotated/noisy/skewed fixtures, and controlled `mixed-layout` experiments. Its
-   current CER/WER are `0.287293`/`0.366667`.
+   representative raster scans, and controlled `mixed-layout` experiments. The
+   procedural degraded/rotated/native-text/long fixtures now pass; the current
+   `mixed-layout` CER/WER remain `0.287293`/`0.366667`.
 3. Capture a preserved rejected candidate if the historical private
    exact-retention failure recurs; do not infer its root cause from a final PDF.
 4. Measure and define queue and page-count limits.
@@ -85,6 +99,9 @@ no global document registry or historical model-tree hashing.
    remains 30 days success/90 days failure unless overridden.
 6. Remove normal-response absolute paths only with a versioned compatibility
    decision; the service remains trusted-network-only.
+7. Profile the 23-page wall-time gap before changing rendering, evidence,
+   validation, or merge behavior; preserve the current quality and integrity
+   gates.
 
 The earlier checkpoint list is retained below as historical audit context:
 

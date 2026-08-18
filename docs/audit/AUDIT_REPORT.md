@@ -2,7 +2,85 @@
 
 Audit code baseline: `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 
-## Executive conclusion
+Status: the audit, inventory, evidence-first integrity work, and first measurable
+OCR baseline are complete. The broader improvement roadmap remains open where it
+requires clean dependency resolution, another PC, repeated profiling, reviewed
+real-document Ground Truth, or a compatible running-job stop boundary.
+
+## Current disposition
+
+The three highest-risk durable-job boundaries found by the initial audit were
+reproduced before repair and are now protected by tests:
+
+1. recovered results require an integrity seal and valid PDF/page evidence;
+2. symlink, reparse, hardlink, and external-path escapes are rejected;
+3. a stale watchdog-reclaimed attempt cannot publish over a newer attempt.
+
+Additional accepted fixes cover malformed/encrypted upload admission, bounded
+HTTP runtime shutdown, punctuation-only Chandra geometry, immutable per-run
+hybrid configuration, and sealed verified-blank artifact publication. The latest
+complete local software suite through production commit `c89b593` reports:
+
+```text
+678 passed, 9 skipped, 5 warnings in 259.49s
+```
+
+Ruff, mypy, and `git diff --check` are clean for the accepted changes. Detailed
+test-signal classification is in `TEST_SIGNAL_CLASSIFICATION.md`.
+
+The repository now has a versioned synthetic corpus and evaluator. Two immutable
+offline checkpoints exercise all nine fixtures at least once with the real
+Surya/Chandra image. The added degraded, rotated, native-text, and 23-page cases
+all passed CER/WER, exact-retention, and page-mapping checks. `mixed-layout`
+remains the measured accuracy target at CER `0.287293` and WER `0.366667`; no OCR
+policy or engine version change has been accepted.
+
+The 23-page run completed correctly but took 922.991 seconds, about 548.733
+seconds more than the recorded engine, PDF-build, and validation stages. That is
+a confirmed profiling target, not yet a proven cause. Median/tail latency and
+peak RAM/VRAM remain unmeasured.
+
+Deployment is materially less machine-specific: tracked GPU UUIDs were removed,
+the permitted GPU is configured locally, Compose has a standalone default,
+preflight/smoke/runbooks exist, and an offline no-cache source-layer Docker build
+passed without downloads. Per user decision, that build is accepted as partial
+new-PC evidence. It does not prove clean dependency/model provisioning or the
+currently incomplete Windows Surya venv.
+
+CI, `AGENTS.md`, architecture/runbook documentation, and the repository-local
+operator skill are present. A thin MCP was assessed and intentionally deferred:
+the HTTP API plus existing operator surfaces are sufficient until a concrete
+consumer requires MCP. License text was removed by user decision; no license is
+claimed.
+
+No global registry or permanent history of processed documents is part of the
+design. Run identity, source/chunk hashes, and configuration exist only inside an
+active/resumable or explicitly retained run. Successful HTTP working data is
+removed by default. Those hashes prevent unsafe resume after interruption; they
+are not a document catalog.
+
+Local Docker cleanup reclaimed approximately 117.9 GB earlier in the audit.
+Current/rollback/incident images, model caches, user PDFs, jobs, and retained
+benchmark evidence were preserved. Additional build-cache/image deletion is not
+recommended merely because Docker labels bytes reclaimable; the remaining large
+objects avoid downloads and preserve rollback/incident evidence.
+
+## Highest-value remaining work
+
+1. Profile the 23-page wall-time gap, then optimize only a measured duplicate
+   render/validation/open/merge cost without weakening integrity gates.
+2. Repeat representative runs for median/tail latency and peak RAM/VRAM; add
+   reviewed raster-scan and dense mixed-layout Ground Truth.
+3. Run controlled `mixed-layout` experiments before accepting any OCR-policy
+   change.
+4. Prove clean Docker/Windows dependency resolution when downloads or a clean
+   machine are available; retain the current offline build as partial evidence.
+5. Measure queue/page limits, design cooperative running cancellation, and add
+   bounded quotas only for explicit persistent benchmark/resume caches.
+6. Capture the rejected candidate if the historical private exact-retention
+   incident recurs; its root cause cannot be reconstructed from the final PDF.
+
+## Initial audit snapshot (historical)
 
 The repository has unusually strong defensive coverage around OCR evidence,
 retry lineage, chunk reuse and PDF validation. The complete suite is green:

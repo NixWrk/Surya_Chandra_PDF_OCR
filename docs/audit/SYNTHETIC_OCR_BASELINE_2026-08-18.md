@@ -1,9 +1,10 @@
 # Synthetic real-engine OCR baseline — 2026-08-18
 
-Status: accepted as the first reproducible synthetic measurement checkpoint for
-accuracy, retention, and stage timing. It is not a production accuracy
-acceptance gate. The record preserves one artifact assembly failure as observed;
-the failure was fixed later and verified without rerunning OCR.
+Status: accepted as two immutable synthetic measurement checkpoints covering all
+nine corpus fixtures at least once. They measure accuracy, retention, page
+mapping, and stage timing, but are not a production accuracy acceptance gate.
+The first record preserves one artifact assembly failure as observed; the
+failure was fixed later and verified without rerunning OCR.
 
 This baseline does not authorize a Surya/Chandra upgrade or OCR-policy change by
 itself. It is a comparison point for controlled experiments.
@@ -73,6 +74,64 @@ Published output evidence:
 recognition and retention under this runtime. `mixed-layout` is the primary
 accuracy target: mapping passed, but CER was about 28.7%, WER about 36.7%, and
 exact text did not match. No tuning has yet been accepted against that result.
+
+## Current-source extension checkpoint
+
+The four fixtures not measured in the first checkpoint were run from clean
+commit `3acda85aec9bbd38b2459120138d7359d1bf048f` with the same immutable Docker
+image, engine versions, GPU runtime, and read-only model caches listed above.
+The container used `--pull never`, `--network none`, and offline Hugging Face,
+Transformers, and Datasets settings. No package, image, or model download
+occurred. Current source was mounted read-only and selected with
+`PYTHONPATH=/app/src:/app`.
+
+Machine-readable evidence is retained locally at:
+
+- `outputs/audit_synthetic_baseline/v1_0_1/postfix-c89b593/`;
+- `outputs/audit_synthetic_baseline/v1_0_1/postfix-c89b593/synthetic-postfix-c89b593-summary.json`.
+
+Source SHA-256 values in the run metadata match the versioned corpus manifest:
+
+| Fixture | Pages | Source SHA-256 |
+|---|---:|---|
+| `degraded-vector-text` | 1 | `213ac5492247df47313db91639960c50bfe91af27967ec253be2048bfb034714` |
+| `rotated` | 3 | `c36f32e5f7a76a2ff2893570fd76a1bad612df81e49a160acad84cc32e497885` |
+| `native-text-layer` | 1 | `a3109c9550cdbcee45fcc6887460e571c78e5d940a10d2b91a786177382ba972` |
+| `long-23p` | 23 | `9e2f178711ae9aeb9e1a8b434386128c044c8851788b4559e6ad8c03663082e4` |
+
+Single-run results:
+
+| Fixture | Wall | Surya | Chandra | PDF build | CER | WER | Exact retention | Page mapping |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| `degraded-vector-text` | 88.905 s | 18.750 s | 60.929 s | 0.517 s | 0 | 0 | pass | pass |
+| `rotated` | 98.102 s | 19.850 s | 65.243 s | 0.645 s | 0 | 0 | pass | pass |
+| `native-text-layer` | 72.226 s | 13.455 s | 51.240 s | 0.466 s | 0 | 0 | pass | pass |
+| `long-23p` | 922.991 s | 71.043 s | 297.778 s | 5.238 s | 0 | 0 | pass | pass |
+
+Published outputs:
+
+| Fixture | Bytes | Output SHA-256 |
+|---|---:|---|
+| `degraded-vector-text` | 139,137 | `329171ce1254276a3c78cc92f6e040b93f4f45162496b43bdfae38a748a60dfd` |
+| `rotated` | 389,458 | `1eb009287c1616224d1ee096c30fe36e118689b43b1647b64db4a7265a7cbd23` |
+| `native-text-layer` | 138,464 | `f03a33b5f80c6014b9768b08f38740c04fe080db5f3e074c77c8a890c8b2df3d` |
+| `long-23p` | 2,954,784 | `f41908aa4c5a129f90e96cbe389340d63e2331255df74e94b9ba8e599e159476` |
+
+`long-23p` ran as three chunks of 10, 10, and 3 pages. The reported Surya
+and Chandra durations are sums from exactly three sealed per-chunk reports; the
+raw runner initially retained only the final chunk, and the summary was corrected
+from those sealed reports without rerunning OCR. All 23 pages mapped once and
+matched Ground Truth.
+
+Its 922.991-second wall time exceeds the measured engine, PDF-build, and
+validation stages (374.258 seconds combined) by about 548.733 seconds. This is a
+profiling target, not an attribution: preprocessing, repeated rendering/evidence
+checks, chunk revalidation, merge work, and uninstrumented orchestration may all
+contribute. No optimization is accepted from this single observation.
+
+Peak process RAM and VRAM were not sampled concurrently and are recorded as
+`not_measured`; one incidental Docker-stats observation is not treated as a peak.
+These are single runs, so they do not establish median or tail latency.
 
 ## Observed blank/graphics failure and fix
 
@@ -145,11 +204,12 @@ must never follow links or delete user source PDFs.
 
 ## Remaining measurement gaps
 
-- Repeat runs are insufficient for median and tail latency.
+- Repeat runs are still required for median and tail latency.
 - Peak VRAM and peak process RAM were not captured consistently.
 - Clean dependency resolution and cold model-cache provisioning remain untested.
-- Rotated, skewed, noisy, low-resolution, and existing-text-layer fixtures still
-  need real-engine runs.
+- Procedural rotation, low-contrast/noise/skew/low-resolution, native-text, and
+  long-document cases now have real-engine runs. Representative raster scans and
+  denser mixed-language/layout cases still need reviewed Ground Truth.
 - `mixed-layout` requires controlled experiments and human/layout review.
 - The historical private exact-retention root cause remains unproven because its
   rejected candidate was not preserved.

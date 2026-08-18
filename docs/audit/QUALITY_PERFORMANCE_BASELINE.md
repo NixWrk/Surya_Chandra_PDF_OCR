@@ -2,7 +2,53 @@
 
 Audit code baseline: `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 
-## Current verified software-quality baseline
+Status: the initial software snapshot below is retained for audit history. The
+current accepted checkpoints and limitations are summarized here; exact raw
+evidence and provenance are in `SYNTHETIC_OCR_BASELINE_2026-08-18.md` and
+`PRIVATE_OCR_BASELINE_2026-08-18.md`.
+
+## Current accepted checkpoint
+
+| Signal | Result |
+|---|---|
+| Full software suite | 678 passed, 9 skipped, 5 warnings in 259.49 s through `c89b593` |
+| Static checks | Ruff and mypy clean |
+| Synthetic corpus | Version 1.0.1, nine fixtures with hashed sources and Ground Truth |
+| Real-engine coverage | All nine fixtures exercised at least once across two immutable offline checkpoints |
+| Added four-fixture accuracy | CER 0, WER 0, exact retention pass, page mapping pass |
+| Known accuracy target | `mixed-layout`: CER 0.287293, WER 0.366667, exact retention fail, mapping pass |
+| Long-document observation | 23 pages, three chunks, all checks pass, 922.991 s wall |
+| Resource/latency limitation | Peak RAM/VRAM and median/tail latency not measured |
+
+The second checkpoint used clean source commit `3acda85`, immutable image
+`sha256:f470cf1520e43ae67b70bf63e5dded12235ebde07e5139c68307cb867b06bdc0`,
+`--pull never`, `--network none`, offline library settings, and read-only model
+caches. Source hashes match the corpus manifest; no download occurred.
+
+The 23-page wall time exceeds the recorded Surya, Chandra, PDF-build, and
+validation durations by about 548.733 seconds. This establishes a profiling
+question only. It does not identify which part of preprocessing, rendering,
+evidence revalidation, merging, or orchestration should change.
+
+The versioned corpus includes procedural English, Russian, mixed layout,
+retention, graphics/blank, degraded vector text, rotation, native text, and a
+23-page chunked document. It is sufficient to block unmeasured OCR tuning, but
+not to claim production accuracy: representative raster scans, denser layouts,
+reviewed private Ground Truth, repeat runs, and resource peaks are still missing.
+
+Resume provenance is intentionally narrow. It identifies only an active or
+explicitly retained same-deployment run so interrupted chunks cannot be mixed
+with another source/configuration. It is not a persistent history of user
+documents; successful HTTP working data is removed by default.
+
+## Current acceptance rule
+
+Do not change Surya/Chandra versions or OCR policy until a written hypothesis is
+tested against the affected fixture and unchanged fixtures, with OCR quality,
+page integrity, runtime, and available resource deltas recorded. Profile before
+removing or weakening strict validation.
+
+## Initial software-quality snapshot (historical)
 
 | Signal | Result |
 |---|---|
@@ -17,7 +63,7 @@ Audit code baseline: `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 These results establish regression protection for existing tested contracts. They
 do not establish OCR accuracy or production throughput.
 
-## Current OCR quality baseline
+## Initial OCR quality state (historical)
 
 There is no tracked representative PDF corpus, Ground Truth manifest, CER/WER
 baseline or accepted layout-scoring baseline. Therefore no accuracy improvement
@@ -105,7 +151,7 @@ Every accepted result must record:
 
 Without this provenance, comparisons are exploratory only.
 
-## Immediate quality gate
+## Initial quality gate (historical)
 
 Before any accuracy or speed modification:
 

@@ -28,8 +28,9 @@ The current open order, which supersedes the numerical order for future work, is
 1. Clean dependency-resolution evidence for Docker and Windows without changing
    OCR versions; the offline source-layer build is not a clean dependency build.
 2. Repeat the real-engine benchmark for median/tail latency and peak RAM/VRAM;
-   extend fixtures for rotated, skewed, noisy, low-resolution, and existing-text
-   inputs.
+   add representative raster-scan Ground Truth. Procedural rotated,
+   skew/noise/low-resolution, existing-text, and 23-page fixtures now have
+   passing real-engine evidence.
 3. Run controlled accuracy experiments against `mixed-layout` (baseline CER
    `0.287293`, WER `0.366667`) before changing OCR policy.
 4. Capture a preserved rejected candidate if the private exact-retention failure
@@ -39,6 +40,9 @@ The current open order, which supersedes the numerical order for future work, is
    preserving active jobs, retained failures, model caches, and user sources.
 7. Incrementally reduce module size and duplicate validation only after the
    above behavior is protected by benchmarks.
+8. Profile the 23-page checkpoint's approximately 549 seconds of wall time not
+   accounted for by recorded engine, PDF-build, and validation stages. Do not
+   remove strict checks until their individual cost and safety value are measured.
 
 Storage constraint: successful HTTP run/chunk working data is removed by default
 unless `UNISCAN_KEEP_JOB_RUNS=1`; terminal job retention defaults to 30 days for
