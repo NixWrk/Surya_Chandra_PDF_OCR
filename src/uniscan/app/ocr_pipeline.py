@@ -3785,6 +3785,16 @@ def _resolve_hybrid_run_config() -> _ResolvedHybridRunConfig:
     )
 
 
+def _assert_hybrid_runtime_config_unchanged(
+    runtime_config: _ResolvedHybridRunConfig,
+) -> None:
+    live_environment = tuple(
+        (key, os.environ.get(key)) for key in _HYBRID_IDENTITY_ENV_KEYS
+    )
+    if live_environment != runtime_config.environment:
+        raise RuntimeError("hybrid runtime configuration changed during the run")
+
+
 def _hybrid_runtime_config() -> dict[str, object]:
     return _resolve_hybrid_run_config().as_identity()
 
@@ -6148,6 +6158,7 @@ def _build_searchable_pdf_chunked(
     page_count: int,
     chunk_cache_root: Path | None = None,
 ) -> SearchablePdfSummary:
+    runtime_config = _resolve_hybrid_run_config()
     identity, run_key = _hybrid_run_identity(
         input_path=input_path,
         mode=mode,
@@ -6156,6 +6167,7 @@ def _build_searchable_pdf_chunked(
         delete_original_text_layer=delete_original_text_layer,
         chunk_pages=chunk_pages,
         page_count=page_count,
+        runtime_config=runtime_config,
     )
     with _hybrid_run_lock(run_key):
         return _build_searchable_pdf_chunked_unlocked(
@@ -6173,6 +6185,7 @@ def _build_searchable_pdf_chunked(
             chunk_cache_root=chunk_cache_root,
             identity=identity,
             run_key=run_key,
+            runtime_config=runtime_config,
         )
 
 
@@ -6192,7 +6205,9 @@ def _build_searchable_pdf_chunked_unlocked(
     chunk_cache_root: Path | None,
     identity: dict[str, object],
     run_key: str,
+    runtime_config: _ResolvedHybridRunConfig,
 ) -> SearchablePdfSummary:
+    _assert_hybrid_runtime_config_unchanged(runtime_config)
     cache_root = _resolve_hybrid_chunk_cache_root(
         work_root=work_root,
         configured_root=chunk_cache_root,
@@ -6301,6 +6316,7 @@ def _build_searchable_pdf_chunked_unlocked(
                         progress=_chunk_progress,
                         delete_original_text_layer=delete_original_text_layer,
                     )
+                _assert_hybrid_runtime_config_unchanged(runtime_config)
                 if not summary.output_pdf_path.exists():
                     raise RuntimeError(f"Chunk output is missing: {summary.output_pdf_path}")
                 _complete_chunk_record(
@@ -6347,6 +6363,7 @@ def _build_searchable_pdf_chunked_unlocked(
     global_graphics_windows: dict[int, list[int]] = {}
     snapshot_root = run_dir / "merge_snapshots"
     for chunk, record in zip(input_chunks, manifest_chunks, strict=True):
+        _assert_hybrid_runtime_config_unchanged(runtime_config)
         revalidated_summary = _reusable_chunk_summary(
             record=record,
             chunk=chunk,
@@ -6399,6 +6416,7 @@ def _build_searchable_pdf_chunked_unlocked(
 
     _emit_progress(progress, 97, "Merging hybrid OCR chunks...")
     try:
+        _assert_hybrid_runtime_config_unchanged(runtime_config)
         if _stable_file_fingerprint(input_path) != identity["source"]:
             raise RuntimeError("Source PDF changed while hybrid OCR chunks were running.")
         merged_pdf = _merge_pdf_chunks(
@@ -6413,6 +6431,7 @@ def _build_searchable_pdf_chunked_unlocked(
         manifest["merge_error"] = str(exc)
         _write_json_atomic(manifest_path, manifest)
         raise
+    _assert_hybrid_runtime_config_unchanged(runtime_config)
     final_pdf_path = merged_pdf
     overwritten_path: Path | None = None
     if overwrite_target is not None:
@@ -6431,6 +6450,7 @@ def _build_searchable_pdf_chunked_unlocked(
         skipped_engines=tuple(benchmark_skips),
     )
     merged_fingerprint = _stable_file_fingerprint(merged_pdf)
+    _assert_hybrid_runtime_config_unchanged(runtime_config)
     manifest["status"] = "done"
     manifest["output_pdf"] = str(merged_pdf)
     manifest["output_sha256"] = str(merged_fingerprint["sha256"])
