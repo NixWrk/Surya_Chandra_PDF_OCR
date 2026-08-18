@@ -57,6 +57,11 @@ does not prove why the hidden text differed if the failed candidate is absent.
 
 Restart recovery may requeue valid queued jobs and marks abandoned running jobs
 interrupted. A stale worker is not permitted to publish after reclamation.
+A resumable chunk cache is same-deployment recovery only. If code, packages,
+models, Python, CUDA, the driver, or the selected GPU runtime changed since the
+interruption, preserve the old run only if it is incident evidence and resubmit
+with a fresh cache/work root. Never copy completed chunks into the new root or
+treat run manifests as a permanent document history.
 
 ## Reproduce before repair
 

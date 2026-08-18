@@ -16,30 +16,28 @@ The original ranked matrix below remains the audit trail. Current disposition:
   (24), `AGENTS.md`/runbooks/repo skill (25–27), MCP assessment (28), and test
   signal classification (30).
 - Completed: immutable resolved environment snapshot and drift fencing for item
-  9. Partially complete: richer runtime/cache provenance (10), dependency/runtime
-  alignment (13–14), resource limits (18), and stale documentation (29).
+  9, plus the same-deployment-only resume decision for item 10. Partially
+  complete: dependency/runtime alignment (13–14), resource limits (18), and stale
+  documentation (29).
 - Deferred by evidence: thin MCP remains unnecessary without a consumer;
+  cross-upgrade resume attestation is unnecessary without that requirement, and
   running cancellation (19) still depends on cooperative engine termination.
 
 The current open order, which supersedes the numerical order for future work, is:
 
 1. Clean dependency-resolution evidence for Docker and Windows without changing
    OCR versions; the offline source-layer build is not a clean dependency build.
-2. Decide the minimal executable/package/model/CUDA provenance needed for an
-   explicitly retained resumable cache. Environment drift is already fenced;
-   do not create a global document registry, permanent history, or full model-file
-   hash inventory without evidence that it is needed.
-3. Repeat the real-engine benchmark for median/tail latency and peak RAM/VRAM;
+2. Repeat the real-engine benchmark for median/tail latency and peak RAM/VRAM;
    extend fixtures for rotated, skewed, noisy, low-resolution, and existing-text
    inputs.
-4. Run controlled accuracy experiments against `mixed-layout` (baseline CER
+3. Run controlled accuracy experiments against `mixed-layout` (baseline CER
    `0.287293`, WER `0.366667`) before changing OCR policy.
-5. Capture a preserved rejected candidate if the private exact-retention failure
+4. Capture a preserved rejected candidate if the private exact-retention failure
    recurs; do not infer its historical root cause.
-6. Measure and define queue/upload/page limits and cooperative cancellation.
-7. Add age and size quotas for explicit persistent benchmark/resume caches while
+5. Measure and define queue/upload/page limits and cooperative cancellation.
+6. Add age and size quotas for explicit persistent benchmark/resume caches while
    preserving active jobs, retained failures, model caches, and user sources.
-8. Incrementally reduce module size and duplicate validation only after the
+7. Incrementally reduce module size and duplicate validation only after the
    above behavior is protected by benchmarks.
 
 Storage constraint: successful HTTP run/chunk working data is removed by default
@@ -220,8 +218,12 @@ Preserve the existing application façade.
 
 ### 10. Complete hybrid run identity
 
-Add package, executable, model and CUDA/runtime digests. Prove with tests that an
-incompatible environment cannot reuse completed chunks.
+Accepted scope: interruption recovery within one unchanged deployment. Source,
+resolved settings, pipeline revision, chunks, and evidence are sealed locally.
+After code/package/model/Python/CUDA/GPU-runtime changes, use a fresh cache root.
+Do not hash an entire model tree or keep a document catalog. Add package,
+executable, model, and CUDA attestation only if cross-upgrade resume is explicitly
+made part of the supported contract.
 
 ### 11. Seal successful job results
 

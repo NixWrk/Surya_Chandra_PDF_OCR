@@ -78,9 +78,10 @@ processes have a proven cooperative stop boundary.
 Publication is fenced by job ownership: a stale or reclaimed worker cannot copy
 its result or mark a newer attempt done. Recovery and result serving accept only
 root-contained regular non-link files whose persisted size, SHA-256 and page-count
-seal revalidates. Richer executable/package/model/CUDA provenance for an explicitly
-retained resumable cache remains incremental hardening work; it does not require a
-global document registry.
+seal revalidates. A resumable chunk cache is valid only within the same deployment.
+After changing code, packages, models, Python, CUDA, or the GPU runtime, start with
+a fresh cache root instead of resuming old chunks. Cross-upgrade resume would need
+separate runtime attestation; it is not a global document registry or history.
 
 ## Validation boundaries
 

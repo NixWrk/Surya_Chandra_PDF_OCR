@@ -67,22 +67,23 @@ not mutated.
 
 Current order after the synthetic baseline and blank-page fix:
 
+Accepted boundary: resumable caches are same-deployment only. The update runbook
+requires a fresh cache root after code/runtime/model changes. Richer attestation
+is deferred unless cross-upgrade resume becomes a supported requirement; there is
+no global document registry or historical model-tree hashing.
+
 1. Validate clean dependency resolutions separately for Docker/Windows and
    `cu126`/`cu128`; the offline source-layer build is only partial evidence.
-2. Decide the smallest useful executable/package/model/CUDA provenance for an
-   explicitly retained resumable cache. One resolved environment snapshot is
-   already enforced across chunk publication. Do not add a global document
-   registry or hash every historical document/model file.
-3. Extend the real-engine baseline with median/tail timing, peak RAM/VRAM,
+2. Extend the real-engine baseline with median/tail timing, peak RAM/VRAM,
    rotated/noisy/skewed fixtures, and controlled `mixed-layout` experiments. Its
    current CER/WER are `0.287293`/`0.366667`.
-4. Capture a preserved rejected candidate if the historical private
+3. Capture a preserved rejected candidate if the historical private
    exact-retention failure recurs; do not infer its root cause from a final PDF.
-5. Measure and define queue and page-count limits.
-6. Add bounded age-and-size quotas for explicit persistent benchmark/resume
+4. Measure and define queue and page-count limits.
+5. Add bounded age-and-size quotas for explicit persistent benchmark/resume
    caches. Successful HTTP run caches already clean up by default; job retention
    remains 30 days success/90 days failure unless overridden.
-7. Remove normal-response absolute paths only with a versioned compatibility
+6. Remove normal-response absolute paths only with a versioned compatibility
    decision; the service remains trusted-network-only.
 
 The earlier checkpoint list is retained below as historical audit context:

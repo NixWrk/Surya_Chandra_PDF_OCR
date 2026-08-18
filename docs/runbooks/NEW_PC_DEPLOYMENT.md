@@ -93,6 +93,13 @@ Model caches may be large; preserve them if redownload time matters. Never copy
 a live SQLite database without stopping the service or using a consistent
 backup method.
 
+Stop the service before changing code, packages, models, Python, CUDA, the driver,
+or the selected GPU runtime. The old `UNISCAN_WORK_ROOT/runs/hybrid_chunk_cache`
+is valid only for the old deployment. Preserve individual failed runs when they
+are incident evidence, then rename/quarantine the old cache root so startup creates
+a fresh one. Do not copy completed chunks into the new root and do not delete job
+results or model caches as part of this step.
+
 Rollback by stopping the current service, checking out the recorded commit or
 retagging the recorded image, restoring the matching local configuration, and
 running preflight before start. Do not delete newer job evidence during
