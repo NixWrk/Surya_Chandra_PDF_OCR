@@ -8,16 +8,28 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 - Baseline, inventory, ranked backlog, target architecture, and both observed OCR
   incidents are recorded under `docs/audit/`.
 - Durable-job recovery now rejects unsafe/tampered artifacts and stale attempts
-  cannot publish after watchdog reclamation.
+  cannot publish after watchdog reclamation. Successful result recovery is
+  sealed and link/hardlink containment tests remain in the suite.
+- Malformed and encrypted PDF uploads are rejected before durable job creation.
+  Idempotency conflicts are checked before parsing a replacement payload.
+- HTTP worker and watchdog threads now have an explicit bounded shutdown path;
+  the full-suite order-dependent thread leak is fixed.
 - Chandra punctuation-only geometry is retained. The separate exact-retention
   incident remains a reproducer only; its failed candidate was not preserved, so
   a root cause is not asserted.
-- The repository has a deterministic model-free benchmark corpus and evaluator.
+- The repository has a deterministic model-free benchmark corpus and evaluator,
+  plus an offline real-engine synthetic checkpoint with valid English, Russian,
+  mixed-layout, blank/graphics, and three-page retention Ground Truth.
   No OCR accuracy or performance tuning has been accepted without a real engine
   baseline.
-- A private real-engine incident/timing baseline now covers one page from each
-  observed failure class. Both pass strict reconciliation; CER/WER and full
-  exact-retention chunk context remain unmeasured.
+- The synthetic run exposed a second OCR publication failure on `blank-graphics`.
+  It was reproduced test-first and fixed by requiring sealed, recomputed blank
+  raster evidence. The preserved run now rebuilds artifact-only as a valid
+  two-page PDF without rerunning OCR.
+- A private real-engine incident/timing baseline covers both observed failure
+  classes and a full 21-page chunked exact-retention run. The run passed, but the
+  historical rejected candidate is unavailable, so its root cause is not proven;
+  CER/WER remain unmeasured because reviewed Ground Truth is unavailable.
 - A repeat of the punctuation case with warm model caches produced a
   byte-identical PDF. It used fresh processes, so it is not an in-process warm
   latency measurement.
@@ -30,23 +42,46 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 
 ## Current verification
 
-On local `main`, after the accepted audit commits:
+On local `main`, through `253bca0`:
 
 ```text
 python -m pytest -q
-655 passed, 9 skipped, 2 xfailed, 5 warnings in 251.77s
+676 passed, 9 skipped, 5 warnings in 243.44s
 ```
 
-The two strict expected failures reproduce early HTTP admission gaps for
-malformed and encrypted PDFs. A forced run (`--runxfail`) produced two failures
-because the API returned `202` instead of the expected `400`.
+There are no expected failures. The former malformed/encrypted admission xfails
+are ordinary passing tests after `d0085fb` and `51ca830`.
 
-Targeted dependency snapshot checks passed (`3 passed`), with Ruff and
-`git diff --check` clean. Docker standalone and shared-network Compose config
-preflights passed earlier in this execution. Windows preflight found that the
-existing Surya venv lacks the local `uniscan` install; it did not mutate it.
+Targeted verification also includes `164 passed, 1 skipped` for page
+reconciliation, `95 passed` for searchable-artifact assembly, Ruff, mypy, and
+`git diff --check`. A no-cache offline source-layer Docker build passed in both
+engine venvs, CLI help passed, and the preserved blank/graphics artifact rebuilt
+successfully. This is not a clean dependency build. Windows preflight still
+reports that the existing Surya venv lacks the local `uniscan` install; it was
+not mutated.
 
 ## Open high-value work
+
+Current order after the synthetic baseline and blank-page fix:
+
+1. Validate clean dependency resolutions separately for Docker/Windows and
+   `cu126`/`cu128`; the offline source-layer build is only partial evidence.
+2. Complete per-run cache identity with actual executable, package, model, and
+   CUDA/runtime provenance and propagate one resolved snapshot through recursive
+   chunks. Do not add a global document registry.
+3. Extend the real-engine baseline with median/tail timing, peak RAM/VRAM,
+   rotated/noisy/skewed fixtures, and controlled `mixed-layout` experiments. Its
+   current CER/WER are `0.287293`/`0.366667`.
+4. Capture a preserved rejected candidate if the historical private
+   exact-retention failure recurs; do not infer its root cause from a final PDF.
+5. Measure and define queue and page-count limits.
+6. Add bounded age-and-size quotas for explicit persistent benchmark/resume
+   caches. Successful HTTP run caches already clean up by default; job retention
+   remains 30 days success/90 days failure unless overridden.
+7. Remove normal-response absolute paths only with a versioned compatibility
+   decision; the service remains trusted-network-only.
+
+The earlier checkpoint list is retained below as historical audit context:
 
 1. Extend the accepted real Surya+Chandra incident/timing baseline with reviewed
    Ground Truth, CER/WER, warm-run repetitions, peak RAM/VRAM, and full pages
@@ -73,3 +108,6 @@ existing Surya venv lacks the local `uniscan` install; it did not mutate it.
 - Keep changes small, reversible, test-first, and separately committed.
 - Do not push, delete artifacts, or invoke Understand Anything without explicit
   user authorization.
+- Do not create a permanent catalog of processed user documents. Identity and
+  chunk metadata remain scoped to a specific active/resumable cache or retained
+  result and are removed according to explicit cleanup/retention policy.

@@ -5,6 +5,46 @@ upgrade or deletion of user/run data.
 
 Priority order within the immediate integrity block is mandatory.
 
+## Execution disposition — 2026-08-18
+
+The original ranked matrix below remains the audit trail. Current disposition:
+
+- Completed with tests/evidence: durable recovery and publication fencing
+  (items 1–3 and 11), both historical incident regression paths (4–5), versioned
+  synthetic corpus/metrics/first baseline (6–8), host-configured GPU identity
+  (12), standalone Compose networking (15), trusted-network decision (16), CPU CI
+  (24), `AGENTS.md`/runbooks/repo skill (25–27), MCP assessment (28), and test
+  signal classification (30).
+- Partially complete: immutable runtime/cache identity (9–10), dependency/runtime
+  alignment (13–14), resource limits (18), and stale documentation (29).
+- Deferred by evidence: thin MCP remains unnecessary without a consumer;
+  running cancellation (19) still depends on cooperative engine termination.
+
+The current open order, which supersedes the numerical order for future work, is:
+
+1. Clean dependency-resolution evidence for Docker and Windows without changing
+   OCR versions; the offline source-layer build is not a clean dependency build.
+2. Complete per-run identity and propagation across recursive chunks using
+   executable/package/model/CUDA provenance. Do not create a global document
+   registry or permanent history.
+3. Repeat the real-engine benchmark for median/tail latency and peak RAM/VRAM;
+   extend fixtures for rotated, skewed, noisy, low-resolution, and existing-text
+   inputs.
+4. Run controlled accuracy experiments against `mixed-layout` (baseline CER
+   `0.287293`, WER `0.366667`) before changing OCR policy.
+5. Capture a preserved rejected candidate if the private exact-retention failure
+   recurs; do not infer its historical root cause.
+6. Measure and define queue/upload/page limits and cooperative cancellation.
+7. Add age and size quotas for explicit persistent benchmark/resume caches while
+   preserving active jobs, retained failures, model caches, and user sources.
+8. Incrementally reduce module size and duplicate validation only after the
+   above behavior is protected by benchmarks.
+
+Storage constraint: successful HTTP run/chunk working data is removed by default
+unless `UNISCAN_KEEP_JOB_RUNS=1`; terminal job retention defaults to 30 days for
+success and 90 days for failure. Hashes and run manifests are local cache/result
+integrity evidence, not a repository-wide document catalog.
+
 ## Ranked matrix
 
 Scales: severity is `P1`, `P2`, or `P3`; effort is `S`, `M`, or `L`.
