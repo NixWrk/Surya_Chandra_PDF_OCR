@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
+import fitz
 import pytest
 
 from benchmarks.synthetic.v1.generate import generate_corpus, validate_corpus
@@ -31,6 +33,35 @@ def _files(root: Path) -> dict[str, bytes]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def _source_lines(root: Path, fixture_id: str) -> list[str]:
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    fixture = next(item for item in manifest["fixtures"] if item["id"] == fixture_id)
+    with fitz.open(str(root / fixture["source_pdf"])) as document:
+        return [
+            line.strip()
+            for page in document
+            for line in page.get_text("text").splitlines()
+            if line.strip()
+        ]
+
+
+def _ground_truth_lines(root: Path, fixture_id: str) -> list[str]:
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    fixture = next(item for item in manifest["fixtures"] if item["id"] == fixture_id)
+    rows = [
+        json.loads(line)
+        for line in (root / fixture["ground_truth"]).read_text(encoding="utf-8").splitlines()
+    ]
+    return [str(line["text"]) for row in rows for line in row["lines"]]
+
+
+def _assert_source_contains_ground_truth_lines(root: Path, fixture_id: str) -> None:
+    expected = Counter(_ground_truth_lines(root, fixture_id))
+    observed = Counter(_source_lines(root, fixture_id))
+    missing = expected - observed
+    assert not missing, f"{fixture_id} missing Ground Truth lines: {dict(missing)}"
 
 
 def test_generation_is_reproducible_and_model_free(tmp_path: Path) -> None:
@@ -71,6 +102,32 @@ def test_manifest_covers_fixture_matrix_and_case_regressions(tmp_path: Path) -> 
     assert punctuation_case["current_expected"]["punctuation_lines_retained"] is True
 
     assert validate_corpus(root)["corpus_id"] == "uniscan-synthetic-offline"
+
+
+def test_generated_corpus_revision_tracks_fidelity_fix(tmp_path: Path) -> None:
+    manifest = generate_corpus(tmp_path / "corpus")
+
+    assert manifest["schema"] == "uniscan.synthetic-benchmark.v1"
+    assert manifest["revision"] == "1.0.1"
+    assert manifest["generator"]["version"] == "1.0.1"
+
+
+def test_generated_clean_ru_source_preserves_exact_ground_truth_lines(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "corpus"
+    generate_corpus(root)
+
+    _assert_source_contains_ground_truth_lines(root, "clean-ru")
+
+
+def test_generated_mixed_layout_source_contains_every_ground_truth_line(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "corpus"
+    generate_corpus(root)
+
+    _assert_source_contains_ground_truth_lines(root, "mixed-layout")
 
 
 def test_validation_rejects_tampered_source_pdf(tmp_path: Path) -> None:
