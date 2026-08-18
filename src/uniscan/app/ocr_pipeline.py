@@ -100,7 +100,7 @@ ProgressCallback = Callable[[int, str], None]
 _DEFAULT_HYBRID_CHUNK_PAGES = 10
 _HYBRID_CHUNK_MANIFEST_SCHEMA = "uniscan.hybrid-chunks.v4"
 _OCR_STATUS_RECONCILIATION_PENDING = "reconciliation_pending"
-_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v10"
+_HYBRID_CHUNK_PIPELINE_REVISION = "chandra-surya-resumable-v11"
 _SURYA_RETRY_PREPROCESSING = "autocontrast-cutoff-1"
 _SURYA_SCALED_RETRY_PREPROCESSING = "rgb-scale-0.5-center-white-lanczos-v1"
 _SURYA_SCALED_RETRY_FACTOR = 0.5
@@ -127,20 +127,43 @@ _MAX_OCR_TEXT_ARTIFACT_BYTES = 64 * 1024 * 1024
 _FILE_HASH_BLOCK_BYTES = 1024 * 1024
 _HYBRID_IDENTITY_ENV_KEYS: tuple[str, ...] = (
     "CUDA_VISIBLE_DEVICES",
+    "HF_HOME",
+    "HUGGINGFACE_HUB_CACHE",
+    "HF_HUB_CACHE",
+    "MODEL_CACHE_DIR",
+    "TORCH_DEVICE",
+    "TRANSFORMERS_CACHE",
     "UNISCAN_ALIGN_BAND",
     "UNISCAN_CHANDRA_ALLOW_CLI_FALLBACK",
     "UNISCAN_CHANDRA_BLEND_Y_WEIGHT",
     "UNISCAN_CHANDRA_DEVICE_POLICY",
     "UNISCAN_CHANDRA_GEOMETRY_POLICY",
+    "UNISCAN_CHANDRA_HF_HOME",
+    "UNISCAN_CHANDRA_HUGGINGFACE_HUB_CACHE",
+    "UNISCAN_CHANDRA_HF_HUB_CACHE",
+    "UNISCAN_CHANDRA_MODEL_CACHE_DIR",
+    "UNISCAN_CHANDRA_MODELSCOPE_CACHE",
     "UNISCAN_CHANDRA_PREFER_GPU",
+    "UNISCAN_CHANDRA_PYTHON",
     "UNISCAN_CHANDRA_REQUIRE_GPU",
     "UNISCAN_CHANDRA_REQUIRE_SIDECAR",
+    "UNISCAN_CHANDRA_TORCH_DEVICE",
+    "UNISCAN_CHANDRA_TRANSFORMERS_CACHE",
+    "UNISCAN_ENGINE_SUBPROCESS_TIMEOUT_SECONDS",
     "UNISCAN_GEOMETRY_DEBUG",
     "UNISCAN_GPU_DEVICE_ID",
     "UNISCAN_OCR_RENDER_DPI",
     "UNISCAN_SURYA_ALLOW_TEXT_FALLBACK",
+    "UNISCAN_SURYA_HF_HOME",
+    "UNISCAN_SURYA_HUGGINGFACE_HUB_CACHE",
+    "UNISCAN_SURYA_HF_HUB_CACHE",
+    "UNISCAN_SURYA_MODEL_CACHE_DIR",
+    "UNISCAN_SURYA_MODELSCOPE_CACHE",
+    "UNISCAN_SURYA_PYTHON",
     "UNISCAN_SURYA_REQUIRE_GEOMETRY_JSON",
     "UNISCAN_SURYA_REQUIRE_GPU",
+    "UNISCAN_SURYA_TORCH_DEVICE",
+    "UNISCAN_SURYA_TRANSFORMERS_CACHE",
     "UNISCAN_TEXT_LAYER_FONT",
     "UNISCAN_TEXTLESS_DPI",
     "UNISCAN_TEXTLESS_JPEG_QUALITY",
@@ -191,6 +214,34 @@ class _PdfChunk:
     start_page: int
     end_page: int
     path: Path
+
+
+@dataclass(slots=True, frozen=True)
+class _ResolvedHybridRunConfig:
+    effective_ocr_render_dpi: int
+    effective_textless_dpi: int
+    effective_textless_jpeg_quality: int
+    effective_engine_subprocess_timeout_seconds: float | None
+    environment: tuple[tuple[str, str | None], ...]
+
+    def as_identity(self) -> dict[str, object]:
+        return {
+            "effective_ocr_render_dpi": self.effective_ocr_render_dpi,
+            "effective_textless_dpi": self.effective_textless_dpi,
+            "effective_textless_jpeg_quality": self.effective_textless_jpeg_quality,
+            "effective_engine_subprocess_timeout_seconds": (
+                self.effective_engine_subprocess_timeout_seconds
+            ),
+            "chandra_min_image_dim": _CHANDRA_MIN_IMAGE_DIM,
+            "zero_output_retry_policy": _SURYA_RETRY_POLICY,
+            "chandra_zero_output_retry_policy": _CHANDRA_RETRY_POLICY,
+            "page_reconciliation_policy": (
+                "explicit-chandra-nontext+quiet-surya+scaled-terminal-lineage+"
+                "durable-source-rasters+durable-chandra-attempts+exact-text-artifacts+"
+                "bounded-png+accounted-alternative-text+plain-cross-engine-agreement-v9"
+            ),
+            "environment": dict(self.environment),
+        }
 
 
 def _emit_progress(cb: ProgressCallback | None, percent: int, status: str) -> None:
@@ -3613,6 +3664,19 @@ def _resolve_textless_dpi() -> int:
     return max(72, min(400, value))
 
 
+def _resolve_textless_jpeg_quality() -> int:
+    raw = (os.environ.get("UNISCAN_TEXTLESS_JPEG_QUALITY") or "").strip()
+    if not raw:
+        return 85
+    try:
+        value = int(raw)
+    except ValueError:
+        return 85
+    if value <= 0:
+        return 0
+    return min(value, 100)
+
+
 def _resolve_hybrid_chunk_pages() -> int:
     raw = (os.environ.get("UNISCAN_HYBRID_CHUNK_PAGES") or "").strip()
     if not raw:
@@ -3709,20 +3773,20 @@ def _stable_json_object(
     return payload, fingerprint
 
 
-def _hybrid_runtime_config() -> dict[str, object]:
-    return {
-        "effective_ocr_render_dpi": _resolve_ocr_render_dpi(),
-        "effective_textless_dpi": _resolve_textless_dpi(),
-        "chandra_min_image_dim": _CHANDRA_MIN_IMAGE_DIM,
-        "zero_output_retry_policy": _SURYA_RETRY_POLICY,
-        "chandra_zero_output_retry_policy": _CHANDRA_RETRY_POLICY,
-        "page_reconciliation_policy": (
-            "explicit-chandra-nontext+quiet-surya+scaled-terminal-lineage+"
-            "durable-source-rasters+durable-chandra-attempts+exact-text-artifacts+"
-            "bounded-png+accounted-alternative-text+plain-cross-engine-agreement-v9"
+def _resolve_hybrid_run_config() -> _ResolvedHybridRunConfig:
+    return _ResolvedHybridRunConfig(
+        effective_ocr_render_dpi=_resolve_ocr_render_dpi(),
+        effective_textless_dpi=_resolve_textless_dpi(),
+        effective_textless_jpeg_quality=_resolve_textless_jpeg_quality(),
+        effective_engine_subprocess_timeout_seconds=_engine_subprocess_timeout_seconds(),
+        environment=tuple(
+            (key, os.environ.get(key)) for key in _HYBRID_IDENTITY_ENV_KEYS
         ),
-        "environment": {key: os.environ.get(key) for key in _HYBRID_IDENTITY_ENV_KEYS},
-    }
+    )
+
+
+def _hybrid_runtime_config() -> dict[str, object]:
+    return _resolve_hybrid_run_config().as_identity()
 
 
 def _hybrid_run_identity(
@@ -3734,6 +3798,7 @@ def _hybrid_run_identity(
     delete_original_text_layer: bool,
     chunk_pages: int,
     page_count: int,
+    runtime_config: _ResolvedHybridRunConfig | None = None,
 ) -> tuple[dict[str, object], str]:
     identity: dict[str, object] = {
         "pipeline_revision": _HYBRID_CHUNK_PIPELINE_REVISION,
@@ -3744,7 +3809,11 @@ def _hybrid_run_identity(
         "delete_original_text_layer": bool(delete_original_text_layer),
         "chunk_pages": int(chunk_pages),
         "page_count": int(page_count),
-        "runtime_config": _hybrid_runtime_config(),
+        "runtime_config": (
+            runtime_config.as_identity()
+            if runtime_config is not None
+            else _hybrid_runtime_config()
+        ),
     }
     serialized = json.dumps(
         identity,
