@@ -767,6 +767,104 @@ def test_split_and_merge_pdf_chunks_preserves_page_order_and_sizes() -> None:
         merged.close()
 
 
+def test_chunked_hybrid_resolves_one_runtime_config_and_passes_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    source_pdf.write_bytes(b"sealed source")
+    snapshot = ocr_pipeline._resolve_hybrid_run_config()
+    resolve_calls = 0
+    identity_snapshots: list[object] = []
+    unlocked_snapshots: list[object] = []
+    sentinel = object()
+
+    def fake_resolve() -> object:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return snapshot
+
+    def fake_identity(**kwargs: object) -> tuple[dict[str, object], str]:
+        identity_snapshots.append(kwargs["runtime_config"])
+        return {"source": {"sha256": "a" * 64, "size": 13}}, "b" * 64
+
+    def fake_unlocked(**kwargs: object) -> object:
+        unlocked_snapshots.append(kwargs["runtime_config"])
+        return sentinel
+
+    monkeypatch.setattr(ocr_pipeline, "_resolve_hybrid_run_config", fake_resolve)
+    monkeypatch.setattr(ocr_pipeline, "_hybrid_run_identity", fake_identity)
+    monkeypatch.setattr(
+        ocr_pipeline,
+        "_build_searchable_pdf_chunked_unlocked",
+        fake_unlocked,
+    )
+
+    result = ocr_pipeline._build_searchable_pdf_chunked(
+        input_path=source_pdf,
+        mode="chandra+surya",
+        lang="rus+eng",
+        work_root=tmp_path / "work",
+        overwrite_target=None,
+        return_bytes=False,
+        strict=True,
+        progress=None,
+        delete_original_text_layer=True,
+        chunk_pages=10,
+        page_count=11,
+    )
+
+    assert result is sentinel
+    assert resolve_calls == 1
+    assert identity_snapshots == [snapshot]
+    assert unlocked_snapshots == [snapshot]
+
+
+def test_chunked_hybrid_rejects_runtime_environment_drift_before_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=2)
+    monkeypatch.setenv("UNISCAN_OCR_RENDER_DPI", "72")
+    calls = 0
+
+    def fake_build_searchable_pdf(**kwargs: object) -> SearchablePdfSummary:
+        nonlocal calls
+        calls += 1
+        chunk_pdf = Path(str(kwargs["pdf_path"]))
+        summary = _write_complete_hybrid_summary(
+            chunk_pdf=chunk_pdf,
+            run_dir=Path(str(kwargs["work_root"])) / "run",
+            delete_original_text_layer=False,
+        )
+        if calls == 1:
+            monkeypatch.setenv("UNISCAN_OCR_RENDER_DPI", "73")
+        return summary
+
+    monkeypatch.setattr(ocr_pipeline, "build_searchable_pdf", fake_build_searchable_pdf)
+
+    with pytest.raises(
+        RuntimeError,
+        match="hybrid runtime configuration changed during the run",
+    ):
+        ocr_pipeline._build_searchable_pdf_chunked(
+            input_path=source_pdf,
+            mode="chandra+surya",
+            lang="rus+eng",
+            work_root=tmp_path / "work",
+            overwrite_target=None,
+            return_bytes=False,
+            strict=True,
+            progress=None,
+            delete_original_text_layer=False,
+            chunk_pages=1,
+            page_count=2,
+        )
+
+    assert calls == 1
+
+
 def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
