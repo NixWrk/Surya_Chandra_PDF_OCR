@@ -1,0 +1,4 @@
+The generator uses PyMuPDF, an existing project dependency. Generated fixture
+content is procedural-original and contains no third-party passages or private
+documents. A caller may provide no external assets; the default generator uses
+PyMuPDF's bundled font aliases only.
