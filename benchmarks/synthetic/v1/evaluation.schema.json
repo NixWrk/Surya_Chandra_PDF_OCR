@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uniscan.invalid/synthetic-evaluation-input-v1.schema.json",
+  "title": "UniScan synthetic evaluation input v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "model_status",
+    "fixtures",
+    "measurements",
+    "output"
+  ],
+  "properties": {
+    "schema": {"const": "uniscan.synthetic-evaluation-input.v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "model_status": {"enum": ["not_run", "external", "not_measured"]},
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/fixture"}
+    },
+    "measurements": {"$ref": "#/$defs/measurements"},
+    "output": {"$ref": "#/$defs/output"}
+  },
+  "$defs": {
+    "sentinel": {"enum": ["not_measured", "not_run"]},
+    "measurement": {
+      "anyOf": [
+        {"type": "number", "minimum": 0},
+        {"$ref": "#/$defs/sentinel"}
+      ]
+    },
+    "count": {
+      "anyOf": [
+        {"type": "integer", "minimum": 0},
+        {"$ref": "#/$defs/sentinel"}
+      ]
+    },
+    "page_number": {"type": "integer", "minimum": 1},
+    "stage_timing": {
+      "type": "object",
+      "required": ["surya", "chandra", "pdf_build", "validation"],
+      "properties": {
+        "surya": {"$ref": "#/$defs/measurement"},
+        "chandra": {"$ref": "#/$defs/measurement"},
+        "pdf_build": {"$ref": "#/$defs/measurement"},
+        "validation": {"$ref": "#/$defs/measurement"}
+      }
+    },
+    "chunk_reuse": {
+      "type": "object",
+      "required": ["status", "reused_chunks", "rerun_reasons"],
+      "properties": {
+        "status": {"enum": ["reused", "not_reused", "not_measured", "not_run"]},
+        "reused_chunks": {"$ref": "#/$defs/count"},
+        "rerun_reasons": {
+          "anyOf": [
+            {"type": "array", "items": {"type": "string"}},
+            {"$ref": "#/$defs/sentinel"}
+          ]
+        }
+      }
+    },
+
+    "measurements": {
+      "type": "object",
+      "required": [
+        "stage_timing_seconds",
+        "peak_ram_bytes",
+        "peak_vram_bytes",
+        "engine_invocations",
+        "render_count",
+        "chunk_reuse"
+      ],
+      "properties": {
+        "stage_timing_seconds": {"$ref": "#/$defs/stage_timing"},
+        "peak_ram_bytes": {"$ref": "#/$defs/count"},
+        "peak_vram_bytes": {"$ref": "#/$defs/count"},
+        "engine_invocations": {"$ref": "#/$defs/count"},
+        "render_count": {"$ref": "#/$defs/count"},
+        "chunk_reuse": {"$ref": "#/$defs/chunk_reuse"}
+      }
+    },
+    "page": {
+      "type": "object",
+      "required": ["source_page", "output_page", "searchable_text", "outcome"],
+      "properties": {
+        "source_page": {"$ref": "#/$defs/page_number"},
+        "output_page": {
+          "anyOf": [
+            {"$ref": "#/$defs/page_number"},
+            {"$ref": "#/$defs/sentinel"}
+          ]
+        },
+        "searchable_text": {
+          "anyOf": [
+            {"type": "string"},
+            {"$ref": "#/$defs/sentinel"}
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "text",
+            "verified_blank",
+            "explicit_nontext",
+            "accepted_zero_output",
+            "failed",
+            "not_measured",
+            "not_run"
+          ]
+        }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "required": ["fixture_id", "pages"],
+      "properties": {
+        "fixture_id": {"type": "string", "minLength": 1},
+        "pages": {"type": "array", "items": {"$ref": "#/$defs/page"}}
+      }
+    },
+
+    "output": {
+      "type": "object",
+      "required": ["status", "path", "sha256", "bytes", "page_count"],
+      "properties": {
+        "status": {"enum": ["published", "failed", "not_measured", "not_run"]},
+        "path": {"type": "string"},
+        "sha256": {
+          "anyOf": [
+            {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            {"$ref": "#/$defs/sentinel"}
+          ]
+        },
+        "bytes": {"$ref": "#/$defs/count"},
+        "page_count": {"$ref": "#/$defs/count"}
+      }
+    }
+  }
+}
