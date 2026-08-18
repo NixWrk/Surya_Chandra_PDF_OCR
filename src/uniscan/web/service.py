@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import ParseResult, parse_qs, quote, urlparse
 
+import fitz
+
 from uniscan.app import (
     DEFAULT_BASIC_GUI_LANG,
     PDF_MODE_HYBRID,
@@ -58,11 +60,6 @@ class _InvalidPdfAdmission(ValueError):
 
 
 def _validate_pdf_admission(payload: bytes) -> None:
-    try:
-        import fitz
-    except Exception as exc:
-        raise RuntimeError("PDF admission validation requires PyMuPDF.") from exc
-
     try:
         with fitz.open(stream=payload, filetype="pdf") as document:
             if bool(document.is_encrypted) or bool(document.needs_pass):
@@ -2024,7 +2021,6 @@ def _build_handler(
                 payload = self._read_request_body()
                 if not payload:
                     raise ValueError("Request body is empty. Send raw PDF bytes.")
-                _validate_pdf_admission(payload)
                 mode, pages_raw, lang, strict, filename, delete_original_text_layer = _parse_job_request(
                     parsed,
                     default_lang=default_lang,
@@ -2079,6 +2075,12 @@ def _build_handler(
                     if not should_retry_terminal:
                         self._send_json(HTTPStatus.OK, existing_payload)
                         return
+
+                try:
+                    _validate_pdf_admission(payload)
+                except _InvalidPdfAdmission as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
 
                 job_id = uuid.uuid4().hex[:12]
                 try:

@@ -1790,6 +1790,21 @@ def test_http_job_idempotency_rejects_conflicting_request(tmp_path: Path, monkey
 
         assert second_response.status == HTTPStatus.CONFLICT
         assert "different OCR request" in second_payload["error"]
+
+        invalid_conn = http.client.HTTPConnection("127.0.0.1", port)
+        invalid_conn.request(
+            "POST",
+            "/api/jobs?mode=chandra+surya",
+            body=b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\n",
+            headers=headers,
+        )
+        invalid_response = invalid_conn.getresponse()
+        invalid_payload = json.loads(invalid_response.read().decode("utf-8"))
+        invalid_conn.close()
+
+        assert invalid_response.status == HTTPStatus.CONFLICT
+        assert "different OCR request" in invalid_payload["error"]
+        assert len(list((tmp_path / "work" / "jobs").glob("*/input.pdf"))) == 1
     finally:
         server.shutdown()
         server.server_close()
