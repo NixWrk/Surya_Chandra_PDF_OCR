@@ -7,8 +7,18 @@ set "VENV_CHANDRA=%CD%\.venv_chandra"
 set "VENV_SURYA=%CD%\.venv_surya"
 set "PY_MAIN=%VENV_CHANDRA%\Scripts\python.exe"
 set "PY_SURYA=%VENV_SURYA%\Scripts\python.exe"
-set "UNISCAN_GPU_DEVICE_ID=GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f"
+if not defined UNISCAN_GPU_DEVICE_ID (
+  echo [OCR GUI] UNISCAN_GPU_DEVICE_ID is required.
+  exit /b 1
+)
 set "CUDA_VISIBLE_DEVICES=0"
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
+  "& { . '.\scripts\gpu0_contract.ps1'; Assert-UniscanGpu0Contract | Out-Null }"
+if errorlevel 1 (
+  echo [OCR GUI] GPU0 attestation failed.
+  exit /b 1
+)
 
 if not exist "%PY_MAIN%" (
   echo [OCR GUI] Missing %PY_MAIN%

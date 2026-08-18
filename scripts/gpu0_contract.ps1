@@ -1,12 +1,21 @@
 Set-StrictMode -Version Latest
 
-$script:UniscanExpectedGpu0Uuid = "GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f"
-
 function Assert-UniscanGpu0Contract {
     [CmdletBinding()]
     param(
         [string[]]$AdditionalFields = @()
     )
+
+    $expectedGpu0Uuid = "$($env:UNISCAN_GPU_DEVICE_ID)".Trim()
+    if ([string]::IsNullOrWhiteSpace($expectedGpu0Uuid)) {
+        throw "UNISCAN_GPU_DEVICE_ID is required and must identify physical GPU index 0."
+    }
+    if ($expectedGpu0Uuid -notmatch '^GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$') {
+        throw (
+            "UNISCAN_GPU_DEVICE_ID must be a full NVIDIA GPU UUID in " +
+            "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx form."
+        )
+    }
 
     if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
         throw "nvidia-smi was not found; the permitted GPU0 cannot be attested."
@@ -26,11 +35,14 @@ function Assert-UniscanGpu0Contract {
     if ($values.Count -ne $fields.Count) {
         throw "GPU0 attestation returned an unexpected field count: $($rows[0])"
     }
-    if ($values[0] -ne "0" -or $values[1] -ne $script:UniscanExpectedGpu0Uuid) {
-        throw "GPU0 attestation mismatch: $($rows[0])"
+    if ($values[0] -ne "0" -or $values[1] -ne $expectedGpu0Uuid) {
+        throw (
+            "GPU0 attestation mismatch: expected index 0, UUID " +
+            "$expectedGpu0Uuid; got $($rows[0])."
+        )
     }
 
-    $env:UNISCAN_GPU_DEVICE_ID = $script:UniscanExpectedGpu0Uuid
+    $script:UniscanExpectedGpu0Uuid = $expectedGpu0Uuid
     $env:CUDA_VISIBLE_DEVICES = "0"
 
     $result = [ordered]@{}

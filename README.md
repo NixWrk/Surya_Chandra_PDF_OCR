@@ -49,9 +49,10 @@ Expected versions after a healthy setup:
 1. `.venv_surya`: `torch==2.11.0+<selected CUDA wheel>`, `torchvision==0.26.0+<selected CUDA wheel>`, `torchaudio==2.11.0+<selected CUDA wheel>`, `pillow>=10.2,<11.0`.
 2. `.venv_chandra`: `torch==2.11.0+<selected CUDA wheel>`, `torchvision==0.26.0+<selected CUDA wheel>`, `torchaudio==2.11.0+<selected CUDA wheel>`.
 
-`setup_dual_venv.cmd` first attests host GPU index `0` against UUID
-`GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f`, then selects the PyTorch CUDA
-wheel from that device only. Any missing/mismatched device is a hard failure.
+`setup_dual_venv.cmd` first attests host GPU index `0` against the UUID in
+`UNISCAN_GPU_DEVICE_ID`, then selects the PyTorch CUDA wheel from that device
+only. The UUID is host-local configuration and must not be committed. Any
+missing, malformed, or mismatched device is a hard failure.
 
 1. `cu126` for GPUs below compute capability `7.5`, for example GTX 1070 / Pascal `sm_61`.
 2. `cu128` for GPUs with compute capability `7.5` or newer.
@@ -130,6 +131,8 @@ Chandra venv:
 ```powershell
 git clone https://github.com/NixWrk/Surya_Chandra_PDF_OCR.git
 cd Surya_Chandra_PDF_OCR
+$env:UNISCAN_GPU_DEVICE_ID = (nvidia-smi --id=0 --query-gpu=uuid --format=csv,noheader,nounits).Trim()
+# For Docker, also copy .env.example to ignored .env and store this UUID there.
 .\setup_dual_venv.cmd
 .\run_basic_gui.cmd
 ```
@@ -427,7 +430,7 @@ Docker GPU requirements:
 Quick GPU check:
 
 ```powershell
-docker run --rm --gpus "device=GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f" `
+docker run --rm --gpus "device=$env:UNISCAN_GPU_DEVICE_ID" `
   nvidia/cuda:12.8.1-base-ubuntu22.04 `
   nvidia-smi --id=0 --query-gpu=index,uuid,name --format=csv,noheader
 ```

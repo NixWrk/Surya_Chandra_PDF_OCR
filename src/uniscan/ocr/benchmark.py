@@ -79,8 +79,9 @@ _MAX_CHANDRA_ATTEMPT_IMAGE_PIXELS = 50_000_000
 _MAX_CHANDRA_ATTEMPT_IMAGE_DIMENSION = 32_768
 _SURYA_DIRECT_EXECUTION_PATHS = ("cli", "module")
 _SURYA_MODULE_EXECUTION_PATHS = ("module",)
-_EXPECTED_GPU0_UUID = "GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f"
-_EXPECTED_GPU0_DOCKER_SELECTOR = f"device={_EXPECTED_GPU0_UUID}"
+_GPU_UUID_PATTERN = re.compile(
+    r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE
+)
 _OCR_OUTCOME_TEXT = "text"
 _OCR_OUTCOME_VERIFIED_BLANK = "verified_blank"
 _OCR_OUTCOME_EXPLICIT_NONTEXT = "explicit_nontext"
@@ -1387,15 +1388,20 @@ def _configure_cpu_only_runtime() -> str:
     return "cpu"
 
 
+def _configured_gpu0_uuid() -> str:
+    configured_uuid = (os.environ.get("UNISCAN_GPU_DEVICE_ID") or "").strip()
+    if not _GPU_UUID_PATTERN.fullmatch(configured_uuid):
+        raise RuntimeError(
+            "UNISCAN_GPU_DEVICE_ID is required and must be a full NVIDIA GPU UUID "
+            "in GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx form."
+        )
+    return configured_uuid
+
+
 def _require_gpu0_contract(
     run_cmd: RunCommand = subprocess.run,
 ) -> str:
-    configured_uuid = (os.environ.get("UNISCAN_GPU_DEVICE_ID") or "").strip()
-    if configured_uuid != _EXPECTED_GPU0_UUID:
-        raise RuntimeError(
-            "UNISCAN_GPU_DEVICE_ID must identify the permitted GPU0 UUID "
-            f"({_EXPECTED_GPU0_UUID}); got {configured_uuid or '<unset>'}."
-        )
+    configured_uuid = _configured_gpu0_uuid()
     visible = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
     if visible != "0":
         raise RuntimeError(f"CUDA_VISIBLE_DEVICES must be exactly 0; got {visible or '<unset>'}.")
@@ -1421,9 +1427,13 @@ def _require_gpu0_contract(
     if len(rows) != 1:
         raise RuntimeError(f"GPU0 attestation must return exactly one row; got {len(rows)}.")
     fields = [field.strip() for field in rows[0].split(",")]
-    if len(fields) != 2 or fields[0] != "0" or fields[1] != _EXPECTED_GPU0_UUID:
+    if (
+        len(fields) != 2
+        or fields[0] != "0"
+        or fields[1].casefold() != configured_uuid.casefold()
+    ):
         raise RuntimeError(f"GPU0 attestation mismatch: {rows[0]!r}.")
-    return _EXPECTED_GPU0_UUID
+    return configured_uuid
 
 
 def _torch_cuda_probe() -> tuple[bool, str]:
@@ -4876,13 +4886,15 @@ def _run_olmocr_docker(
     require_gpu = _env_bool("UNISCAN_OLMOCR_REQUIRE_GPU", default=True)
     configured_gpu = (os.environ.get("UNISCAN_OLMOCR_DOCKER_GPU") or "").strip()
     if require_gpu:
-        gpu = configured_gpu or _EXPECTED_GPU0_DOCKER_SELECTOR
-        if gpu != _EXPECTED_GPU0_DOCKER_SELECTOR:
+        configured_gpu0_uuid = _configured_gpu0_uuid()
+        expected_gpu_selector = f"device={configured_gpu0_uuid}"
+        gpu = configured_gpu or expected_gpu_selector
+        if gpu != expected_gpu_selector:
             raise RuntimeError(
                 "GPU-required olmOCR requires UNISCAN_OLMOCR_DOCKER_GPU="
-                f"{_EXPECTED_GPU0_DOCKER_SELECTOR!r}; got {gpu or '<unset>'!r}."
+                f"{expected_gpu_selector!r}; got {gpu or '<unset>'!r}."
             )
-        _require_gpu0_contract(run_cmd)
+        attested_gpu0_uuid = _require_gpu0_contract(run_cmd)
     else:
         if configured_gpu and configured_gpu.lower() != "none":
             raise RuntimeError(
@@ -4930,8 +4942,8 @@ def _run_olmocr_docker(
     if require_gpu:
         command.extend(["--gpus", gpu])
         command.extend(["--env", "CUDA_VISIBLE_DEVICES=0"])
-        command.extend(["--env", f"NVIDIA_VISIBLE_DEVICES={_EXPECTED_GPU0_UUID}"])
-        command.extend(["--env", f"UNISCAN_GPU_DEVICE_ID={_EXPECTED_GPU0_UUID}"])
+        command.extend(["--env", f"NVIDIA_VISIBLE_DEVICES={attested_gpu0_uuid}"])
+        command.extend(["--env", f"UNISCAN_GPU_DEVICE_ID={attested_gpu0_uuid}"])
     else:
         command.extend(["--env", "CUDA_VISIBLE_DEVICES="])
         command.extend(["--env", "NVIDIA_VISIBLE_DEVICES=none"])
@@ -5042,7 +5054,7 @@ def _run_olmocr_direct(
     errors: list[str] = []
     if backend in {"auto", "local"}:
         if require_gpu:
-            _require_gpu0_contract(run_cmd)
+            attested_gpu0_uuid = _require_gpu0_contract(run_cmd)
         command_candidates: list[list[str]] = []
         olmocr_cmd = which_fn("olmocr") or which_fn("olmocr.exe")
         if olmocr_cmd:
@@ -5056,8 +5068,8 @@ def _run_olmocr_direct(
                 command_env = dict(os.environ)
                 if require_gpu:
                     command_env["CUDA_VISIBLE_DEVICES"] = "0"
-                    command_env["NVIDIA_VISIBLE_DEVICES"] = _EXPECTED_GPU0_UUID
-                    command_env["UNISCAN_GPU_DEVICE_ID"] = _EXPECTED_GPU0_UUID
+                    command_env["NVIDIA_VISIBLE_DEVICES"] = attested_gpu0_uuid
+                    command_env["UNISCAN_GPU_DEVICE_ID"] = attested_gpu0_uuid
                     command_env["TORCH_DEVICE"] = "cuda:0"
                 else:
                     _hide_gpu_visibility(command_env)

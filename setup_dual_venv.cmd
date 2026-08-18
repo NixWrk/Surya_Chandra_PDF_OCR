@@ -14,8 +14,10 @@ set "SURYA_HF_HUB_CACHE=%SURYA_HF_HOME%\hub"
 set "SURYA_MODEL_CACHE_DIR=%CD%\.surya_cache"
 set "SURYA_MODELSCOPE_CACHE=%CD%\.modelscope_cache"
 set "SETUPTOOLS_VERSION=70.2.0"
-set "EXPECTED_GPU0_UUID=GPU-e6a8c006-5017-6126-01cc-bf9bd972bf4f"
-set "UNISCAN_GPU_DEVICE_ID=%EXPECTED_GPU0_UUID%"
+if not defined UNISCAN_GPU_DEVICE_ID (
+  echo [dual-venv] ERROR: UNISCAN_GPU_DEVICE_ID is required.
+  exit /b 1
+)
 set "CUDA_VISIBLE_DEVICES=0"
 
 if not exist "%UV_CACHE_DIR%" mkdir "%UV_CACHE_DIR%"
@@ -132,8 +134,8 @@ if not "%GPU0_INDEX%"=="0" (
   echo [dual-venv] ERROR: GPU0 attestation returned index %GPU0_INDEX%; expected 0.
   exit /b 1
 )
-if not "%GPU0_UUID%"=="%EXPECTED_GPU0_UUID%" (
-  echo [dual-venv] ERROR: GPU0 UUID mismatch: %GPU0_UUID%.
+if /I not "%GPU0_UUID%"=="%UNISCAN_GPU_DEVICE_ID%" (
+  echo [dual-venv] ERROR: GPU0 UUID mismatch: expected %UNISCAN_GPU_DEVICE_ID%; got %GPU0_UUID%.
   exit /b 1
 )
 exit /b 0

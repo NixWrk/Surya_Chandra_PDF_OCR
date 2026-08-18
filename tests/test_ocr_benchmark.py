@@ -27,6 +27,7 @@ from uniscan.ocr import (
     run_ocr_benchmark,
     sample_pdf_page_indices,
 )
+FAKE_GPU0_UUID = "GPU-11111111-2222-3333-4444-555555555555"
 
 FIXTURE_PDF = Path(r"J:\Imaging Edge Mobile\Imaging Edge Mobile_paddleocr_uvdoc.pdf")
 ALL_ENGINES = (
@@ -140,14 +141,14 @@ def test_collect_surya_batch_removes_punctuation_only_geometry(tmp_path: Path) -
 
 
 def _set_exact_gpu0_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("UNISCAN_GPU_DEVICE_ID", ocr_benchmark_mod._EXPECTED_GPU0_UUID)
+    monkeypatch.setenv("UNISCAN_GPU_DEVICE_ID", FAKE_GPU0_UUID)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
 
 
 def _gpu0_attestation_result() -> SimpleNamespace:
     return SimpleNamespace(
         returncode=0,
-        stdout=f"0, {ocr_benchmark_mod._EXPECTED_GPU0_UUID}\n",
+        stdout=f"0, {FAKE_GPU0_UUID}\n",
         stderr="",
     )
 
@@ -1008,10 +1009,10 @@ def test_olmocr_docker_defaults_single_page_to_permissive_error_rate(tmp_path, m
     assert text == "ok"
     assert chars == 2
     command = captured["command"]
-    assert command[command.index("--gpus") + 1] == ocr_benchmark_mod._EXPECTED_GPU0_DOCKER_SELECTOR
+    assert command[command.index("--gpus") + 1] == f"device={FAKE_GPU0_UUID}"
     assert "CUDA_VISIBLE_DEVICES=0" in command
-    assert f"NVIDIA_VISIBLE_DEVICES={ocr_benchmark_mod._EXPECTED_GPU0_UUID}" in command
-    assert f"UNISCAN_GPU_DEVICE_ID={ocr_benchmark_mod._EXPECTED_GPU0_UUID}" in command
+    assert f"NVIDIA_VISIBLE_DEVICES={FAKE_GPU0_UUID}" in command
+    assert f"UNISCAN_GPU_DEVICE_ID={FAKE_GPU0_UUID}" in command
     assert "--max_page_error_rate" in command
     assert command[command.index("--max_page_error_rate") + 1] == "1.0"
 
@@ -1107,6 +1108,7 @@ def test_olmocr_docker_rejects_unscoped_gpu_selector(tmp_path, monkeypatch) -> N
     image_path = tmp_path / "p1.png"
     image_path.write_bytes(b"fake")
     monkeypatch.setenv("UNISCAN_OLMOCR_DOCKER_GPU", "all")
+    _set_exact_gpu0_environment(monkeypatch)
     monkeypatch.setattr(
         ocr_benchmark_mod,
         "_render_images_to_pdf",
@@ -1163,7 +1165,7 @@ def test_olmocr_docker_cpu_mode_never_queries_or_reserves_gpu(tmp_path, monkeypa
     [
         (None, "0", "UNISCAN_GPU_DEVICE_ID"),
         ("GPU-wrong", "0", "UNISCAN_GPU_DEVICE_ID"),
-        (ocr_benchmark_mod._EXPECTED_GPU0_UUID, "1", "CUDA_VISIBLE_DEVICES"),
+        (FAKE_GPU0_UUID, "1", "CUDA_VISIBLE_DEVICES"),
     ],
 )
 def test_olmocr_local_and_auto_block_invalid_gpu0_contract_before_launch(
@@ -1213,8 +1215,8 @@ def test_olmocr_local_attests_gpu0_before_backend_launch(tmp_path, monkeypatch) 
         events.append("backend")
         environment = kwargs["env"]
         assert environment["CUDA_VISIBLE_DEVICES"] == "0"
-        assert environment["NVIDIA_VISIBLE_DEVICES"] == ocr_benchmark_mod._EXPECTED_GPU0_UUID
-        assert environment["UNISCAN_GPU_DEVICE_ID"] == ocr_benchmark_mod._EXPECTED_GPU0_UUID
+        assert environment["NVIDIA_VISIBLE_DEVICES"] == FAKE_GPU0_UUID
+        assert environment["UNISCAN_GPU_DEVICE_ID"] == FAKE_GPU0_UUID
         assert environment["TORCH_DEVICE"] == "cuda:0"
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -1260,20 +1262,18 @@ def test_olmocr_local_cpu_mode_hides_inherited_gpu_without_query(tmp_path, monke
 
 def test_gpu0_contract_attests_exact_uuid_and_index(monkeypatch) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setenv("UNISCAN_GPU_DEVICE_ID", ocr_benchmark_mod._EXPECTED_GPU0_UUID)
+    monkeypatch.setenv("UNISCAN_GPU_DEVICE_ID", FAKE_GPU0_UUID)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
 
     def fake_run(command, **_kwargs):
         calls.append(command)
         return SimpleNamespace(
             returncode=0,
-            stdout=f"0, {ocr_benchmark_mod._EXPECTED_GPU0_UUID}\n",
+            stdout=f"0, {FAKE_GPU0_UUID}\n",
             stderr="",
         )
 
-    assert (
-        ocr_benchmark_mod._require_gpu0_contract(fake_run) == ocr_benchmark_mod._EXPECTED_GPU0_UUID
-    )
+    assert ocr_benchmark_mod._require_gpu0_contract(fake_run) == FAKE_GPU0_UUID
     assert calls == [
         [
             "nvidia-smi",
@@ -1298,8 +1298,8 @@ def test_gpu0_contract_rejects_missing_environment(monkeypatch) -> None:
     ("configured_uuid", "visible", "error"),
     [
         ("GPU-wrong", "0", "UNISCAN_GPU_DEVICE_ID"),
-        (ocr_benchmark_mod._EXPECTED_GPU0_UUID, "", "CUDA_VISIBLE_DEVICES"),
-        (ocr_benchmark_mod._EXPECTED_GPU0_UUID, "1", "CUDA_VISIBLE_DEVICES"),
+        (FAKE_GPU0_UUID, "", "CUDA_VISIBLE_DEVICES"),
+        (FAKE_GPU0_UUID, "1", "CUDA_VISIBLE_DEVICES"),
     ],
 )
 def test_gpu0_contract_rejects_wrong_uuid_or_visibility_before_query(
@@ -2269,7 +2269,7 @@ def test_chandra_optional_legacy_preference_never_probes_gpu(monkeypatch) -> Non
     [
         (None, "0", "UNISCAN_GPU_DEVICE_ID"),
         ("GPU-wrong", "0", "UNISCAN_GPU_DEVICE_ID"),
-        (ocr_benchmark_mod._EXPECTED_GPU0_UUID, "1", "CUDA_VISIBLE_DEVICES"),
+        (FAKE_GPU0_UUID, "1", "CUDA_VISIBLE_DEVICES"),
     ],
 )
 def test_gpu_required_runtime_blocks_invalid_contract_before_cuda_backend(
