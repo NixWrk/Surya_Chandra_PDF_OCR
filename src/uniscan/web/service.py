@@ -53,6 +53,29 @@ class _PayloadTooLarge(ValueError):
     pass
 
 
+class _InvalidPdfAdmission(ValueError):
+    pass
+
+
+def _validate_pdf_admission(payload: bytes) -> None:
+    try:
+        import fitz
+    except Exception as exc:
+        raise RuntimeError("PDF admission validation requires PyMuPDF.") from exc
+
+    try:
+        with fitz.open(stream=payload, filetype="pdf") as document:
+            if bool(document.is_encrypted) or bool(document.needs_pass):
+                raise _InvalidPdfAdmission("Encrypted PDF uploads are not supported.")
+            page_count = int(document.page_count)
+            if page_count < 1:
+                raise _InvalidPdfAdmission("Invalid PDF upload: document has no pages.")
+    except _InvalidPdfAdmission:
+        raise
+    except Exception as exc:
+        raise _InvalidPdfAdmission("Invalid PDF upload.") from exc
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -2001,6 +2024,7 @@ def _build_handler(
                 payload = self._read_request_body()
                 if not payload:
                     raise ValueError("Request body is empty. Send raw PDF bytes.")
+                _validate_pdf_admission(payload)
                 mode, pages_raw, lang, strict, filename, delete_original_text_layer = _parse_job_request(
                     parsed,
                     default_lang=default_lang,

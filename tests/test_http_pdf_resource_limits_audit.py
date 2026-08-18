@@ -55,6 +55,17 @@ def _post_pdf(server: ThreadingHTTPServer, payload: bytes) -> tuple[int, dict[st
         conn.close()
 
 
+def _valid_pdf_bytes(marker: str = "") -> bytes:
+    document = fitz.open()
+    try:
+        page = document.new_page(width=72, height=72)
+        if marker:
+            page.insert_text((10, 20), marker)
+        return document.tobytes()
+    finally:
+        document.close()
+
+
 def _encrypted_pdf_bytes() -> bytes:
     document = fitz.open()
     try:
@@ -68,31 +79,21 @@ def _encrypted_pdf_bytes() -> bytes:
         document.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The HTTP API only checks non-empty bytes at admission; PDF parsing is deferred "
-        "to the asynchronous worker."
-    ),
-)
 def test_http_should_reject_malformed_pdf_before_accepting_job(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with _http_server(tmp_path, monkeypatch) as server:
-        status, payload = _post_pdf(server, b"this is not a PDF")
+        status, payload = _post_pdf(
+            server,
+            b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\n",
+        )
 
     assert status == HTTPStatus.BAD_REQUEST
     assert "PDF" in str(payload.get("error", ""))
+    assert not list((tmp_path / "work" / "jobs").glob("*/input.pdf"))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The HTTP API does not inspect encryption state before persisting and queueing "
-        "the uploaded PDF."
-    ),
-)
 def test_http_should_reject_encrypted_pdf_before_accepting_job(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -102,6 +103,7 @@ def test_http_should_reject_encrypted_pdf_before_accepting_job(
 
     assert status == HTTPStatus.BAD_REQUEST
     assert "encrypt" in str(payload.get("error", "")).lower()
+    assert not list((tmp_path / "work" / "jobs").glob("*/input.pdf"))
 
 
 def test_http_accepts_pdf_above_chunk_size_without_page_count_admission_limit(
@@ -156,9 +158,10 @@ def test_http_queue_accepts_jobs_beyond_worker_concurrency_without_admission_bou
             monkeypatch,
             build_searchable_pdf=blocked_build,
         ) as server:
+            queue_payload = _valid_pdf_bytes("queue-pressure-audit")
             submissions = []
             for _ in range(32):
-                status, payload = _post_pdf(server, b"%PDF queue-pressure-audit")
+                status, payload = _post_pdf(server, queue_payload)
                 assert status == HTTPStatus.ACCEPTED
                 submissions.append(payload)
             assert started.wait(timeout=2)

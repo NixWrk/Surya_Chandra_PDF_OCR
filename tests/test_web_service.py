@@ -29,6 +29,19 @@ from uniscan.web.service import (
 )
 
 
+def _valid_pdf_bytes(marker: str = "") -> bytes:
+    import fitz
+
+    document = fitz.open()
+    try:
+        page = document.new_page(width=72, height=72)
+        if marker:
+            page.insert_text((10, 20), marker)
+        return document.tobytes()
+    finally:
+        document.close()
+
+
 def test_run_http_server_closes_cleanly_on_sigterm(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1027,7 +1040,7 @@ def test_http_jobs_are_processed_one_document_at_a_time(tmp_path: Path, monkeypa
         first_conn.request(
             "POST",
             "/api/jobs?filename=first.pdf",
-            body=b"%PDF first",
+            body=_valid_pdf_bytes("first"),
             headers={
                 "Content-Type": "application/pdf",
                 "X-Project-ID": "project-a",
@@ -1045,7 +1058,7 @@ def test_http_jobs_are_processed_one_document_at_a_time(tmp_path: Path, monkeypa
         second_conn.request(
             "POST",
             "/api/jobs?filename=second.pdf",
-            body=b"%PDF second",
+            body=_valid_pdf_bytes("second"),
             headers={
                 "Content-Type": "application/pdf",
                 "X-Project-ID": "project-b",
@@ -1123,7 +1136,7 @@ def test_http_keepalive_prevents_reclaim_during_long_build_without_progress(
         conn.request(
             "POST",
             "/api/jobs?filename=long.pdf",
-            body=b"%PDF long",
+            body=_valid_pdf_bytes("long"),
             headers={"Content-Type": "application/pdf"},
         )
         response = conn.getresponse()
@@ -1174,7 +1187,7 @@ def test_http_job_persists_input_pdf_before_accepting(tmp_path: Path, monkeypatc
 
     try:
         port = server.server_address[1]
-        body = b"%PDF durable input"
+        body = _valid_pdf_bytes("durable input")
         conn = http.client.HTTPConnection("127.0.0.1", port)
         conn.request(
             "POST",
@@ -1227,7 +1240,7 @@ def test_http_job_isolates_and_cleans_pipeline_work(tmp_path: Path, monkeypatch)
         conn.request(
             "POST",
             "/api/jobs?filename=input.pdf",
-            body=b"%PDF input",
+            body=_valid_pdf_bytes("input"),
             headers={"Content-Type": "application/pdf"},
         )
         response = conn.getresponse()
@@ -1347,7 +1360,7 @@ def test_http_job_result_supports_cyrillic_filename_header(tmp_path: Path, monke
         conn.request(
             "POST",
             f"/api/jobs?filename={quote(filename)}",
-            body=b"%PDF cyrillic",
+            body=_valid_pdf_bytes("cyrillic"),
             headers={"Content-Type": "application/pdf"},
         )
         response = conn.getresponse()
@@ -1502,7 +1515,7 @@ def test_http_priority_orders_waiting_jobs(tmp_path: Path, monkeypatch) -> None:
         conn.request(
             "POST",
             f"/api/jobs?filename={filename}",
-            body=f"%PDF {filename}".encode("ascii"),
+            body=_valid_pdf_bytes(filename),
             headers={"Content-Type": "application/pdf", "X-Priority": priority},
         )
         response = conn.getresponse()
@@ -1569,7 +1582,7 @@ def test_http_cancel_queued_job(tmp_path: Path, monkeypatch) -> None:
         conn.request(
             "POST",
             f"/api/jobs?filename={filename}",
-            body=f"%PDF {filename}".encode("ascii"),
+            body=_valid_pdf_bytes(filename),
             headers={"Content-Type": "application/pdf"},
         )
         response = conn.getresponse()
@@ -1627,7 +1640,7 @@ def test_http_job_idempotency_replays_existing_job(tmp_path: Path, monkeypatch) 
 
     try:
         port = server.server_address[1]
-        body = b"%PDF-1.4\n"
+        body = _valid_pdf_bytes("idempotency-replay")
         headers = {
             "Content-Type": "application/pdf",
             "X-Project-ID": "zotero",
@@ -1668,7 +1681,7 @@ def test_http_job_idempotency_retries_terminal_failed_job_with_same_fingerprint(
 ) -> None:
     work_root = tmp_path / "work"
     jobs_root = work_root / "jobs"
-    body = b"%PDF retry"
+    body = _valid_pdf_bytes("retry")
     input_sha256 = hashlib.sha256(body).hexdigest()
     fingerprint = _request_fingerprint(
         input_sha256=input_sha256,
@@ -1757,9 +1770,10 @@ def test_http_job_idempotency_rejects_conflicting_request(tmp_path: Path, monkey
             "Content-Type": "application/pdf",
             "X-Idempotency-Key": "same-key",
         }
+        body = _valid_pdf_bytes("conflict")
 
         conn = http.client.HTTPConnection("127.0.0.1", port)
-        conn.request("POST", "/api/jobs?mode=chandra+surya", body=b"%PDF A", headers=headers)
+        conn.request("POST", "/api/jobs?mode=chandra+surya", body=body, headers=headers)
         first_response = conn.getresponse()
         first_response.read()
         conn.close()
@@ -1768,7 +1782,7 @@ def test_http_job_idempotency_rejects_conflicting_request(tmp_path: Path, monkey
 
         conn = http.client.HTTPConnection("127.0.0.1", port)
         conn.request(
-            "POST", "/api/jobs?mode=chandra+surya&lang=eng", body=b"%PDF A", headers=headers
+            "POST", "/api/jobs?mode=chandra+surya&lang=eng", body=body, headers=headers
         )
         second_response = conn.getresponse()
         second_payload = json.loads(second_response.read().decode("utf-8"))
@@ -1957,7 +1971,7 @@ def test_http_watchdog_does_not_publish_result_from_reclaimed_worker(
         conn.request(
             "POST",
             "/api/jobs?filename=race.pdf",
-            body=b"%PDF race",
+            body=_valid_pdf_bytes("race"),
             headers={"Content-Type": "application/pdf"},
         )
         response = conn.getresponse()
