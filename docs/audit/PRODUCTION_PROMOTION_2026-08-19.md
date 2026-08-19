@@ -130,8 +130,9 @@ parent bind did not override the image's `/data/work` volume. It is valid for
 the narrow before/after code comparison documented in
 `PREMERGE_EVIDENCE_PERFORMANCE_2026-08-19.md`, but it is not directly comparable
 to this production-like Windows-bind series. The new median therefore becomes
-the operational storage baseline; the 256.788-second median residual is the next
-profiling target.
+the operational Windows-bind baseline. The 256.788-second median residual was
+subsequently profiled and addressed without removing validation; see
+`RESIDUAL_STORAGE_PROFILE_2026-08-19.md`.
 
 ## Production promotion
 
@@ -173,6 +174,31 @@ The corrected image `sha256:b774e4aa955df...` is tagged as both
 and the same 26-file SHA-256 manifest. It is healthy. The job store changed only by the
 expected additional completed synthetic smoke job.
 
+## Residual profile and storage promotion
+
+A standard-library profiler on the same `long-23p` fixture found 71,376
+`lstat` and 35,498 `stat` calls during one cache-hit validation/merge pass. On
+the Windows bind, those calls consumed about 148.18 seconds; SHA-256 consumed
+about 1.45 seconds. The same sealed cache and unchanged validation code took:
+
+| Storage | Cache-hit validation/merge |
+|---|---:|
+| Windows bind | 198.584 s |
+| Docker-managed volume | 31.031 s |
+
+Commit `5d7b7d2` adds a nested named volume only at
+`/data/work/runs/hybrid_chunk_cache`. Durable job inputs, SQLite metadata,
+retained evidence, and published PDFs remain under the host `./outputs` bind.
+The existing cache was copied with the service stopped and matched before start:
+1,854 files, 737,854,373 bytes, aggregate manifest SHA-256
+`bfbe1e51b4960448919f590bf81bde68f29a12436323929d62f7493ddc4a955c`.
+
+Production HTTP job `4eb0ea9d0611` then completed the fresh 23-page fixture in
+433.897 seconds, 162.902 seconds (27.296%) below the prior Windows-bind median.
+It produced 23 pages and 2,954,784 bytes with exact Ground Truth retention and
+zero partial failures. Successful-run cache cleanup restored the volume to the
+same 1,854 files and 737,854,373 bytes that existed before the smoke.
+
 ## Local evidence
 
 Raw ignored evidence is under:
@@ -194,8 +220,8 @@ Still open:
    available;
 2. representative raster-scan Ground Truth and controlled `mixed-layout`
    accuracy experiments;
-3. attribution and reduction of the production-bind residual without weakening
-   evidence, fingerprint, manifest, snapshot, or runtime-drift fences.
+3. repeated native-volume runs if a median/tail claim is required; the current
+   433.897-second production result is one accepted after-run.
 
 Rollback is local and does not delete newer job evidence:
 

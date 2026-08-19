@@ -38,6 +38,13 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
   quality gates with 596.799-second median wall time, 628.505-second observed
   maximum, 4.22 GB observed RAM peak, and 11,046 MiB peak GPU0 VRAM above
   background. A real async HTTP smoke also completed with exact retention.
+- The remaining production-bind residual is now attributed to path-heavy
+  integrity checks over the Windows bind, not to SHA-256 or OCR policy. A
+  fail-closed cache-hit A/B reduced validation/merge from 198.584 to 31.031
+  seconds on a Docker-managed volume. Commit `5d7b7d2` moves only the resumable
+  chunk cache there. Production job `4eb0ea9d0611` completed `long-23p` in
+  433.897 seconds with exact retention; all pre-existing jobs and cache files
+  were retained.
 - The synthetic run exposed a second OCR publication failure on `blank-graphics`.
   It was reproduced test-first and fixed by requiring sealed, recomputed blank
   raster evidence. The preserved run now rebuilds artifact-only as a valid
@@ -61,12 +68,12 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 
 ## Current verification
 
-The latest complete software suite was run on local `main` through production
-commit `1cb708c`:
+The latest complete software suite was run on local `main` through storage
+commit `5d7b7d2`:
 
 ```text
 python -m pytest -q
-679 passed, 9 skipped, 5 warnings in 208.99s
+680 passed, 9 skipped, 5 warnings in 216.47s
 ```
 
 There are no expected failures. The former malformed/encrypted admission xfails
@@ -76,7 +83,11 @@ Targeted verification also includes `164 passed, 1 skipped` for page
 reconciliation, `95 passed` for searchable-artifact assembly, Ruff, mypy, and
 `git diff --check`. A no-cache offline source-layer Docker build passed in both
 engine venvs, CLI help passed, and the preserved blank/graphics artifact rebuilt
-successfully. This is not a clean dependency build. Windows preflight still
+successfully. `docker compose config --quiet` and the read-only Docker new-PC
+preflight pass. The production container is healthy on image
+`sha256:b774e4aa955df...`; its 21 durable jobs have no active entries, and the
+accepted 23-page job `4eb0ea9d0611` remains `done`. This is not a clean
+dependency build. Windows preflight still
 reports that the existing Surya venv lacks the local `uniscan` install; it was
 not mutated.
 
@@ -106,6 +117,11 @@ seconds; observed maximum was 628.505 seconds; the observed RAM peak was
 background. This observed maximum is not a p95. See
 `PRODUCTION_PROMOTION_2026-08-19.md`.
 
+The storage follow-up kept the same production image and validation code. The
+named volume migration matched 1,854 files, 737,854,373 bytes, and aggregate
+manifest SHA-256 `bfbe1e51b4960448919f590bf81bde68f29a12436323929d62f7493ddc4a955c`
+before restart. See `RESIDUAL_STORAGE_PROFILE_2026-08-19.md`.
+
 ## Open high-value work
 
 Current order after the synthetic baseline and blank-page fix:
@@ -129,9 +145,6 @@ no global document registry or historical model-tree hashing.
    remains 30 days success/90 days failure unless overridden.
 6. Remove normal-response absolute paths only with a versioned compatibility
    decision; the service remains trusted-network-only.
-7. Instrument the production-bind 23-page residual (256.788-second median,
-   282.728-second observed maximum) before any further validation, rendering,
-   or storage optimization.
 
 The earlier checkpoint list is retained below as historical audit context:
 

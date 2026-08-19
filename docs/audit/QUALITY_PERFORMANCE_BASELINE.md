@@ -11,7 +11,7 @@ evidence and provenance are in `SYNTHETIC_OCR_BASELINE_2026-08-18.md` and
 
 | Signal | Result |
 |---|---|
-| Full software suite | 679 passed, 9 skipped, 5 warnings in 208.99 s through `1cb708c` |
+| Full software suite | 680 passed, 9 skipped, 5 warnings in 216.47 s through `5d7b7d2` |
 | Static checks | Ruff and mypy clean |
 | Synthetic corpus | Version 1.0.1, nine fixtures with hashed sources and Ground Truth |
 | Real-engine coverage | All nine fixtures exercised at least once across two immutable offline checkpoints |
@@ -19,6 +19,7 @@ evidence and provenance are in `SYNTHETIC_OCR_BASELINE_2026-08-18.md` and
 | Known accuracy target | `mixed-layout`: CER 0.287293, WER 0.366667, exact retention fail, mapping pass |
 | Long-document after fix | 23 pages, three chunks, all checks pass, 463.709 s wall; 49.760% faster than the preserved run |
 | Production-like repeat checkpoint | Three fresh runs: 596.799 s median, 628.505 s observed max, 4.22 GB observed RAM peak, 11,046 MiB GPU0 VRAM above background; quality passed in all runs |
+| Native-volume production after-run | 433.897 s wall; 27.296% below the Windows-bind median; exact retention pass, 23 pages, zero partial failures |
 
 The second checkpoint used clean source commit `3acda85`, immutable image
 `sha256:f470cf1520e43ae67b70bf63e5dded12235ebde07e5139c68307cb867b06bdc0`,
@@ -44,9 +45,17 @@ CER/WER, exact retention, mapping, and partial-failure gates. Wall median was
 596.799 seconds and the observed maximum was 628.505 seconds. The prior
 463.709-second run used an anonymous nested Docker work volume, so it remains a
 valid narrow before/after comparison but is not directly comparable to the new
-production-storage series. The production-bind residual median is 256.788
-seconds and remains a profiling target. Exact build, measurement, promotion,
-HTTP smoke, and rollback evidence is in
+production-storage series.
+
+The 256.788-second median residual was then profiled. A cache-hit A/B with OCR
+engine invocation forbidden took 198.584 seconds on the production Windows bind
+and 31.031 seconds on a Docker-managed volume. `lstat` plus `stat` self-time fell
+from about 148.18 seconds to 0.18 seconds, while SHA-256 stayed essentially
+unchanged at 1.45/1.42 seconds. Only the resumable chunk working cache moved to
+the native volume; durable jobs and results remain on the bind. The first fresh
+production HTTP after-run completed in 433.897 seconds with exact retention.
+This is one after-run, not a new median/tail series. Exact profiler, migration,
+quality, and rollback evidence is in `RESIDUAL_STORAGE_PROFILE_2026-08-19.md` and
 `PRODUCTION_PROMOTION_2026-08-19.md`.
 
 The versioned corpus includes procedural English, Russian, mixed layout,

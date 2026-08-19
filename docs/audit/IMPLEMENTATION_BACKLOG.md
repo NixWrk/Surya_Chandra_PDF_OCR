@@ -24,6 +24,11 @@ The original ranked matrix below remains the audit trail. Current disposition:
   image is now in local production with a rollback tag; three fresh production-
   bind `long-23p` runs provide median/observed-maximum latency and RAM/VRAM
   evidence without a quality regression.
+  The 256.788-second median residual is now attributed: a cache-hit A/B reduced
+  validation/merge from 198.584 seconds on the Windows bind to 31.031 seconds
+  on a Docker-managed volume. Commit `5d7b7d2` keeps durable jobs/results on the
+  bind and moves only the same-deployment chunk cache to that volume; a fresh
+  production HTTP `long-23p` run completed in 433.897 seconds with exact retention.
 - Deferred by evidence: thin MCP remains unnecessary without a consumer;
   cross-upgrade resume attestation is unnecessary without that requirement, and
   running cancellation (19) still depends on cooperative engine termination.
@@ -45,9 +50,6 @@ The current open order, which supersedes the numerical order for future work, is
    preserving active jobs, retained failures, model caches, and user sources.
 7. Incrementally reduce module size and duplicate validation only after the
    above behavior is protected by benchmarks.
-8. Profile the optimized 23-page production-bind residual (256.788-second median,
-   282.728-second observed maximum). Do not weaken the retained sealing,
-   fingerprint, manifest, snapshot, or runtime-drift fences.
 
 Storage constraint: successful HTTP run/chunk working data is removed by default
 unless `UNISCAN_KEEP_JOB_RUNS=1`; terminal job retention defaults to 30 days for
