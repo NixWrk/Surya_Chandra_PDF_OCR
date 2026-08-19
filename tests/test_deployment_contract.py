@@ -37,3 +37,19 @@ def test_shared_network_integration_is_an_explicit_override() -> None:
 
     assert 'name: "${UNISCAN_SHARED_NETWORK_NAME:-zotero-automation}"' in override
     assert "external: true" in override
+
+
+def test_compose_keeps_jobs_on_bind_and_uses_native_volume_for_chunk_cache() -> None:
+    compose = _read("docker-compose.yml")
+    architecture = _read("docs/ARCHITECTURE.md")
+    deployment = _read("docs/runbooks/NEW_PC_DEPLOYMENT.md")
+
+    assert "- ./outputs:/data/work" in compose
+    assert "- hybrid-chunk-cache:/data/work/runs/hybrid_chunk_cache" in compose
+    assert "hybrid-chunk-cache:" in compose
+    assert (
+        'name: "${UNISCAN_HYBRID_CACHE_VOLUME:-surya-chandra-ocr-hybrid-chunk-cache}"'
+        in compose
+    )
+    assert "Docker-managed volume" in architecture
+    assert "UNISCAN_HYBRID_CACHE_VOLUME" in deployment

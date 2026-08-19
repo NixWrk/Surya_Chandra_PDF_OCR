@@ -114,6 +114,16 @@ binds HTTP to localhost. The shared-network override attaches the same service
 to an explicitly pre-created external network. Windows uses two venvs because
 the accepted Surya and Chandra dependency sets differ.
 
+Durable job inputs, metadata, and published results remain on the host bind at
+`./outputs:/data/work`. The path-intensive, same-deployment resumable chunk
+cache is a nested Docker-managed volume at
+`/data/work/runs/hybrid_chunk_cache`. This keeps link, ownership, fingerprint,
+manifest, and TOCTOU validation fences intact while avoiding the high metadata
+latency of a Windows bind. The volume is working state, not a document registry;
+successful HTTP chunk caches are still removed by default. Its stable default
+name is `surya-chandra-ocr-hybrid-chunk-cache` and can be changed locally with
+`UNISCAN_HYBRID_CACHE_VOLUME`.
+
 Physical GPU0 is selected by a host-local `UNISCAN_GPU_DEVICE_ID`; the container
 sees only CUDA device index 0. Tracked configuration contains no host UUID.
 

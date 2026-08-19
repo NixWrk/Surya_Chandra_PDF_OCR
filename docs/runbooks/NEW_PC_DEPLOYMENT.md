@@ -54,6 +54,34 @@ docker compose ps
 curl.exe http://127.0.0.1:8000/health
 ```
 
+Compose creates a Docker-managed volume named
+`surya-chandra-ocr-hybrid-chunk-cache` for active resumable chunk work. Override
+the name only in the untracked `.env` when multiple deployments share one host:
+
+```dotenv
+UNISCAN_HYBRID_CACHE_VOLUME=my-uniscan-hybrid-cache
+```
+
+The volume does not replace `./outputs`: durable job inputs, SQLite metadata,
+published PDFs, and retained job evidence remain on the host bind. A missing or
+empty chunk-cache volume can make an interrupted job repeat OCR, but it does not
+remove an already published result or its durable input.
+
+Inspect the volume without starting OCR:
+
+```powershell
+$hybridCacheVolume = if ($env:UNISCAN_HYBRID_CACHE_VOLUME) {
+    $env:UNISCAN_HYBRID_CACHE_VOLUME
+} else {
+    "surya-chandra-ocr-hybrid-chunk-cache"
+}
+docker volume inspect $hybridCacheVolume
+docker compose config
+```
+
+Do not prune this volume while a job is running or while an interrupted run is
+expected to resume.
+
 Shared-network integration:
 
 ```powershell
@@ -89,6 +117,9 @@ without repairing it.
 
 Before updating, record the Git commit and Docker image ID. Back up operator
 configuration plus `outputs/jobs` or the configured `UNISCAN_WORK_ROOT/jobs`.
+Retain the named hybrid-cache volume when same-deployment interruption resume
+matters; it is not required to serve completed job results. Export it before a
+host migration only when preserving resumable work is worth the extra storage.
 Model caches may be large; preserve them if redownload time matters. Never copy
 a live SQLite database without stopping the service or using a consistent
 backup method.

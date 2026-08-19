@@ -35,6 +35,9 @@ services:
       - ./.surya_cache:/cache/surya_models
       - ./.modelscope_cache:/cache/modelscope
       - ./outputs:/data/work
+      # Path-heavy integrity checks are prohibitively slow on a Windows bind.
+      # Keep only resumable working chunks native; jobs/results stay in ./outputs.
+      - hybrid-chunk-cache:/data/work/runs/hybrid_chunk_cache
       - ./PDFs:/data/in
     deploy:
       resources:
@@ -44,3 +47,7 @@ services:
               device_ids: ["${UNISCAN_GPU_DEVICE_ID:?Set UNISCAN_GPU_DEVICE_ID in the local .env file}"]
               capabilities: [gpu]
     restart: "no"
+
+volumes:
+  hybrid-chunk-cache:
+    name: "${UNISCAN_HYBRID_CACHE_VOLUME:-surya-chandra-ocr-hybrid-chunk-cache}"
