@@ -30,6 +30,13 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
   runtime-drift fences. One comparable offline after-run reduced wall time from
   922.991 to 463.709 seconds while CER/WER remained zero and retention/mapping
   passed.
+- The clean `771b5de` source was rebuilt as an offline source/install layer,
+  matched against all 26 tracked production inputs, and promoted to the local
+  production service as image `sha256:72ad02bb45d...`; the old image remains
+  tagged for rollback. Three fresh production-bind `long-23p` runs passed all
+  quality gates with 596.799-second median wall time, 628.505-second observed
+  maximum, 4.22 GB observed RAM peak, and 11,046 MiB peak GPU0 VRAM above
+  background. A real async HTTP smoke also completed with exact retention.
 - The synthetic run exposed a second OCR publication failure on `blank-graphics`.
   It was reproduced test-first and fixed by requiring sealed, recomputed blank
   raster evidence. The preserved run now rebuilds artifact-only as a valid
@@ -84,10 +91,19 @@ immutable image from clean commit `1cb708c`, again with `--pull never`,
 `--network none`, offline settings, and read-only model caches. Wall time was
 463.709 seconds versus 922.991 seconds before. The model-free evaluator reports
 CER/WER zero, exact retention pass, page mapping pass, 23 output pages, and zero
-partial failures. This is one after-run; peak RAM/VRAM and median/tail latency
-remain open. Exact evidence is in
+partial failures. At that checkpoint, peak RAM/VRAM and median/tail latency
+remained open. Exact evidence is in
 `PREMERGE_EVIDENCE_PERFORMANCE_2026-08-19.md` and the ignored local benchmark
 directory named there.
+
+The follow-up production-like series closes the long-document repeat/resource
+measurement gap. It used fresh chunk caches, read-only model caches, network
+isolation, and an exact Windows `/data/work` bind. All three runs had CER/WER
+zero, retention/mapping pass, and zero partial failures. Wall median was 596.799
+seconds; observed maximum was 628.505 seconds; the observed RAM peak was
+4,221,952,852 bytes; and total GPU0 VRAM peaked 11,046 MiB above the immediate
+background. This observed maximum is not a p95. See
+`PRODUCTION_PROMOTION_2026-08-19.md`.
 
 ## Open high-value work
 
@@ -100,10 +116,10 @@ no global document registry or historical model-tree hashing.
 
 1. Validate clean dependency resolutions separately for Docker/Windows and
    `cu126`/`cu128`; the offline source-layer build is only partial evidence.
-2. Extend the real-engine baseline with median/tail timing, peak RAM/VRAM,
-   representative raster scans, and controlled `mixed-layout` experiments. The
-   procedural degraded/rotated/native-text/long fixtures now pass; the current
-   `mixed-layout` CER/WER remain `0.287293`/`0.366667`.
+2. Extend the real-engine baseline with representative raster scans and
+   controlled `mixed-layout` experiments. The procedural long fixture now has
+   repeat timing/resource evidence; the current `mixed-layout` CER/WER remain
+   `0.287293`/`0.366667`.
 3. Capture a preserved rejected candidate if the historical private
    exact-retention failure recurs; do not infer its root cause from a final PDF.
 4. Measure and define queue and page-count limits.
@@ -112,9 +128,9 @@ no global document registry or historical model-tree hashing.
    remains 30 days success/90 days failure unless overridden.
 6. Remove normal-response absolute paths only with a versioned compatibility
    decision; the service remains trusted-network-only.
-7. Repeat the 23-page after-run for median/tail latency and measure peak RAM/VRAM;
-   instrument the remaining approximately 61-second residual before any further
-   validation or rendering optimization.
+7. Instrument the production-bind 23-page residual (256.788-second median,
+   282.728-second observed maximum) before any further validation, rendering,
+   or storage optimization.
 
 The earlier checkpoint list is retained below as historical audit context:
 

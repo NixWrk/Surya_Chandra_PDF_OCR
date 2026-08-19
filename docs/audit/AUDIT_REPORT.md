@@ -19,10 +19,10 @@ reproduced before repair and are now protected by tests:
 Additional accepted fixes cover malformed/encrypted upload admission, bounded
 HTTP runtime shutdown, punctuation-only Chandra geometry, immutable per-run
 hybrid configuration, and sealed verified-blank artifact publication. The latest
-complete local software suite through production commit `c89b593` reports:
+complete local software suite through production commit `1cb708c` reports:
 
 ```text
-678 passed, 9 skipped, 5 warnings in 259.49s
+679 passed, 9 skipped, 5 warnings in 208.99s
 ```
 
 Ruff, mypy, and `git diff --check` are clean for the accepted changes. Detailed
@@ -40,15 +40,26 @@ chunk recomputed the same full evidence object twice in the immediate premerge
 loop. A test-first narrow fix retained all manifest, fingerprint, snapshot, and
 runtime-drift fences. One comparable offline after-run fell from 922.991 to
 463.709 seconds (-49.760%) with CER/WER zero, exact retention pass, page mapping
-pass, and no partial failures. Repeat median/tail latency and peak RAM/VRAM
-remain unmeasured.
+pass, and no partial failures.
+
+A follow-up production-like series rebuilt and attested all 26 tracked source
+inputs in image `sha256:72ad02bb45d...`, then ran three independent fresh-cache
+checkpoints on the production Windows bind. All quality gates passed. Wall
+median was 596.799 seconds, the observed maximum was 628.505 seconds, observed
+container RAM peaked at 4.22 GB, and total GPU0 VRAM peaked 11,046 MiB above
+background. The earlier anonymous-volume run remains valid for the narrow code
+comparison but is not a production-storage baseline. Exact evidence is in
+`PRODUCTION_PROMOTION_2026-08-19.md`.
 
 Deployment is materially less machine-specific: tracked GPU UUIDs were removed,
 the permitted GPU is configured locally, Compose has a standalone default,
 preflight/smoke/runbooks exist, and an offline no-cache source-layer Docker build
 passed without downloads. Per user decision, that build is accepted as partial
 new-PC evidence. It does not prove clean dependency/model provisioning or the
-currently incomplete Windows Surya venv.
+currently incomplete Windows Surya venv. The attested image is now the local
+production `latest` and immutable `prod-771b5de`; the old image is preserved as
+`rollback-f470cf-20260819`. The production async HTTP smoke completed and exact
+retention passed.
 
 CI, `AGENTS.md`, architecture/runbook documentation, and the repository-local
 operator skill are present. A thin MCP was assessed and intentionally deferred:
@@ -70,10 +81,11 @@ objects avoid downloads and preserve rollback/incident evidence.
 
 ## Highest-value remaining work
 
-1. Profile the 23-page wall-time gap, then optimize only a measured duplicate
-   render/validation/open/merge cost without weakening integrity gates.
-2. Repeat representative runs for median/tail latency and peak RAM/VRAM; add
-   reviewed raster-scan and dense mixed-layout Ground Truth.
+1. Profile the 256.788-second median production-bind residual, then optimize only
+   an attributed storage/render/validation/open/merge cost without weakening
+   integrity gates.
+2. Add reviewed raster-scan and dense mixed-layout Ground Truth and repeat those
+   representative accuracy cases.
 3. Run controlled `mixed-layout` experiments before accepting any OCR-policy
    change.
 4. Prove clean Docker/Windows dependency resolution when downloads or a clean

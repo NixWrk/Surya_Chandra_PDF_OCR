@@ -18,7 +18,7 @@ evidence and provenance are in `SYNTHETIC_OCR_BASELINE_2026-08-18.md` and
 | Added four-fixture accuracy | CER 0, WER 0, exact retention pass, page mapping pass |
 | Known accuracy target | `mixed-layout`: CER 0.287293, WER 0.366667, exact retention fail, mapping pass |
 | Long-document after fix | 23 pages, three chunks, all checks pass, 463.709 s wall; 49.760% faster than the preserved run |
-| Resource/latency limitation | Peak RAM/VRAM and median/tail latency not measured |
+| Production-like repeat checkpoint | Three fresh runs: 596.799 s median, 628.505 s observed max, 4.22 GB observed RAM peak, 11,046 MiB GPU0 VRAM above background; quality passed in all runs |
 
 The second checkpoint used clean source commit `3acda85`, immutable image
 `sha256:f470cf1520e43ae67b70bf63e5dded12235ebde07e5139c68307cb867b06bdc0`,
@@ -36,11 +36,24 @@ residual includes separately unmeasured validation. This is accepted evidence
 for the narrow fix, not a median/tail latency claim. See
 `PREMERGE_EVIDENCE_PERFORMANCE_2026-08-19.md`.
 
+A rebuilt offline source-layer image from clean `771b5de` was subsequently
+attested against all 26 tracked production inputs and promoted to the local
+production service. Three independent fresh-cache `long-23p` runs used the
+production Windows `/data/work` bind, captured raw RAM/VRAM samples, and passed
+CER/WER, exact retention, mapping, and partial-failure gates. Wall median was
+596.799 seconds and the observed maximum was 628.505 seconds. The prior
+463.709-second run used an anonymous nested Docker work volume, so it remains a
+valid narrow before/after comparison but is not directly comparable to the new
+production-storage series. The production-bind residual median is 256.788
+seconds and remains a profiling target. Exact build, measurement, promotion,
+HTTP smoke, and rollback evidence is in
+`PRODUCTION_PROMOTION_2026-08-19.md`.
+
 The versioned corpus includes procedural English, Russian, mixed layout,
 retention, graphics/blank, degraded vector text, rotation, native text, and a
 23-page chunked document. It is sufficient to block unmeasured OCR tuning, but
 not to claim production accuracy: representative raster scans, denser layouts,
-reviewed private Ground Truth, repeat runs, and resource peaks are still missing.
+and reviewed private Ground Truth are still missing.
 
 Resume provenance is intentionally narrow. It identifies only an active or
 explicitly retained same-deployment run so interrupted chunks cannot be mixed

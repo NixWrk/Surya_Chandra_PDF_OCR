@@ -20,7 +20,10 @@ The original ranked matrix below remains the audit trail. Current disposition:
   complete: dependency/runtime alignment (13–14), resource limits (18), and stale
   documentation (29). The proven duplicate immediate-premerge evidence pass is
   removed test-first at `1cb708c`; all integrity fences remain active and one
-  comparable real-engine after-run is accepted.
+  comparable real-engine after-run is accepted. An attested offline source-layer
+  image is now in local production with a rollback tag; three fresh production-
+  bind `long-23p` runs provide median/observed-maximum latency and RAM/VRAM
+  evidence without a quality regression.
 - Deferred by evidence: thin MCP remains unnecessary without a consumer;
   cross-upgrade resume attestation is unnecessary without that requirement, and
   running cancellation (19) still depends on cooperative engine termination.
@@ -29,10 +32,10 @@ The current open order, which supersedes the numerical order for future work, is
 
 1. Clean dependency-resolution evidence for Docker and Windows without changing
    OCR versions; the offline source-layer build is not a clean dependency build.
-2. Repeat the real-engine benchmark for median/tail latency and peak RAM/VRAM;
-   add representative raster-scan Ground Truth. Procedural rotated,
-   skew/noise/low-resolution, existing-text, and 23-page fixtures now have
-   passing real-engine evidence.
+2. Add representative raster-scan Ground Truth. Procedural rotated,
+   skew/noise/low-resolution, existing-text, and 23-page fixtures have passing
+   real-engine evidence; the long fixture now also has three-run latency and
+   resource evidence.
 3. Run controlled accuracy experiments against `mixed-layout` (baseline CER
    `0.287293`, WER `0.366667`) before changing OCR policy.
 4. Capture a preserved rejected candidate if the private exact-retention failure
@@ -42,9 +45,9 @@ The current open order, which supersedes the numerical order for future work, is
    preserving active jobs, retained failures, model caches, and user sources.
 7. Incrementally reduce module size and duplicate validation only after the
    above behavior is protected by benchmarks.
-8. Repeat the optimized 23-page checkpoint for median/tail latency, peak RAM/VRAM,
-   and the remaining approximately 61-second residual. Do not weaken the retained
-   sealing, fingerprint, manifest, snapshot, or runtime-drift fences.
+8. Profile the optimized 23-page production-bind residual (256.788-second median,
+   282.728-second observed maximum). Do not weaken the retained sealing,
+   fingerprint, manifest, snapshot, or runtime-drift fences.
 
 Storage constraint: successful HTTP run/chunk working data is removed by default
 unless `UNISCAN_KEEP_JOB_RUNS=1`; terminal job retention defaults to 30 days for
