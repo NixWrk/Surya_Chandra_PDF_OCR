@@ -71,7 +71,11 @@ Model cache locations:
 
 ## Project Status
 
-The production path was re-accepted on 2026-07-20. The intended user path is: clone the repository, run `setup_dual_venv.cmd`, then run `run_basic_gui.cmd`, the CLI, or the durable HTTP API.
+The Docker production OCR path was audit-accepted as complete on 2026-08-19.
+Its image, storage layout, quality/performance evidence, accepted limitations,
+and reopening conditions are recorded in
+[`docs/audit/OCR_ACCEPTANCE_CLOSURE_2026-08-19.md`](docs/audit/OCR_ACCEPTANCE_CLOSURE_2026-08-19.md).
+The intended user path is: clone the repository, run `setup_dual_venv.cmd`, then run `run_basic_gui.cmd`, the CLI, or the durable HTTP API.
 
 Completed baseline:
 

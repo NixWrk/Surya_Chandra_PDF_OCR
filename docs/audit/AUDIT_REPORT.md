@@ -2,10 +2,13 @@
 
 Audit code baseline: `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 
-Status: the audit, inventory, evidence-first integrity work, and first measurable
-OCR baseline are complete. The broader improvement roadmap remains open where it
-requires clean dependency resolution, another PC, repeated profiling, reviewed
-real-document Ground Truth, or a compatible running-job stop boundary.
+Status: accepted complete for the current production OCR scope on 2026-08-19.
+The audit, inventory, integrity repairs, reproducible baseline, measured
+performance work, deployment documentation, production promotion, and storage
+optimization are complete. No OCR task remains active. Evidence gaps that need
+another PC, new reviewed Ground Truth, a new incident, or a new product
+requirement are accepted as non-blocking limitations in
+`OCR_ACCEPTANCE_CLOSURE_2026-08-19.md`.
 
 ## Current disposition
 
@@ -19,10 +22,10 @@ reproduced before repair and are now protected by tests:
 Additional accepted fixes cover malformed/encrypted upload admission, bounded
 HTTP runtime shutdown, punctuation-only Chandra geometry, immutable per-run
 hybrid configuration, and sealed verified-blank artifact publication. The latest
-complete local software suite through production commit `1cb708c` reports:
+complete local software suite through storage commit `5d7b7d2` reports:
 
 ```text
-679 passed, 9 skipped, 5 warnings in 208.99s
+680 passed, 9 skipped, 5 warnings in 216.47s
 ```
 
 Ruff, mypy, and `git diff --check` are clean for the accepted changes. Detailed
@@ -51,6 +54,16 @@ background. The earlier anonymous-volume run remains valid for the narrow code
 comparison but is not a production-storage baseline. Exact evidence is in
 `PRODUCTION_PROMOTION_2026-08-19.md`.
 
+The remaining 256.788-second Windows-bind residual was then attributed without
+weakening validation. A fail-closed cache-hit A/B reduced validation/merge from
+198.584 seconds on the bind to 31.031 seconds on a Docker-managed volume while
+SHA-256 time stayed essentially unchanged. Commit `5d7b7d2` moves only the
+same-deployment hybrid chunk cache to that volume; durable inputs, job metadata,
+retained evidence, and results remain host files. Production HTTP job
+`4eb0ea9d0611` completed the fresh 23-page fixture in 433.897 seconds with exact
+retention and zero partial failures. This is one accepted after-run, not a p95
+claim. Exact evidence is in `RESIDUAL_STORAGE_PROFILE_2026-08-19.md`.
+
 Deployment is materially less machine-specific: tracked GPU UUIDs were removed,
 the permitted GPU is configured locally, Compose has a standalone default,
 preflight/smoke/runbooks exist, and an offline no-cache source-layer Docker build
@@ -65,8 +78,7 @@ retention passed.
 CI, `AGENTS.md`, architecture/runbook documentation, and the repository-local
 operator skill are present. A thin MCP was assessed and intentionally deferred:
 the HTTP API plus existing operator surfaces are sufficient until a concrete
-consumer requires MCP. License text was removed by user decision; no license is
-claimed.
+consumer requires MCP.
 
 No global registry or permanent history of processed documents is part of the
 design. Run identity, source/chunk hashes, and configuration exist only inside an
@@ -76,24 +88,25 @@ are not a document catalog.
 
 Local Docker cleanup reclaimed approximately 117.9 GB earlier in the audit.
 Current/rollback/incident images, model caches, user PDFs, jobs, and retained
-benchmark evidence were preserved. Additional build-cache/image deletion is not
-recommended merely because Docker labels bytes reclaimable; the remaining large
-objects avoid downloads and preserve rollback/incident evidence.
+benchmark evidence were preserved. A final inspection found no additional large
+object that was both clearly disposable and unrelated to historical stopped OCR
+containers or rollback/audit evidence. Additional broad pruning is therefore not
+part of closure.
 
-## Highest-value remaining work
+## Accepted non-blocking future candidates
 
-1. Profile the 256.788-second median production-bind residual, then optimize only
-   an attributed storage/render/validation/open/merge cost without weakening
-   integrity gates.
-2. Add reviewed raster-scan and dense mixed-layout Ground Truth and repeat those
+These are not active OCR tasks. Reopen them only for a new requirement, incident,
+or benchmark decision:
+
+1. Add reviewed raster-scan and dense mixed-layout Ground Truth and repeat those
    representative accuracy cases.
-3. Run controlled `mixed-layout` experiments before accepting any OCR-policy
+2. Run controlled `mixed-layout` experiments before accepting any OCR-policy
    change.
-4. Prove clean Docker/Windows dependency resolution when downloads or a clean
-   machine are available; retain the current offline build as partial evidence.
-5. Measure queue/page limits, design cooperative running cancellation, and add
+3. Replace the accepted partial clean-build evidence only when a genuinely clean
+   machine or prepared cache is available.
+4. Measure queue/page limits, design cooperative running cancellation, and add
    bounded quotas only for explicit persistent benchmark/resume caches.
-6. Capture the rejected candidate if the historical private exact-retention
+5. Capture the rejected candidate if the historical private exact-retention
    incident recurs; its root cause cannot be reconstructed from the final PDF.
 
 ## Initial audit snapshot (historical)

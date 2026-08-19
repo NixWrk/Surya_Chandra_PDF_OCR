@@ -3,9 +3,11 @@
 Audit code baseline: `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 
 Status: the initial software snapshot below is retained for audit history. The
-current accepted checkpoints and limitations are summarized here; exact raw
-evidence and provenance are in `SYNTHETIC_OCR_BASELINE_2026-08-18.md` and
-`PRIVATE_OCR_BASELINE_2026-08-18.md`.
+current checkpoints were accepted as a complete production OCR baseline on
+2026-08-19. Limitations are recorded rather than treated as active work. Exact
+raw evidence and provenance are in `SYNTHETIC_OCR_BASELINE_2026-08-18.md`,
+`PRIVATE_OCR_BASELINE_2026-08-18.md`, and
+`OCR_ACCEPTANCE_CLOSURE_2026-08-19.md`.
 
 ## Current accepted checkpoint
 

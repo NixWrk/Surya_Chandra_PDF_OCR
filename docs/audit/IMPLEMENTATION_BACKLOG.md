@@ -5,7 +5,7 @@ upgrade or deletion of user/run data.
 
 Priority order within the immediate integrity block is mandatory.
 
-## Execution disposition — 2026-08-18
+## Execution disposition — closed 2026-08-19
 
 The original ranked matrix below remains the audit trail. Current disposition:
 
@@ -33,7 +33,13 @@ The original ranked matrix below remains the audit trail. Current disposition:
   cross-upgrade resume attestation is unnecessary without that requirement, and
   running cancellation (19) still depends on cooperative engine termination.
 
-The current open order, which supersedes the numerical order for future work, is:
+By explicit user decision, the current production OCR workstream is accepted
+complete. No backlog item below is active or a release blocker. The ranked matrix
+is retained as audit history, not as an instruction to continue implementation.
+See `OCR_ACCEPTANCE_CLOSURE_2026-08-19.md`.
+
+If a new requirement or incident reopens the workstream, evaluate these deferred
+candidates against a new benchmark before implementation:
 
 1. Clean dependency-resolution evidence for Docker and Windows without changing
    OCR versions; the offline source-layer build is not a clean dependency build.

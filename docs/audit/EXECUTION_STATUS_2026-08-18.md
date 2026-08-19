@@ -1,7 +1,19 @@
 # Audit execution status — 2026-08-18
 
-This is an evidence checkpoint, not a claim that the full audit plan is complete.
+This began as an evidence checkpoint. On 2026-08-19 the user accepted the current
+production OCR scope as complete. No OCR audit, repair, tuning, or measurement
+task remains active. Historical gaps below are retained as evidence and future
+reopening conditions, not current blockers. The authoritative closure is
+`OCR_ACCEPTANCE_CLOSURE_2026-08-19.md`.
+
 The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
+
+## Closure decision
+
+The accepted production checkpoint is storage commit `5d7b7d2`, image
+`sha256:b774e4aa955df...`, and the evidence-only closure documentation commit
+that records this decision. Existing guardrails remain in force for any future
+change; closure is not permission for unmeasured OCR or model changes.
 
 ## Accepted changes
 
@@ -122,9 +134,11 @@ named volume migration matched 1,854 files, 737,854,373 bytes, and aggregate
 manifest SHA-256 `bfbe1e51b4960448919f590bf81bde68f29a12436323929d62f7493ddc4a955c`
 before restart. See `RESIDUAL_STORAGE_PROFILE_2026-08-19.md`.
 
-## Open high-value work
+## Accepted future reopening candidates
 
-Current order after the synthetic baseline and blank-page fix:
+Nothing in this section is active at closure. If a new incident or product
+requirement reopens OCR work, reassess these candidates using the preserved
+baseline:
 
 Accepted boundary: resumable caches are same-deployment only. The update runbook
 requires a fresh cache root after code/runtime/model changes. Richer attestation

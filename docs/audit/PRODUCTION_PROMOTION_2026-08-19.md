@@ -212,9 +212,11 @@ raw resource samples, summaries, evaluator inputs/reports, container logs,
 production HTTP smoke result/metadata, host/container source manifests, and the
 final corrected-image label/manifest summary.
 
-## Remaining limits and rollback
+## Accepted limitations and rollback
 
-Still open:
+The user accepted the current production OCR checkpoint as complete on
+2026-08-19. The following evidence limits are documented but do not keep an OCR
+task open:
 
 1. a clean dependency/model build when downloads or a prepared clean cache are
    available;
@@ -222,6 +224,9 @@ Still open:
    accuracy experiments;
 3. repeated native-volume runs if a median/tail claim is required; the current
    433.897-second production result is one accepted after-run.
+
+Reopen measurement or implementation only for a new incident, requirement,
+engine/model change, or benchmark regression.
 
 Rollback is local and does not delete newer job evidence:
 
