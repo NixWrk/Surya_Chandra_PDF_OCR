@@ -40,8 +40,9 @@ The accepted fallback was a `--no-cache`, `--network none`, `--pull=false`
 source/install-layer rebuild on top of the preserved immutable image:
 
 ```text
-base:      sha256:f470cf1520e43ae67b70bf63e5dded12235ebde07e5139c68307cb867b06bdc0
-candidate: sha256:72ad02bb45d162612fcc9ea9bf74feca6c9f4e44d314dce292dfa572019d1d16
+base:       sha256:f470cf1520e43ae67b70bf63e5dded12235ebde07e5139c68307cb867b06bdc0
+measured:   sha256:72ad02bb45d162612fcc9ea9bf74feca6c9f4e44d314dce292dfa572019d1d16
+production: sha256:b774e4aa955df82b24b360027e8b084576ad5f6b18a5251a6f9bf7cc848fd42b
 ```
 
 Both `/opt/venvs/surya` and `/opt/venvs/chandra` reinstalled the current
@@ -51,7 +52,7 @@ engine, or model provisioning.
 
 ## Image attestation
 
-The candidate label records full source revision
+The source-layer candidate and final production labels record full source revision
 `771b5de5465278495dda80d06a7a2413db3a7ca1`. The following checks passed:
 
 - all 26 tracked production inputs (`src/` plus `pyproject.toml`, `README.md`,
@@ -143,11 +144,9 @@ surya-chandra-ocr:rollback-f470cf-20260819
 sha256:f470cf1520e43ae67b70bf63e5dded12235ebde07e5139c68307cb867b06bdc0
 ```
 
-The accepted image is tagged as both `surya-chandra-ocr:prod-771b5de` and the
-Compose pointer `surya-chandra-ocr:latest`. The no-build, force-recreate Compose
-command recreated only the OCR service. The running container
-reports image `sha256:72ad02bb45d...`, the same 26-file source manifest, pipeline
-revision `v11`, and healthy durable job storage with all pre-existing records.
+The measured image `sha256:72ad02bb45d...` was initially promoted with a
+no-build, force-recreate Compose command. The running container matched the same
+26-file source manifest and retained all pre-existing durable job records.
 
 A real async HTTP smoke then submitted the one-page generated `clean-en` fixture:
 
@@ -161,7 +160,17 @@ page count:      1
 exact retention: pass
 ```
 
-The service remained healthy after the smoke. The job store changed only by the
+After the smoke, a stale inherited custom label was found: it advertised
+pipeline `v10` even though the attested runtime code was `v11`. A network-free,
+metadata-only image was built directly from the exact measured image. It adds no
+filesystem changes and overrides the source/pipeline labels to the attested
+revision. The exact measured image remains tagged `measured-771b5de`.
+
+The corrected image `sha256:b774e4aa955df...` is tagged as both
+`surya-chandra-ocr:prod-771b5de` and the Compose pointer
+`surya-chandra-ocr:latest`. The final running container reports source revision
+`771b5de...`, pipeline revision `chandra-surya-resumable-v11`, production role,
+and the same 26-file SHA-256 manifest. It is healthy. The job store changed only by the
 expected additional completed synthetic smoke job.
 
 ## Local evidence
@@ -174,7 +183,8 @@ outputs/audit_synthetic_baseline/v1_0_1/prod-771b5de-multirun/
 
 It contains the runtime-generated fixture, three independent output/work trees,
 raw resource samples, summaries, evaluator inputs/reports, container logs,
-production HTTP smoke result/metadata, and host/container source manifests.
+production HTTP smoke result/metadata, host/container source manifests, and the
+final corrected-image label/manifest summary.
 
 ## Remaining limits and rollback
 

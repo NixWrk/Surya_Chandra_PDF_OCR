@@ -31,8 +31,9 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
   922.991 to 463.709 seconds while CER/WER remained zero and retention/mapping
   passed.
 - The clean `771b5de` source was rebuilt as an offline source/install layer,
-  matched against all 26 tracked production inputs, and promoted to the local
-  production service as image `sha256:72ad02bb45d...`; the old image remains
+  matched against all 26 tracked production inputs, and measured as image
+  `sha256:72ad02bb45d...`. A filesystem-identical metadata-corrected image
+  `sha256:b774e4aa955df...` is now in local production; the old image remains
   tagged for rollback. Three fresh production-bind `long-23p` runs passed all
   quality gates with 596.799-second median wall time, 628.505-second observed
   maximum, 4.22 GB observed RAM peak, and 11,046 MiB peak GPU0 VRAM above

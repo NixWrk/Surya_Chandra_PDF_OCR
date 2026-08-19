@@ -56,8 +56,9 @@ the permitted GPU is configured locally, Compose has a standalone default,
 preflight/smoke/runbooks exist, and an offline no-cache source-layer Docker build
 passed without downloads. Per user decision, that build is accepted as partial
 new-PC evidence. It does not prove clean dependency/model provisioning or the
-currently incomplete Windows Surya venv. The attested image is now the local
-production `latest` and immutable `prod-771b5de`; the old image is preserved as
+currently incomplete Windows Surya venv. A metadata-corrected derivative of the
+exact measured image is now the local production `latest` and immutable
+`prod-771b5de` at `sha256:b774e4aa955df...`; the old image is preserved as
 `rollback-f470cf-20260819`. The production async HTTP smoke completed and exact
 retention passed.
 
