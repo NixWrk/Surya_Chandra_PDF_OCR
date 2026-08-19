@@ -865,6 +865,114 @@ def test_chunked_hybrid_rejects_runtime_environment_drift_before_publish(
     assert calls == 1
 
 
+def test_chunked_hybrid_premerge_reuses_verified_evidence_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UNISCAN_OCR_RENDER_DPI", "72")
+    monkeypatch.setenv("UNISCAN_TEXTLESS_DPI", "72")
+    monkeypatch.setattr(ocr_benchmark, "_CHANDRA_MIN_IMAGE_DIM", 72)
+    monkeypatch.setattr(ocr_pipeline, "_CHANDRA_MIN_IMAGE_DIM", 72)
+
+    tmp_path = _new_test_dir()
+    source_pdf = tmp_path / "source.pdf"
+    _write_numbered_pdf(source_pdf, page_count=2)
+    phase = "premerge"
+    evidence_passes: list[tuple[str, int]] = []
+    real_complete_chunk_record = ocr_pipeline._complete_chunk_record
+    real_required_chunk_evidence = ocr_pipeline._required_chunk_evidence
+
+    def track_complete_chunk_record(
+        *,
+        record: dict[str, object],
+        chunk: ocr_pipeline._PdfChunk,
+        summary: SearchablePdfSummary,
+        run_dir: Path,
+        source_sizes: list[tuple[float, float]],
+        delete_original_text_layer: bool = False,
+    ) -> None:
+        nonlocal phase
+        previous_phase = phase
+        phase = "seal"
+        try:
+            real_complete_chunk_record(
+                record=record,
+                chunk=chunk,
+                summary=summary,
+                run_dir=run_dir,
+                source_sizes=source_sizes,
+                delete_original_text_layer=delete_original_text_layer,
+            )
+        finally:
+            phase = previous_phase
+
+    def track_required_chunk_evidence(
+        *,
+        summary: SearchablePdfSummary,
+        chunk: ocr_pipeline._PdfChunk,
+        run_dir: Path,
+        delete_original_text_layer: bool,
+    ) -> ocr_pipeline._RequiredChunkEvidence:
+        required = real_required_chunk_evidence(
+            summary=summary,
+            chunk=chunk,
+            run_dir=run_dir,
+            delete_original_text_layer=delete_original_text_layer,
+        )
+        evidence_passes.append((phase, chunk.index))
+        return required
+
+    def fake_build_searchable_pdf(**kwargs: object) -> SearchablePdfSummary:
+        chunk_pdf = Path(str(kwargs["pdf_path"]))
+        return _write_complete_hybrid_summary(
+            chunk_pdf=chunk_pdf,
+            run_dir=Path(str(kwargs["work_root"])) / "run",
+            delete_original_text_layer=False,
+        )
+
+    monkeypatch.setattr(
+        ocr_pipeline,
+        "_required_chunk_evidence",
+        track_required_chunk_evidence,
+    )
+    monkeypatch.setattr(
+        ocr_pipeline,
+        "_complete_chunk_record",
+        track_complete_chunk_record,
+    )
+    monkeypatch.setattr(ocr_pipeline, "build_searchable_pdf", fake_build_searchable_pdf)
+
+    summary = ocr_pipeline._build_searchable_pdf_chunked(
+        input_path=source_pdf,
+        mode="chandra+surya",
+        lang="rus+eng",
+        work_root=tmp_path / "work",
+        overwrite_target=None,
+        return_bytes=False,
+        strict=True,
+        progress=None,
+        delete_original_text_layer=False,
+        chunk_pages=1,
+        page_count=2,
+    )
+
+    assert summary.chunk_count == 2
+    assert [index for current_phase, index in evidence_passes if current_phase == "seal"] == [
+        1,
+        2,
+    ]
+    assert [
+        index for current_phase, index in evidence_passes if current_phase == "premerge"
+    ] == [1, 2]
+
+    assert summary.chunk_manifest_path is not None
+    manifest = json.loads(summary.chunk_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "done"
+    assert all(
+        record["status"] == "done" and record["evidence_manifest_sha256"]
+        for record in manifest["chunks"]
+    )
+
+
 def test_chunked_hybrid_pipeline_uses_ten_page_hybrid_jobs_and_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
