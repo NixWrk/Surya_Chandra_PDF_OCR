@@ -11,13 +11,13 @@ evidence and provenance are in `SYNTHETIC_OCR_BASELINE_2026-08-18.md` and
 
 | Signal | Result |
 |---|---|
-| Full software suite | 678 passed, 9 skipped, 5 warnings in 259.49 s through `c89b593` |
+| Full software suite | 679 passed, 9 skipped, 5 warnings in 208.99 s through `1cb708c` |
 | Static checks | Ruff and mypy clean |
 | Synthetic corpus | Version 1.0.1, nine fixtures with hashed sources and Ground Truth |
 | Real-engine coverage | All nine fixtures exercised at least once across two immutable offline checkpoints |
 | Added four-fixture accuracy | CER 0, WER 0, exact retention pass, page mapping pass |
 | Known accuracy target | `mixed-layout`: CER 0.287293, WER 0.366667, exact retention fail, mapping pass |
-| Long-document observation | 23 pages, three chunks, all checks pass, 922.991 s wall |
+| Long-document after fix | 23 pages, three chunks, all checks pass, 463.709 s wall; 49.760% faster than the preserved run |
 | Resource/latency limitation | Peak RAM/VRAM and median/tail latency not measured |
 
 The second checkpoint used clean source commit `3acda85`, immutable image
@@ -25,10 +25,16 @@ The second checkpoint used clean source commit `3acda85`, immutable image
 `--pull never`, `--network none`, offline library settings, and read-only model
 caches. Source hashes match the corpus manifest; no download occurred.
 
-The 23-page wall time exceeds the recorded Surya, Chandra, PDF-build, and
-validation durations by about 548.733 seconds. This establishes a profiling
-question only. It does not identify which part of preprocessing, rendering,
-evidence revalidation, merging, or orchestration should change.
+The 23-page gap was diagnosed as repeated strict evidence work. A deterministic
+test proved two full evidence passes per chunk in the immediate premerge loop.
+Commit `1cb708c` reuses the first validated evidence result without removing the
+sealing, fingerprint, manifest, or runtime-drift fences. On one comparable
+offline after-run, wall time fell from 922.991 to 463.709 seconds while CER/WER
+remained zero and exact retention and mapping passed. The residual not explained
+by measured engine/PDF-build stages fell from 548.733 to 61.064 seconds; the new
+residual includes separately unmeasured validation. This is accepted evidence
+for the narrow fix, not a median/tail latency claim. See
+`PREMERGE_EVIDENCE_PERFORMANCE_2026-08-19.md`.
 
 The versioned corpus includes procedural English, Russian, mixed layout,
 retention, graphics/blank, degraded vector text, rotation, native text, and a

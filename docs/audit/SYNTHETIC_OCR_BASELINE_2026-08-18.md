@@ -129,6 +129,33 @@ profiling target, not an attribution: preprocessing, repeated rendering/evidence
 checks, chunk revalidation, merge work, and uninstrumented orchestration may all
 contribute. No optimization is accepted from this single observation.
 
+## Premerge evidence-reuse checkpoint
+
+A model-free RED test at `2ea0f6d` proved that each chunk ran two full evidence
+passes immediately before merge. Commit `1cb708c` reuses the evidence object
+returned by the first pass while retaining complete-chunk sealing, pre-snapshot
+fingerprint checks, post-snapshot manifest validation, and runtime drift fences.
+The full suite after the fix is `679 passed, 9 skipped, 5 warnings`.
+
+The same `long-23p` source was rerun from clean commit `1cb708c` with the same
+immutable image, GPU0, `--pull never`, `--network none`, offline settings, and
+read-only caches. No package, image, or model download occurred.
+
+| Signal | Before | After | Observed delta |
+|---|---:|---:|---:|
+| Wall time | 922.991 s | 463.709 s | -459.282 s (-49.760%) |
+| Recorded-stage residual | 548.733 s | 61.064 s | -487.669 s (-88.872%) |
+| CER / WER | 0 / 0 | 0 / 0 | unchanged |
+| Exact retention / mapping | pass / pass | pass / pass | unchanged |
+| Pages / partial failures | 23 / 0 | 23 / 0 | unchanged |
+
+The after-run is retained locally at
+`outputs/audit_synthetic_baseline/v1_0_1/premerge-fix-1cb708c-r1/`.
+Its output PDF is 2,954,784 bytes with SHA-256
+`08243e9fd8b66e86efb79af2cba43785e8cfa39bec8f9222c720b893976b1a9e`.
+Full methodology, retained safety fences, exact verification, and limitations
+are in `PREMERGE_EVIDENCE_PERFORMANCE_2026-08-19.md`.
+
 Peak process RAM and VRAM were not sampled concurrently and are recorded as
 `not_measured`; one incidental Docker-stats observation is not treated as a peak.
 These are single runs, so they do not establish median or tail latency.

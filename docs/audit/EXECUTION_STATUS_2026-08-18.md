@@ -24,9 +24,12 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
   native-text, and 23-page fixtures. Across both checkpoints, all nine corpus
   fixtures have been exercised at least once. No OCR accuracy or performance
   tuning has been accepted without real-engine evidence.
-- The 23-page checkpoint passed text, retention, and page mapping, but exposed
-  about 549 seconds of uninstrumented/non-engine wall time. This is a profiling
-  target, not yet a diagnosed cause or accepted optimization.
+- The 23-page checkpoint exposed two consecutive full premerge evidence passes
+  per chunk. A deterministic RED test and narrow fix now reuse the already
+  validated evidence object without removing sealing, TOCTOU, manifest, or
+  runtime-drift fences. One comparable offline after-run reduced wall time from
+  922.991 to 463.709 seconds while CER/WER remained zero and retention/mapping
+  passed.
 - The synthetic run exposed a second OCR publication failure on `blank-graphics`.
   It was reproduced test-first and fixed by requiring sealed, recomputed blank
   raster evidence. The preserved run now rebuilds artifact-only as a valid
@@ -51,11 +54,11 @@ The reference start was `bbebe4bbb58c0e3a384558e24f22bc06663093c0`.
 ## Current verification
 
 The latest complete software suite was run on local `main` through production
-commit `c89b593`:
+commit `1cb708c`:
 
 ```text
 python -m pytest -q
-678 passed, 9 skipped, 5 warnings in 259.49s
+679 passed, 9 skipped, 5 warnings in 208.99s
 ```
 
 There are no expected failures. The former malformed/encrypted admission xfails
@@ -75,6 +78,16 @@ image `sha256:f470cf1520e43ae67b70bf63e5dded12235ebde07e5139c68307cb867b06bdc0`,
 All four added fixtures completed; their source hashes match the corpus manifest,
 CER/WER were zero, exact retention passed, and page mapping passed. Peak RAM/VRAM
 and repeat-run latency were not measured.
+
+The premerge evidence-reuse checkpoint used the same `long-23p` source hash and
+immutable image from clean commit `1cb708c`, again with `--pull never`,
+`--network none`, offline settings, and read-only model caches. Wall time was
+463.709 seconds versus 922.991 seconds before. The model-free evaluator reports
+CER/WER zero, exact retention pass, page mapping pass, 23 output pages, and zero
+partial failures. This is one after-run; peak RAM/VRAM and median/tail latency
+remain open. Exact evidence is in
+`PREMERGE_EVIDENCE_PERFORMANCE_2026-08-19.md` and the ignored local benchmark
+directory named there.
 
 ## Open high-value work
 
@@ -99,9 +112,9 @@ no global document registry or historical model-tree hashing.
    remains 30 days success/90 days failure unless overridden.
 6. Remove normal-response absolute paths only with a versioned compatibility
    decision; the service remains trusted-network-only.
-7. Profile the 23-page wall-time gap before changing rendering, evidence,
-   validation, or merge behavior; preserve the current quality and integrity
-   gates.
+7. Repeat the 23-page after-run for median/tail latency and measure peak RAM/VRAM;
+   instrument the remaining approximately 61-second residual before any further
+   validation or rendering optimization.
 
 The earlier checkpoint list is retained below as historical audit context:
 

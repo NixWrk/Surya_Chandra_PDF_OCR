@@ -35,10 +35,13 @@ all passed CER/WER, exact-retention, and page-mapping checks. `mixed-layout`
 remains the measured accuracy target at CER `0.287293` and WER `0.366667`; no OCR
 policy or engine version change has been accepted.
 
-The 23-page run completed correctly but took 922.991 seconds, about 548.733
-seconds more than the recorded engine, PDF-build, and validation stages. That is
-a confirmed profiling target, not yet a proven cause. Median/tail latency and
-peak RAM/VRAM remain unmeasured.
+The 23-page run completed correctly but exposed a structural duplicate: every
+chunk recomputed the same full evidence object twice in the immediate premerge
+loop. A test-first narrow fix retained all manifest, fingerprint, snapshot, and
+runtime-drift fences. One comparable offline after-run fell from 922.991 to
+463.709 seconds (-49.760%) with CER/WER zero, exact retention pass, page mapping
+pass, and no partial failures. Repeat median/tail latency and peak RAM/VRAM
+remain unmeasured.
 
 Deployment is materially less machine-specific: tracked GPU UUIDs were removed,
 the permitted GPU is configured locally, Compose has a standalone default,

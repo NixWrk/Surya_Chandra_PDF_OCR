@@ -18,7 +18,9 @@ The original ranked matrix below remains the audit trail. Current disposition:
 - Completed: immutable resolved environment snapshot and drift fencing for item
   9, plus the same-deployment-only resume decision for item 10. Partially
   complete: dependency/runtime alignment (13–14), resource limits (18), and stale
-  documentation (29).
+  documentation (29). The proven duplicate immediate-premerge evidence pass is
+  removed test-first at `1cb708c`; all integrity fences remain active and one
+  comparable real-engine after-run is accepted.
 - Deferred by evidence: thin MCP remains unnecessary without a consumer;
   cross-upgrade resume attestation is unnecessary without that requirement, and
   running cancellation (19) still depends on cooperative engine termination.
@@ -40,9 +42,9 @@ The current open order, which supersedes the numerical order for future work, is
    preserving active jobs, retained failures, model caches, and user sources.
 7. Incrementally reduce module size and duplicate validation only after the
    above behavior is protected by benchmarks.
-8. Profile the 23-page checkpoint's approximately 549 seconds of wall time not
-   accounted for by recorded engine, PDF-build, and validation stages. Do not
-   remove strict checks until their individual cost and safety value are measured.
+8. Repeat the optimized 23-page checkpoint for median/tail latency, peak RAM/VRAM,
+   and the remaining approximately 61-second residual. Do not weaken the retained
+   sealing, fingerprint, manifest, snapshot, or runtime-drift fences.
 
 Storage constraint: successful HTTP run/chunk working data is removed by default
 unless `UNISCAN_KEEP_JOB_RUNS=1`; terminal job retention defaults to 30 days for
