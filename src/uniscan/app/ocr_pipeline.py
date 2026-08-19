@@ -4862,6 +4862,12 @@ class _RequiredChunkEvidence:
         return sorted(path.relative_to(self.outer_root).as_posix() for path in self.outer_files)
 
 
+@dataclass(slots=True, frozen=True)
+class _ValidatedReusableChunk:
+    summary: SearchablePdfSummary
+    required: _RequiredChunkEvidence
+
+
 def _owned_engine_reference(
     engine_dir: Path,
     value: object,
@@ -5588,14 +5594,14 @@ def _validate_complete_chunk_evidence_manifest(
     return payload == expected_payload
 
 
-def _reusable_chunk_summary(
+def _validated_reusable_chunk(
     *,
     record: dict[str, object],
     chunk: _PdfChunk,
     run_dir: Path,
     source_sizes: list[tuple[float, float]],
     delete_original_text_layer: bool = False,
-) -> SearchablePdfSummary | None:
+) -> _ValidatedReusableChunk | None:
     if record.get("status") != "done":
         return None
     try:
@@ -5662,9 +5668,27 @@ def _reusable_chunk_summary(
             required=required,
         ):
             return None
-        return summary
+        return _ValidatedReusableChunk(summary=summary, required=required)
     except (KeyError, TypeError, ValueError, OSError, RuntimeError):
         return None
+
+
+def _reusable_chunk_summary(
+    *,
+    record: dict[str, object],
+    chunk: _PdfChunk,
+    run_dir: Path,
+    source_sizes: list[tuple[float, float]],
+    delete_original_text_layer: bool = False,
+) -> SearchablePdfSummary | None:
+    validated = _validated_reusable_chunk(
+        record=record,
+        chunk=chunk,
+        run_dir=run_dir,
+        source_sizes=source_sizes,
+        delete_original_text_layer=delete_original_text_layer,
+    )
+    return None if validated is None else validated.summary
 
 
 def run_basic_ocr_benchmark(
@@ -6364,31 +6388,25 @@ def _build_searchable_pdf_chunked_unlocked(
     snapshot_root = run_dir / "merge_snapshots"
     for chunk, record in zip(input_chunks, manifest_chunks, strict=True):
         _assert_hybrid_runtime_config_unchanged(runtime_config)
-        revalidated_summary = _reusable_chunk_summary(
+        validated = _validated_reusable_chunk(
             record=record,
             chunk=chunk,
             run_dir=run_dir,
             source_sizes=source_sizes,
             delete_original_text_layer=delete_original_text_layer,
         )
-        if revalidated_summary is None:
+        if validated is None:
             raise RuntimeError(f"Chunk {chunk.index} changed after completion and before merge")
-        required = _required_chunk_evidence(
-            summary=revalidated_summary,
-            chunk=chunk,
-            run_dir=run_dir,
-            delete_original_text_layer=delete_original_text_layer,
-        )
         snapshot, page_texts, visual_seals = _premerge_chunk_state(
             chunk=chunk,
             record=record,
-            summary=revalidated_summary,
-            required=required,
+            summary=validated.summary,
+            required=validated.required,
             snapshot_root=snapshot_root,
         )
         if not _validate_complete_chunk_evidence_manifest(
             record=record,
-            required=required,
+            required=validated.required,
         ):
             raise RuntimeError(f"Chunk {chunk.index} evidence changed while preparing the merge")
         snapshot_outputs.append((chunk, snapshot))
